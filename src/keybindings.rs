@@ -9,6 +9,7 @@ pub struct Keybindings {
     pub normal:       HashMap<KeyEvent, Message>,
     pub editing:      HashMap<KeyEvent, Message>,
     pub continuation: HashMap<KeyEvent, Message>,
+    pub key_naming:   HashMap<KeyEvent, Message>,
     pub filter:       HashMap<KeyEvent, Message>,
 }
 
@@ -58,6 +59,13 @@ pub fn default_keybindings() -> Keybindings {
         (KeyCode::Esc,            none) => Message::CancelContinuation,
     ];
 
+    let key_naming = map![
+        (KeyCode::Enter,          none) => Message::CommitKeyName,
+        (KeyCode::Esc,            none) => Message::CancelEdit,
+        (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
+        (KeyCode::Char('c'),      ctrl) => Message::Quit,
+    ];
+
     let filter = map![
         (KeyCode::Enter,          none) => Message::CommitEdit,
         (KeyCode::Esc,            none) => Message::CancelEdit,
@@ -65,5 +73,5 @@ pub fn default_keybindings() -> Keybindings {
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
     ];
 
-    Keybindings { normal, editing, continuation, filter }
+    Keybindings { normal, editing, continuation, key_naming, filter }
 }

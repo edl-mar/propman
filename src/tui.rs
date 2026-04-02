@@ -64,6 +64,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
         Mode::Normal       => &keybindings.normal,
         Mode::Editing      => &keybindings.editing,
         Mode::Continuation => &keybindings.continuation,
+        Mode::KeyNaming    => &keybindings.key_naming,
         Mode::Filter       => &keybindings.filter,
     };
 
@@ -75,6 +76,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
     // are silently ignored (Normal mode).
     match state.mode {
         Mode::Editing | Mode::Continuation => update(state, Message::TextInput(key)),
+        Mode::KeyNaming                    => update(state, Message::TextInput(key)),
         Mode::Filter                       => update(state, Message::FilterInput(key)),
         Mode::Normal                       => state,
     }
@@ -85,7 +87,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
 fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    if matches!(state.mode, Mode::Editing | Mode::Continuation) {
+    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming) {
         // Pane grows with content: 2 border lines + one per TextArea line, capped at 8.
         let content_lines = state.edit_buffer.as_ref()
             .map(|e| e.textarea.lines().len())
@@ -128,9 +130,19 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
         .map(|s| s.as_str())
         .unwrap_or("");
 
+    let title = if matches!(state.mode, Mode::KeyNaming) {
+        // Show the header prefix the new key will live under.
+        let prefix = match state.display_rows.get(state.cursor_row) {
+            Some(DisplayRow::Header { prefix }) => prefix.as_str(),
+            _ => full_key,
+        };
+        format!(" new key under {prefix} [{locale}] ")
+    } else {
+        format!(" {full_key} [{locale}] ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {full_key} [{locale}] "));
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(&edit.textarea, inner);
@@ -265,12 +277,14 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Normal       => "NORMAL",
         Mode::Editing      => "EDIT  ",
         Mode::Continuation => "CONT  ",
+        Mode::KeyNaming    => "NEWKEY",
         Mode::Filter       => "FILTER",
     };
     let dirty = if state.unsaved_changes { " [+]" } else { "    " };
     let hints = match state.mode {
         Mode::Editing      => "  Enter commit  Esc cancel  \\ continuation",
         Mode::Continuation => "  Enter new line  Esc cancel \\",
+        Mode::KeyNaming    => "  Enter confirm key name  Esc cancel",
         _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit  / filter  Ctrl+S save",
     };
     let status = format!(" {mode_label}{dirty}{hints}");

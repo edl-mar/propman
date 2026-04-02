@@ -34,6 +34,10 @@ pub enum Mode {
     /// Sub-mode of Editing: the user just typed `\`. Enter inserts a newline
     /// instead of committing; any other key returns to Editing.
     Continuation,
+    /// The user pressed Enter on a Header row. The editor TextArea holds the
+    /// new key name (pre-filled with the header prefix + `.`). Enter confirms
+    /// the name and transitions straight to value Editing for that key.
+    KeyNaming,
     Filter,
 }
 

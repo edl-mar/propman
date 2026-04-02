@@ -18,6 +18,8 @@ pub enum Message {
     InsertNewline,
     /// Esc pressed in Continuation sub-mode — returns to Editing, `\` stays literal.
     CancelContinuation,
+    /// Enter pressed in KeyNaming mode — validates and confirms the typed key name.
+    CommitKeyName,
     /// A raw key event forwarded to the active TextArea (Editing/Continuation mode).
     TextInput(crossterm::event::KeyEvent),
     // Filter

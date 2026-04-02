@@ -53,9 +53,20 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             if state.cursor_col == 0 {
                 // Key / prefix column — no action yet.
             } else {
-                let current_value = current_cell_value(&state).unwrap_or_default();
-                state.edit_buffer = Some(CellEdit::new(current_value));
-                state.mode = Mode::Editing;
+                // Clone prefix before the mutable borrow of state.
+                let header_prefix = match state.display_rows.get(state.cursor_row) {
+                    Some(DisplayRow::Header { prefix }) => Some(prefix.clone()),
+                    _ => None,
+                };
+                if let Some(prefix) = header_prefix {
+                    // Header row: open the key-naming editor pre-filled with "prefix.".
+                    state.edit_buffer = Some(CellEdit::new(format!("{prefix}.")));
+                    state.mode = Mode::KeyNaming;
+                } else {
+                    let current_value = current_cell_value(&state).unwrap_or_default();
+                    state.edit_buffer = Some(CellEdit::new(current_value));
+                    state.mode = Mode::Editing;
+                }
             }
         }
         (Mode::Normal, Message::FocusFilter) => {
@@ -117,6 +128,51 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Editing, Message::CancelEdit) => {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
+        }
+
+        // ── KeyNaming mode ───────────────────────────────────────────────────
+        (Mode::KeyNaming, Message::CommitKeyName) => {
+            let new_key = state.edit_buffer.as_ref()
+                .map(|e| e.current_value().trim().to_string())
+                .unwrap_or_default();
+
+            // Valid key: non-empty, contains at least one dot, not already known.
+            let is_valid = !new_key.is_empty()
+                && new_key.contains('.')
+                && !state.workspace.merged_keys.contains(&new_key);
+
+            if is_valid {
+                state.edit_buffer = None;
+
+                // Register in the workspace and rebuild the display.
+                state.workspace.merged_keys.push(new_key.clone());
+                state.workspace.merged_keys.sort();
+                apply_filter(&mut state);
+
+                // Navigate to the new row if it is visible under the current filter.
+                if let Some(row_idx) = state.display_rows.iter().position(|r| {
+                    matches!(r, DisplayRow::Key { full_key, .. } if *full_key == new_key)
+                }) {
+                    state.cursor_row = row_idx;
+                    clamp_scroll(&mut state);
+                    // Open the value editor; commit_cell_insert will handle the write.
+                    state.edit_buffer = Some(CellEdit::new(String::new()));
+                    state.mode = Mode::Editing;
+                } else {
+                    // New key hidden by active filter — return to Normal.
+                    state.mode = Mode::Normal;
+                }
+            }
+            // else: invalid key — stay in KeyNaming so the user can correct it.
+        }
+        (Mode::KeyNaming, Message::CancelEdit) => {
+            state.edit_buffer = None;
+            state.mode = Mode::Normal;
+        }
+        (Mode::KeyNaming, Message::TextInput(key)) => {
+            if let Some(edit) = state.edit_buffer.as_mut() {
+                edit.textarea.input(tui_textarea::Input::from(key));
+            }
         }
 
         // ── Filter mode ──────────────────────────────────────────────────────
@@ -290,6 +346,28 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
             if file.locale == locale {
                 target = Some((gi, fi));
                 break 'find;
+            }
+        }
+    }
+
+    // Fallback for brand-new keys not yet present in any locale: find the group
+    // that owns the key's prefix (e.g. "app.confirm" for "app.confirm.cancel").
+    if target.is_none() {
+        let prefix_end = full_key.rfind('.').unwrap_or(full_key.len());
+        let prefix = &full_key[..prefix_end];
+        'prefix_find: for (gi, group) in state.workspace.groups.iter().enumerate() {
+            let has_prefix = group.files.iter().any(|f| {
+                f.entries.iter().any(|e| matches!(e,
+                    FileEntry::KeyValue { key, .. } if key.starts_with(prefix)
+                ))
+            });
+            if has_prefix {
+                for (fi, file) in group.files.iter().enumerate() {
+                    if file.locale == locale {
+                        target = Some((gi, fi));
+                        break 'prefix_find;
+                    }
+                }
             }
         }
     }
