@@ -43,14 +43,18 @@ pub fn parse(path: &Path) -> io::Result<Vec<FileEntry>> {
             let mut value = v.trim_start().to_string();
             i += 1;
 
-            // Join any \-terminated continuation lines.
+            // Join any \-terminated continuation lines, preserving the trailing '\'
+            // and joining with '\n' so the editor can display and re-save the
+            // physical line structure faithfully.
             while value.ends_with('\\') {
-                value.pop(); // strip trailing backslash
+                value.push('\n'); // separator after the continuation marker
                 if i < raw_lines.len() {
                     // Leading whitespace on continuation lines is intentionally stripped.
                     value.push_str(raw_lines[i].trim());
                     i += 1;
                 } else {
+                    // Trailing '\' at EOF with no following line — drop the added '\n'.
+                    value.pop();
                     break;
                 }
             }

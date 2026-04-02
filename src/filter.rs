@@ -226,8 +226,8 @@ fn has_value(key: &str, locale: &str, workspace: &Workspace) -> bool {
         .groups
         .iter()
         .flat_map(|g| g.files.iter())
-        .find(|f| f.locale == locale)
-        .map_or(false, |f| f.get(key).is_some())
+        .filter(|f| f.locale == locale)
+        .any(|f| f.get(key).is_some())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

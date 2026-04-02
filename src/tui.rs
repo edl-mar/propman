@@ -208,6 +208,8 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
 
             // Headers have no stored values — their cells are empty/creatable.
+            // Search all files matching the locale (across groups) so that a key
+            // present in group B is not hidden by group A's file for that locale.
             let value = if is_header {
                 None
             } else {
@@ -216,8 +218,8 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                     .groups
                     .iter()
                     .flat_map(|g| g.files.iter())
-                    .find(|f| &f.locale == locale)
-                    .and_then(|f| f.get(full_key))
+                    .filter(|f| &f.locale == locale)
+                    .find_map(|f| f.get(full_key))
             };
 
             let tag_style = if is_selected_row {
@@ -227,22 +229,27 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             };
             spans.push(Span::styled(format!("[{locale}] "), tag_style));
 
+            // Strip `\`+newline continuation markers — they're an on-disk format
+            // detail. The logical value (without them) is what the cell should show.
+            let display = value.map(|v| v.replace("\\\n", ""));
+            let display_str = display.as_deref().unwrap_or("");
+
             let (text, style) = match (is_cursor_cell, &state.mode, &state.edit_buffer) {
                 // Cell is being edited in the bottom pane — show the workspace value
                 // reversed so the user can see which cell is active.
                 (true, Mode::Editing, _) => (
-                    value.unwrap_or("").to_string(),
+                    display_str.to_string(),
                     Style::default().add_modifier(Modifier::REVERSED),
                 ),
                 (true, _, _) => (
-                    value.unwrap_or("").to_string(),
+                    display_str.to_string(),
                     Style::default().add_modifier(Modifier::REVERSED),
                 ),
                 // Key row: value missing in this locale but present in others.
                 (false, _, _) if value.is_none() && !is_header => {
                     ("<missing>".to_string(), Style::default().fg(Color::Red))
                 }
-                _ => (value.unwrap_or("").to_string(), Style::default()),
+                _ => (display_str.to_string(), Style::default()),
             };
             spans.push(Span::styled(format!("{text}  "), style));
         }

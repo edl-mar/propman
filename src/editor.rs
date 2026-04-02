@@ -14,20 +14,22 @@ pub struct CellEdit {
 
 impl CellEdit {
     pub fn new(value: String) -> Self {
-        let mut textarea = TextArea::from([value.clone()]);
-        // Place the cursor at the end of the line so typing appends naturally.
+        // Split on '\n' so that values previously saved with continuation lines
+        // are re-opened as multi-line in the editor.
+        let lines: Vec<&str> = value.split('\n').collect();
+        let mut textarea = TextArea::from(lines);
+        // Place the cursor at the end of the last line so typing appends naturally.
         textarea.move_cursor(tui_textarea::CursorMove::End);
         // Don't highlight the current line — it looks noisy in a single-line editor pane.
         textarea.set_cursor_line_style(Style::default());
         Self { original: value, textarea }
     }
 
-    /// The current value of the cell.
-    /// Lines are joined with no separator — continuation lines are a file-format
-    /// detail; the logical value is always a single string. The user is responsible
-    /// for any trailing space before the `\` continuation marker.
+    /// The physical value as it will be written to disk.
+    /// Lines are joined with '\n'; a line that ends with '\' becomes a
+    /// continuation line in the .properties file format.
     pub fn current_value(&self) -> String {
-        self.textarea.lines().join("")
+        self.textarea.lines().join("\n")
     }
 
     pub fn is_modified(&self) -> bool {

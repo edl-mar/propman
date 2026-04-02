@@ -42,7 +42,8 @@ pub fn write_change(
         let line_num = idx + 1;
         if line_num == first_line {
             // TODO: preserve the original separator style (= vs :) and surrounding whitespace.
-            // TODO: re-split long values with \ continuations.
+            // Values containing '\n' (from continuation lines in the editor) are written
+            // as-is; the embedded `\` + newline sequences become natural continuation lines.
             writeln!(out, "{key}={new_value}")?;
         } else if line_num > first_line && line_num <= last_line {
             // Skip old continuation lines — value is now on one line.

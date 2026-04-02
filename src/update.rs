@@ -86,10 +86,12 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.mode = Mode::Continuation;
         }
         (Mode::Continuation, Message::InsertNewline) => {
-            // Strip the trailing `\` and open a new continuation line.
+            // Keep the trailing `\` — it becomes the continuation marker in the
+            // .properties file — and open a new line after it.
+            // Do NOT move to End first: `EnterContinuation` leaves the cursor right
+            // after the `\`, so insert_newline splits at that position, which lets
+            // the user break a line in the middle by placing `\` mid-value.
             if let Some(edit) = state.edit_buffer.as_mut() {
-                edit.textarea.move_cursor(tui_textarea::CursorMove::End);
-                edit.textarea.delete_char(); // backspace the `\`
                 edit.textarea.insert_newline();
             }
             state.mode = Mode::Editing;
@@ -174,8 +176,8 @@ fn current_cell_value(state: &AppState) -> Option<String> {
 
     state.workspace.groups.iter()
         .flat_map(|g| g.files.iter())
-        .find(|f| &f.locale == locale)
-        .and_then(|f| f.get(full_key))
+        .filter(|f| &f.locale == locale)
+        .find_map(|f| f.get(full_key))
         .map(|v| v.to_string())
 }
 
@@ -228,7 +230,9 @@ fn commit_cell_edit(state: &mut AppState, new_value: String) {
         _ => return,
     };
 
-    // Pass 2 (mutable): update the value in-memory.
+    // Pass 2 (mutable): update the value in-memory (physical format, with any
+    // `\`+newline continuation markers intact so the editor can re-open correctly).
+    // The display layer strips `\<newline>` before rendering cell text.
     if let FileEntry::KeyValue { value, .. } =
         &mut state.workspace.groups[gi].files[fi].entries[ei]
     {
