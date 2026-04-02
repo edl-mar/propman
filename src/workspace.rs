@@ -21,6 +21,42 @@ impl PropertiesFile {
         })
     }
 
+    /// Returns the 1-based line number after which a new entry for `key` should
+    /// be inserted to preserve the file's existing grouping structure.
+    ///
+    /// Scans all existing `KeyValue` entries and picks the one that shares the
+    /// longest common dot-boundary prefix with `key`; ties are broken by taking
+    /// the entry with the highest `last_line` (i.e. the last sibling in file order).
+    ///
+    /// Returns 0 only for an empty file (no entries at all), in which case the
+    /// caller should append after line 0 — i.e. the new entry becomes line 1.
+    pub fn insertion_point_for(&self, key: &str) -> usize {
+        let mut best_last_line: usize = 0;
+        let mut best_prefix_len: usize = 0;
+
+        for entry in &self.entries {
+            if let FileEntry::KeyValue { key: k, last_line, .. } = entry {
+                let prefix_len = common_dot_prefix_len(key, k);
+                if prefix_len > best_prefix_len
+                    || (prefix_len == best_prefix_len && *last_line > best_last_line)
+                {
+                    best_prefix_len = prefix_len;
+                    best_last_line = *last_line;
+                }
+            }
+        }
+
+        if best_last_line == 0 {
+            // No KeyValue entries: fall back to the last line in the file.
+            self.entries.iter().map(|e| match e {
+                FileEntry::KeyValue { last_line, .. } => *last_line,
+                FileEntry::Comment { line, .. } | FileEntry::Blank { line } => *line,
+            }).max().unwrap_or(0)
+        } else {
+            best_last_line
+        }
+    }
+
     /// Look up the line range for `key`, if present.
     /// Returns `(first_line, last_line)`; equal for single-line values.
     pub fn line_of(&self, key: &str) -> Option<(usize, usize)> {
@@ -122,6 +158,18 @@ impl Workspace {
         }
         out
     }
+}
+
+/// Length of the longest common prefix of `a` and `b` that ends on a `.`
+/// boundary. Property keys are ASCII so byte indexing is safe.
+///
+/// Examples:
+///   "app.confirm.new",  "app.confirm.delete"  → 12  ("app.confirm.")
+///   "app.confirm.new",  "app.other"            →  4  ("app.")
+///   "com.foo",          "app.bar"              →  0  (no common dot boundary)
+fn common_dot_prefix_len(a: &str, b: &str) -> usize {
+    let common = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    a[..common].rfind('.').map(|i| i + 1).unwrap_or(0)
 }
 
 /// Splits a file stem into (base_name, locale).

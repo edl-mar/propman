@@ -4,7 +4,7 @@ use crate::{
     messages::Message,
     parser::FileEntry,
     render_model::{self, DisplayRow},
-    state::{AppState, Mode},
+    state::{AppState, Mode, PendingChange},
     writer,
 };
 
@@ -71,7 +71,14 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Editing, Message::CommitEdit) | (Mode::Editing, Message::StartEdit) => {
             if let Some(edit) = state.edit_buffer.take() {
                 if edit.is_modified() {
-                    commit_cell_edit(&mut state, edit.current_value());
+                    let new_value = edit.current_value();
+                    // Dispatch: insert if the key is absent from the locale file,
+                    // update if it already exists there.
+                    if current_cell_value(&state).is_none() {
+                        commit_cell_insert(&mut state, new_value);
+                    } else {
+                        commit_cell_edit(&mut state, new_value);
+                    }
                 }
             }
             state.mode = Mode::Normal;
@@ -138,10 +145,16 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (_, Message::SaveFile) => {
             // Flush pending writes. Any that fail are put back so the user can retry.
             // NOTE: this is the one place in update() that performs I/O.
-            let writes = std::mem::take(&mut state.pending_writes);
-            for (path, first_line, last_line, key, value) in writes {
-                if writer::write_change(&path, first_line, last_line, &key, &value).is_err() {
-                    state.pending_writes.push((path, first_line, last_line, key, value));
+            let changes = std::mem::take(&mut state.pending_writes);
+            for change in changes {
+                let result = match &change {
+                    PendingChange::Update { path, first_line, last_line, key, value } =>
+                        writer::write_change(path, *first_line, *last_line, key, value),
+                    PendingChange::Insert { path, after_line, key, value } =>
+                        writer::write_insert(path, *after_line, key, value),
+                };
+                if result.is_err() {
+                    state.pending_writes.push(change);
                 }
             }
             state.unsaved_changes = !state.pending_writes.is_empty();
@@ -239,7 +252,93 @@ fn commit_cell_edit(state: &mut AppState, new_value: String) {
         *value = new_value.clone();
     }
 
-    state.pending_writes.push((path, first_line, last_line, full_key, new_value));
+    state.pending_writes.push(PendingChange::Update {
+        path,
+        first_line,
+        last_line,
+        key: full_key,
+        value: new_value,
+    });
+    state.unsaved_changes = true;
+}
+
+/// Inserts a new key-value entry into the appropriate locale file and queues
+/// a disk write. Called when the user commits an edit on a `<missing>` cell.
+fn commit_cell_insert(state: &mut AppState, new_value: String) {
+    if state.cursor_col == 0 {
+        return;
+    }
+    let locale_idx = state.cursor_col - 1;
+    let locale = match state.visible_locales.get(locale_idx) {
+        Some(l) => l.clone(),
+        None => return,
+    };
+    let full_key = match state.display_rows.get(state.cursor_row) {
+        Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
+        _ => return, // Header rows handled separately in the future.
+    };
+
+    // Find the group that owns this key (where it exists in some other locale).
+    // That group's file for `locale` is where we insert.
+    let mut target: Option<(usize, usize)> = None; // (group_idx, file_idx)
+    'find: for (gi, group) in state.workspace.groups.iter().enumerate() {
+        let key_in_group = group.files.iter().any(|f| f.get(&full_key).is_some());
+        if !key_in_group {
+            continue;
+        }
+        for (fi, file) in group.files.iter().enumerate() {
+            if file.locale == locale {
+                target = Some((gi, fi));
+                break 'find;
+            }
+        }
+    }
+
+    let (gi, fi) = match target {
+        Some(t) => t,
+        None => return, // No file for this locale in the key's group — skip.
+    };
+
+    let after_line = state.workspace.groups[gi].files[fi]
+        .insertion_point_for(&full_key);
+
+    // How many physical lines does the new value occupy?
+    let n_lines = new_value.split('\n').count();
+    let new_first_line = after_line + 1;
+    let new_last_line  = after_line + n_lines;
+
+    // Bump line numbers of all entries that follow the insertion point.
+    for entry in &mut state.workspace.groups[gi].files[fi].entries {
+        match entry {
+            FileEntry::KeyValue { first_line, last_line, .. } => {
+                if *first_line > after_line {
+                    *first_line += n_lines;
+                    *last_line  += n_lines;
+                }
+            }
+            FileEntry::Comment { line, .. } | FileEntry::Blank { line } => {
+                if *line > after_line {
+                    *line += n_lines;
+                }
+            }
+        }
+    }
+
+    // Register the new entry in the in-memory workspace.
+    let path = state.workspace.groups[gi].files[fi].path.clone();
+    state.workspace.groups[gi].files[fi].entries.push(FileEntry::KeyValue {
+        first_line: new_first_line,
+        last_line:  new_last_line,
+        key:   full_key.clone(),
+        value: new_value.clone(),
+    });
+
+    state.pending_writes.push(PendingChange::Insert {
+        path,
+        after_line,
+        key:   full_key,
+        value: new_value,
+    });
     state.unsaved_changes = true;
 }
 

@@ -6,6 +6,27 @@ use crate::{
     workspace::Workspace,
 };
 
+/// A committed edit queued for the next Ctrl+S flush.
+#[derive(Debug)]
+pub enum PendingChange {
+    /// Overwrite an existing key-value entry at `first_line..=last_line`.
+    Update {
+        path: PathBuf,
+        first_line: usize,
+        last_line: usize,
+        key: String,
+        value: String,
+    },
+    /// Insert a brand-new key-value entry after `after_line`
+    /// (0 means prepend before the first line).
+    Insert {
+        path: PathBuf,
+        after_line: usize,
+        key: String,
+        value: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Normal,
@@ -35,11 +56,8 @@ pub struct AppState {
     /// The current query is `filter_textarea.lines()[0]`.
     pub filter_textarea: TextArea<'static>,
     pub unsaved_changes: bool,
-    /// Edits committed but not yet written to disk.
-    /// Each entry is `(file_path, first_line, last_line, key, new_value)`.
-    /// `first_line..=last_line` is the range occupied by the original value
-    /// (continuation lines included). Flushed by `Message::SaveFile`.
-    pub pending_writes: Vec<(PathBuf, usize, usize, String, String)>,
+    /// Edits committed but not yet flushed to disk. Flushed by `Message::SaveFile`.
+    pub pending_writes: Vec<PendingChange>,
     /// Set to true by `Message::Quit`; the TUI loop exits on the next iteration.
     pub quitting: bool,
     /// Active cell editor; present only while `mode == Mode::Editing`.

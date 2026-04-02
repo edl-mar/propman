@@ -4,6 +4,48 @@ use std::{
     path::Path,
 };
 
+/// Inserts a new key-value entry into `path` after `after_line`.
+///
+/// `after_line = 0` inserts before all existing content.
+/// `after_line = N` inserts after line N (1-based).
+/// Values containing `\n` are written as-is; the embedded `\` + newline sequences
+/// become natural continuation lines in the .properties file.
+pub fn write_insert(
+    path: &Path,
+    after_line: usize,
+    key: &str,
+    new_value: &str,
+) -> io::Result<()> {
+    let file = fs::File::open(path)?;
+    let lines: Vec<String> = io::BufReader::new(file)
+        .lines()
+        .collect::<io::Result<_>>()?;
+
+    if after_line > lines.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "after_line {after_line} out of range (file has {} lines)",
+                lines.len()
+            ),
+        ));
+    }
+
+    let mut out = fs::File::create(path)?;
+
+    if after_line == 0 {
+        writeln!(out, "{key}={new_value}")?;
+    }
+    for (idx, original) in lines.iter().enumerate() {
+        let line_num = idx + 1;
+        writeln!(out, "{original}")?;
+        if line_num == after_line {
+            writeln!(out, "{key}={new_value}")?;
+        }
+    }
+    Ok(())
+}
+
 /// Rewrites a key-value entry in `path`, replacing `first_line..=last_line`.
 ///
 /// For single-line values `first_line == last_line`. For entries that spanned
