@@ -5,10 +5,10 @@ A terminal UI tool for managing Java `.properties` files, written in Rust.
 ## What this project does
 
 propman scans a directory recursively for `.properties` files, groups them
-by locale (everything after the first `_` in the filename stem is treated as
-a locale identifier; files with no `_` get locale `"default"`), and presents
-them as an interactive TUI. The user can navigate, filter, and edit
-translations across all locales side by side.
+by bundle (the file stem before the first `_`) and locale (everything after
+the first `_`; files with no `_` get locale `"default"`), and presents them
+as an interactive TUI. The user can navigate, filter, edit, create, rename,
+and delete translations across all bundles and locales side by side.
 
 ## Module architecture
 
@@ -16,44 +16,64 @@ The app follows The Elm Architecture (TEA):
 
     Event → Message → Update → State → Render
 
-tui           ratatui + crossterm — rendering and raw keyboard event capture
-keybindings   HashMap<KeyEvent, Message> — translates raw events to semantic messages
+```
+tui           ratatui + crossterm — layout, rendering, raw keyboard event capture
+keybindings   HashMap<KeyEvent, Message> per mode — translates raw events to messages
 messages      Message enum — all possible actions in the app
-update        (State, Message) → State — mostly pure; SaveFile is the one place
-              that performs I/O (flushing pending_writes to disk)
-state         complete app state — see AppState fields below
-filter        filter parser and evaluator — FilterExpr AST, parse(), evaluate(),
-              visible_locales()
-render_model  build_display_rows() — converts a key slice into Vec<DisplayRow>
-editor        CellEdit — wraps TextArea<'static> + original string for the cell editor
-workspace     groups PropertiesFile sets, locale detection, merged key index;
-              single source of truth — owns all FileEntry vecs
+update        (State, Message) → State — pure except SaveFile (flushes pending_writes)
+state         AppState — complete app state (see fields below)
+filter        FilterExpr AST, parse(), evaluate(), visible_locales()
+render_model  build_display_rows() — converts bundle-qualified key slice → Vec<DisplayRow>
+editor        CellEdit — wraps TextArea<'static> + original string for change detection
+workspace     Workspace — owns all FileGroup/PropertiesFile/FileEntry data;
+              single source of truth for keys and values
 parser        line-by-line reader — preserves KeyValue, Comment, Blank entries;
-              joins \-continuation lines into a single value string
-writer        write_change() — rewrites a line range, preserves everything else
+              joins \-continuation lines into a single logical value string
+writer        write_change(), write_insert(), write_delete() — targeted file rewrites
 search        stub (nucleo fuzzy search planned; currently unused)
+```
 
-New features are added by introducing new Message variants and handling them
-in update — the event handler and renderer stay largely untouched.
+New features are added by introducing new `Message` variants and handling them
+in `update` — the event handler and renderer stay largely untouched.
+
+## Interaction model
+
+The control flow in Normal mode follows a consistent pattern:
+
+    selection (cursor) → action key → [confirmation sub-mode] → [scope toggle] → Enter
+
+- **`Enter` on a locale cell**: open value editor (`Mode::Editing`)
+- **`Enter` on the key column**: open rename editor (`Mode::KeyRenaming`)
+- **`n`**: open new-key editor (`Mode::KeyNaming`)
+- **`d` on a locale cell**: immediate locale-entry deletion (no sub-mode)
+- **`d` on the key column**: open deletion confirmation (`Mode::Deleting`)
+- **`/`**: focus filter bar (`Mode::Filter`)
+
+Sub-modes with Tab-toggle (KeyRenaming, Deleting) offer `[exact]` vs
+`[+children]` scope. The pane title always reflects the current scope.
+Bundle-level Header rows are blocked from rename and edit (the bundle name
+is the file name — renaming a bundle would rename the file on disk).
 
 ## AppState fields
 
 ```rust
 pub workspace: Workspace,
-pub display_rows: Vec<DisplayRow>,   // filtered + grouped; rebuilt on filter change
-pub visible_locales: Vec<String>,    // subset of all_locales() when a locale
+pub display_rows: Vec<DisplayRow>,   // rebuilt on every filter/edit change
+pub visible_locales: Vec<String>,    // subset of all_locales() when locale
                                      // selector is active; full list otherwise
 pub cursor_row: usize,               // index into display_rows
 pub cursor_col: usize,               // 0 = key column, 1..=n = visible_locales[n-1]
 pub scroll_offset: usize,
-pub mode: Mode,                      // Normal | Editing | Filter
+pub mode: Mode,
 pub filter_textarea: TextArea<'static>, // always present; lines()[0] is the query
 pub unsaved_changes: bool,
-pub pending_writes: Vec<(PathBuf, usize, usize, String, String)>,
-                                     // (path, first_line, last_line, key, new_value)
-                                     // flushed on SaveFile
+pub pending_writes: Vec<PendingChange>, // flushed on SaveFile
 pub quitting: bool,
-pub edit_buffer: Option<CellEdit>,   // present only while mode == Editing
+pub edit_buffer: Option<CellEdit>,   // present while mode is Editing / KeyNaming
+                                     // / KeyRenaming / Deleting
+pub rename_children: bool,           // Tab-toggle in KeyRenaming
+pub delete_children: bool,           // Tab-toggle in Deleting
+pub status_message: Option<String>,  // one-shot; cleared on next keypress
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -62,135 +82,190 @@ was never needed since `update` takes ownership of state.
 ## Modes
 
 ```
-Normal   — navigation, entering Edit/Filter mode
-Editing  — editing a cell in the bottom pane; Esc cancels, Enter commits
-Filter   — typing in the filter bar; Esc returns to Normal (keeps query)
+Normal      — navigation and action dispatch
+Editing     — editing a cell value in the bottom pane (Enter commit, Esc cancel)
+Continuation — sub-mode of Editing: \ was typed; Enter inserts a newline
+KeyNaming   — typing a new key name; Enter creates the key, Esc cancels
+KeyRenaming — editing the current key name; Tab toggles exact/+children scope
+Deleting    — confirming key deletion; Tab toggles exact/+children scope
+Filter      — typing in the filter bar; Esc returns to Normal (keeps query)
 ```
 
-Escape cycles: Normal → Filter → Normal. Clearing the filter is explicit
-(ClearFilter message, no default binding yet).
+Escape cycles: `Normal → Filter → Normal`.
+`ClearFilter` message exists but has no default binding yet.
 
 ## Key design decisions
 
+**Bundle system**
+Files are grouped by bundle (base filename before `_`). Keys are stored in
+`merged_keys` as `"bundle:real_key"` (e.g. `"messages:app.title"`).
+`workspace::split_key(full_key) -> (&str, &str)` splits on the first `:`.
+`workspace.get_value(full_key, locale)` routes lookups through the correct
+bundle group. Files on disk always store the bare real key — the bundle
+prefix is an in-memory convention only.
+
+Bundle-level Header rows (depth 0, prefix == bundle name) are shown without
+locale columns and are blocked from value editing and rename.
+
+Cross-bundle rename/move is supported: renaming a key to a different bundle
+prefix runs `commit_cross_bundle_rename`, which snapshots values, deletes
+from the source, and inserts into the destination. Locales with no matching
+file in the destination are listed in the status bar.
+
 **File order preservation**
-The original file is never sorted or reformatted. Every entry (key-value,
-comment, blank line) is stored with its original line number. On save, only
-the changed lines are rewritten — diffs stay minimal and readable.
+The original file is never sorted or reformatted. Every entry is stored with
+its original line number. On save, only the changed lines are rewritten.
 
 **FileEntry model**
 
-    enum FileEntry {
-        KeyValue { first_line: usize, last_line: usize, key: String, value: String },
-        Comment  { line: usize, raw: String },
-        Blank    { line: usize },
-    }
+```rust
+enum FileEntry {
+    KeyValue { first_line: usize, last_line: usize, key: String, value: String },
+    Comment  { line: usize, raw: String },
+    Blank    { line: usize },
+}
+```
 
 `KeyValue` spans `first_line..=last_line` to support `\`-continuation lines.
-For single-line values `first_line == last_line`. `Comment` and `Blank` are
-always exactly one line.
-
-The parser joins `\`-terminated continuation lines into a single value string.
-`\` continuation is a file-format detail for long lines — the logical value is
-always a single string. The writer collapses continuation lines when saving an
-edited value (re-splitting is a future TODO).
+The parser joins continuation lines into a single value string (the `\` and
+newline are preserved verbatim as the physical value; the display layer strips
+them for rendering). The writer collapses multi-line values to a single line
+on save (re-splitting is a future TODO).
 
 **Render model**
-`build_display_rows(keys: &[String]) -> Vec<DisplayRow>` converts the flat key
-list into a trie and emits a flat sequence of header and key rows:
+`build_display_rows(keys: &[String]) -> Vec<DisplayRow>` groups keys by
+bundle, emits a bundle `Header` at depth 0 for each bundle, then walks a
+dot-split trie for the real keys within it:
 
-    enum DisplayRow {
-        Header { prefix: String },
-        Key    { display: String, full_key: String },
-    }
+```rust
+enum DisplayRow {
+    Header { display: String, prefix: String, depth: usize },
+    Key    { display: String, full_key: String, depth: usize },
+}
+```
 
-A `Header` is emitted at branch points only: a trie node gets a header when
-all of its children are leaf keys and there are ≥2 of them. Single-child
-chains collapse silently. Nodes with mixed-depth children get no header.
+`Header.prefix` is bundle-qualified for within-bundle headers
+(e.g. `"messages:app.confirm"`); for bundle-level headers it is just the
+bundle name. `Key.full_key` is always bundle-qualified.
 
-`Key.display` is ".suffix" when the key falls under a header, or the full key
-when it stands alone. The renderer indents suffixes with 2 spaces.
+Trie rules (applied per bundle):
+- A non-key node with ≥2 key-children emits a `Header`; single-child chains
+  collapse (the child's display is the full relative path from the outer header).
+- A key-node that also has children emits only a `Key` row; its children
+  appear indented below it at depth+1.
+- `depth` drives indentation (`"  ".repeat(depth)`).
+
+Keys without `:` (legacy / test keys) take the bare path — no bundle header.
 
 **Selection model**
 `cursor_row` indexes into `display_rows`. All rows (Header and Key) are
-navigable. `cursor_col` indexes into `visible_locales` (offset by 1; col 0 is
-the key column).
-
-`Key` rows show actual values. A cell with no value in this locale but present
-in others is shown as `<missing>` in red. Header row cells are empty (the key
-does not exist anywhere yet).
+navigable. `cursor_col` indexes into `visible_locales` offset by 1 (col 0 is
+the key column). `<missing>` in red marks cells where the key is absent from
+that locale file. Bundle-level Header cells are always blank.
 
 **Filter system**
-The filter bar is always visible at the bottom. `/` focuses it. The bar is
-backed by a permanent `TextArea<'static>` in `AppState`; the query is
-`filter_textarea.lines()[0]`, parsed live into a `FilterExpr` AST on every
-keystroke and applied to `workspace.merged_keys` to produce `display_rows`.
+The filter bar is always visible. `/` focuses it. The bar is backed by a
+permanent `TextArea<'static>`; the query is `filter_textarea.lines()[0]`,
+parsed live into a `FilterExpr` AST on every keystroke.
 
-Locale selectors also control column visibility: only locales matched by any
-`LocaleStatus` term are shown in `visible_locales`. When there are no locale
-selectors, all locales are visible.
+```
+Full format: [bundle, ... /] [key_pattern, ...] [: locale[modifier], ...]
 
-See `docs/filtering.md` for the full syntax and internal representation.
+bundle selectors  — require / after them; unquoted = prefix match on bundle name
+key patterns      — unquoted = substring; "quoted" = exact
+locale selectors  — unquoted = prefix (de matches de, default, de_AT)
+modifiers         — ! = must be present, ? = must be missing, none = column hint only
+?                 — bare ? shorthand for AnyMissing (at least one locale missing)
+*pattern          — DanglingKey: unsaved key matching the pattern
+```
 
-**Write model**
-Edits are committed in-memory immediately on Enter. Each committed edit is
-appended to `state.pending_writes`. Ctrl+S flushes `pending_writes` to disk
-via `writer::write_change` (one call per edit). Failed writes are kept in
-`pending_writes` so the user can retry. The `[+]` indicator in the status bar
-reflects `state.unsaved_changes`.
+`visible_locales` is narrowed to the matched locales when any `LocaleStatus`
+selector is present; all locales are shown otherwise.
 
-Editing a `<missing>` cell (key not present in the locale file) is currently
-a no-op — new key creation is not yet implemented.
+See `docs/filtering.md` for the full syntax and AST.
 
-**Cell editor**
-Pressing Enter on a locale cell opens a bottom editor pane. The pane title
-shows `key [locale]`. The pane is backed by a `CellEdit` which wraps
-`TextArea<'static>` and stores the original value for change detection.
-Enter commits; Esc cancels. The pane height grows dynamically with the number
-of continuation lines (capped at 8 total lines).
+**PendingChange / write model**
+Edits are committed in-memory immediately and appended to `pending_writes`.
+Ctrl+S flushes them to disk. Failed writes are kept for retry. `[+]` in the
+status bar reflects `unsaved_changes`.
 
-Continuation lines: typing `\` enters `Mode::Continuation` (status bar shows
-`CONT  `). Enter in that sub-mode strips the `\` and opens a new line in the
-TextArea. Esc cancels the continuation and leaves `\` as a literal character.
-Any other key also cancels continuation and is typed normally. On commit,
-`current_value()` joins all TextArea lines with `""` (no separator) — the
-`\` continuation is a file-format detail; the logical value is always a single
-string. The writer currently writes the value as a single line; re-splitting
-with `\` continuations on save is a future TODO.
+```rust
+enum PendingChange {
+    Update { path, first_line, last_line, key, value }, // rewrite existing entry
+    Insert { path, after_line, key, value },            // append new entry
+    Delete { path, first_line, last_line },             // remove entry
+}
+```
 
-The value shown in the table cell while editing is the last saved workspace
-value (reversed highlight), not the live edit — the bottom pane is the source
-of truth during editing.
+`insert_into_file(state, gi, fi, real_key, value)` is the shared helper used
+by cell insert and cross-bundle move. It finds the insertion point, bumps
+subsequent line numbers in-memory, and queues a `PendingChange::Insert`.
+
+When entries are deleted, line numbers of all subsequent entries in the same
+file are shifted down immediately so in-memory state stays consistent.
+
+**Deletion**
+- `d` on a locale cell: removes that one `(key, locale)` entry immediately,
+  leaving the key in `merged_keys` (other locales still visible).
+- `d` on the key column: enters `Mode::Deleting`. The pane shows the key
+  (read-only). Tab toggles `delete_children` (exact vs. +children). Enter
+  confirms; Esc cancels. Dangling (unsaved) keys are dropped without a file
+  write.
+
+**Cell editor / KeyNaming / KeyRenaming**
+The bottom edit pane is used for Editing, KeyNaming, KeyRenaming, and
+Deleting modes. It is backed by a `CellEdit` wrapping `TextArea<'static>`.
+The pane height grows with the number of lines (capped at 8).
+
+- *Editing*: Enter commits, Esc cancels. `\` enters `Mode::Continuation`
+  where Enter inserts a real newline instead of committing.
+- *KeyNaming*: `n` in Normal pre-fills `"bundle:"` or `"bundle:prefix."`;
+  Enter validates (non-empty, unique, has `.` or `:`) and creates the key.
+- *KeyRenaming*: Enter on col 0. Tab toggles exact/+children. Cross-bundle
+  rename (different prefix before `:`) triggers a move instead.
+- *Deleting*: read-only display of the key; Tab and Enter only.
 
 **Keybindings**
-Keybindings are mode-aware: `keybindings.rs` exposes a `Keybindings` struct
-with one `HashMap<KeyEvent, Message>` per mode (`normal`, `editing`,
-`continuation`, `filter`). No keybinding is hardcoded in the rendering or
-update logic.
+`keybindings.rs` exposes a `Keybindings` struct with one
+`HashMap<KeyEvent, Message>` per mode. Unbound keys fall through to
+`TextInput` / `FilterInput` in text modes; silently ignored in Normal /
+Deleting. No keybinding is hardcoded in rendering or update logic.
 
-`handle_key` in `tui.rs` selects the map for the current mode, dispatches any
-match, then falls through to `TextInput` / `FilterInput` for unbound keys in
-text modes (arrows, printable chars, etc. all reach the TextArea).
-
-On Windows, crossterm fires both Press and Release events; the event loop
-filters to `KeyEventKind::Press` only.
-
-On Windows, AltGr is emitted as `Ctrl+Alt`. `normalize_altgr()` in `tui.rs`
-strips those modifiers from `Char` keys before lookup and TextArea dispatch,
-so characters like `\`, `@`, `[`, `]` typed via AltGr work correctly.
+On Windows: crossterm fires both Press and Release; loop filters to Press.
+AltGr emits as Ctrl+Alt — `normalize_altgr()` strips those modifiers from
+Char keys so `\`, `@`, `[`, `]` etc. work correctly.
 
 ## Default keybindings
 
 ```
-Normal:       ↑↓←→/hjkl navigate  PgUp/PgDn  Enter edit  Esc→Filter
-              / filter  Ctrl+S save  q/Ctrl+C quit
+Normal:       ↑↓←→ / hjkl navigate  PgUp/PgDn
+              Enter  edit value (locale col) or rename key (col 0)
+              n      new key
+              d      delete locale entry (locale col) or enter Deleting (col 0)
+              /      focus filter bar
+              Ctrl+S save   q / Ctrl+C quit
 
-Editing:      Enter commit  Esc cancel  \ continuation  Ctrl+S save  Ctrl+C quit
-              (all other keys → TextArea: arrows move cursor, backspace, etc.)
+Editing:      Enter commit  Esc cancel  \ continuation
+              Ctrl+S save  Ctrl+C quit
+              (all other keys → TextArea)
 
 Continuation: Enter new line  Esc cancel \
               (all other keys → cancel continuation, key typed normally)
 
-Filter:       Enter close  Esc close  Ctrl+S save  Ctrl+C quit
+KeyNaming:    Enter confirm  Esc cancel
+              Ctrl+S save  Ctrl+C quit
+              (all other keys → TextArea)
+
+KeyRenaming:  Enter confirm  Tab toggle exact/+children  Esc cancel
+              Ctrl+S save  Ctrl+C quit
+              (all other keys → TextArea)
+
+Deleting:     Enter confirm  Tab toggle exact/+children  Esc cancel
+              Ctrl+S save  Ctrl+C quit
+              (no text input — pane is read-only)
+
+Filter:       Enter / Esc close (keeps query)
+              Ctrl+S save  Ctrl+C quit
               (all other keys → filter TextArea)
 ```
 
@@ -220,38 +295,43 @@ careful — the writer must never corrupt a file.
 
 ### Near-term
 
-- **ClearFilter keybinding**: `ClearFilter` message exists but has no default
-  binding. Add one (e.g. Ctrl+Backspace or a dedicated key).
-- **New key creation**: editing a `<missing>` cell should append the new
-  key=value to the locale file and add it to the workspace in-memory.
-  Editing an empty cell on a `Header` row should do the same, pre-filling
-  `prefix.` as the key prefix.
-- **Save error display**: when `write_change` fails, surface the error in the
+- **Value preview**: `Space` in Normal mode opens a read-only preview pane
+  showing the full value of the selected cell (important for multiline values
+  that are truncated in the table). Also useful on key rows to show the full
+  key path. Same dynamic-height pane as the edit pane; Esc / Space closes it.
+- **Filter by translation text**: extend the filter DSL to match against
+  translation values, not just key names. Possible syntax: `=pattern` (any
+  locale contains pattern) or `:de=pattern` (specific locale). New
+  `FilterExpr::TextMatch` variant in filter.rs.
+- **ClearFilter keybinding**: `ClearFilter` message exists but has no
+  default binding (e.g. `Ctrl+Backspace` or `X` in Filter mode).
+- **Save error display**: when a write fails, surface the error in the
   status bar rather than silently keeping `[+]`.
 - **Viewport height**: `clamp_scroll` uses a hardcoded `VIEWPORT = 20`.
   Pass the actual terminal height through from the renderer.
-- **Re-split continuation lines on save**: `writer::write_change` currently
-  collapses multi-line values to a single line. It should re-split long values
-  with `\` continuations to preserve file readability.
 
 ### Medium-term
-- **nucleo fuzzy matching**: replace the current `key.contains(pattern)`
-  substring match with nucleo for key pattern filtering.
-- **Separator style preservation**: `writer::write_change` always writes
-  `key=value`. It should detect and preserve the original separator (`=` vs
-  `:`) and surrounding whitespace.
-- **Column visibility for Any modifier**: `:de` (no `?`/`!`) narrows the
-  column list correctly but there is no visual "focus" hint differentiating
-  shown-by-filter columns from hidden ones.
+
+- **nucleo fuzzy matching**: replace `key.contains(pattern)` substring match
+  with nucleo for key pattern filtering.
+- **Re-split continuation lines on save**: `write_change` collapses
+  multi-line values to a single line. It should re-split long values with
+  `\` continuations to preserve file readability.
+- **Separator style preservation**: `write_change` always writes `key=value`.
+  It should detect and preserve the original separator (`=` vs `:`) and
+  surrounding whitespace.
+- **Column visibility hint**: `:de` (no `?`/`!`) narrows the column list but
+  there is no visual distinction between "shown by filter" and "always shown".
 
 ### Future
+
 - **Multi-selection**: Shift+A selects all visible rows; actions apply to all
-  selected entries (e.g. bulk-copy default value to a missing locale).
-- **New key flow** (`n`): opens an input pre-filled with the sibling prefix of
-  the row under the cursor, with fuzzy search over existing keys.
+  selected entries (e.g. bulk-copy default value to missing locales).
 - **User config file**: load keybindings from a TOML config at startup.
 - **OR in filter expressions**: `FilterExpr::Or` is reserved in the AST but
   not yet parsed or evaluated.
+- **Create locale file**: when a cross-bundle move has no destination file for
+  a locale, offer to create the file rather than just warning.
 
 ## Further documentation
 

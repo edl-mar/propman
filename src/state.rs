@@ -90,6 +90,10 @@ pub struct AppState {
     /// One-shot message shown in the status bar until the next keypress.
     /// Used for rename conflict errors and similar feedback.
     pub status_message: Option<String>,
+    /// When true, a read-only preview pane is shown below the table in Normal
+    /// and Filter modes.  The pane updates live as the cursor moves.
+    /// Edit modes implicitly suppress it (they use the same pane slot).
+    pub show_preview: bool,
 }
 
 impl AppState {
@@ -113,6 +117,7 @@ impl AppState {
             rename_children: false,
             delete_children: false,
             status_message: None,
+            show_preview: false,
         }
     }
 }

@@ -127,6 +127,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
             }
         }
+        (Mode::Normal, Message::TogglePreview) => {
+            state.show_preview = !state.show_preview;
+        }
         (Mode::Normal, Message::FocusFilter) => {
             state.mode = Mode::Filter;
         }

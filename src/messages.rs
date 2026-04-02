@@ -45,4 +45,6 @@ pub enum Message {
     ToggleDeleteScope,
     // App
     Quit,
+    /// `Space` in Normal mode — toggle the read-only preview pane.
+    TogglePreview,
 }

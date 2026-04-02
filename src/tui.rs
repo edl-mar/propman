@@ -10,7 +10,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{prelude::*, widgets::{Block, Borders, Paragraph}};
+use ratatui::{prelude::*, widgets::{Block, Borders, Paragraph, Wrap}};
 use crate::keybindings::Keybindings;
 
 pub fn run(mut state: AppState, keybindings: Keybindings) -> Result<()> {
@@ -91,7 +91,7 @@ fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
     if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting) {
-        // Pane grows with content: 2 border lines + one per TextArea line, capped at 8.
+        // Edit/confirm pane: height grows with content, capped at 8 lines.
         let content_lines = state.edit_buffer.as_ref()
             .map(|e| e.textarea.lines().len())
             .unwrap_or(1);
@@ -106,6 +106,20 @@ fn draw(f: &mut Frame, state: &AppState) {
         .split(area);
         draw_table(f, chunks[0], state);
         draw_edit_pane(f, chunks[1], state);
+        draw_filter_bar(f, chunks[2], state);
+        draw_status(f, chunks[3], state);
+    } else if state.show_preview {
+        // Preview pane: read-only, same slot as the edit pane.
+        let pane_height = preview_pane_height(state);
+        let chunks = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(pane_height),
+            Constraint::Length(1), // filter bar
+            Constraint::Length(1), // status bar
+        ])
+        .split(area);
+        draw_table(f, chunks[0], state);
+        draw_preview_pane(f, chunks[1], state);
         draw_filter_bar(f, chunks[2], state);
         draw_status(f, chunks[3], state);
     } else {
@@ -179,6 +193,53 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(&edit.textarea, inner);
+}
+
+/// Returns `(title, content)` for the preview pane at the current cursor position,
+/// or `None` when there is nothing to preview (e.g. a header locale cell).
+fn preview_content(state: &AppState) -> Option<(String, String)> {
+    let full_key = match state.display_rows.get(state.cursor_row)? {
+        DisplayRow::Key { full_key, .. } => full_key.as_str(),
+        DisplayRow::Header { prefix, .. } => prefix.as_str(),
+    };
+
+    if state.cursor_col == 0 {
+        // Key column: show the full bundle-qualified key path.
+        Some((format!(" {full_key} "), full_key.to_string()))
+    } else {
+        // Locale column: show the full value for this (key, locale) pair.
+        // Header locale cells have no value and produce no preview.
+        if matches!(state.display_rows.get(state.cursor_row), Some(DisplayRow::Header { .. })) {
+            return None;
+        }
+        let locale = state.visible_locales.get(state.cursor_col - 1)?;
+        let value = state.workspace.get_value(full_key, locale);
+        // Convert physical continuation markers (\+newline) to display newlines.
+        let content = match value {
+            Some(v) => v.replace("\\\n", "\n"),
+            None    => "<missing>".to_string(),
+        };
+        Some((format!(" {full_key} [{locale}] "), content))
+    }
+}
+
+fn preview_pane_height(state: &AppState) -> u16 {
+    let content_lines = preview_content(state)
+        .map(|(_, c)| c.lines().count().max(1))
+        .unwrap_or(1);
+    (content_lines + 2).min(8) as u16
+}
+
+fn draw_preview_pane(f: &mut Frame, area: Rect, state: &AppState) {
+    let Some((title, content)) = preview_content(state) else { return };
+
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(
+        Paragraph::new(content).wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
@@ -336,7 +397,7 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
             Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
-            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  / filter  Ctrl+S save".into(),
+            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save".into(),
         }
     };
     let status = format!(" {mode_label}{dirty}{hints}");

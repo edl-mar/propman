@@ -46,6 +46,7 @@ pub fn default_keybindings() -> Keybindings {
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
         (KeyCode::Char('n'),      none) => Message::NewKey,
         (KeyCode::Char('d'),      none) => Message::DeleteKey,
+        (KeyCode::Char(' '),      none) => Message::TogglePreview,
     ];
 
     let editing = map![
