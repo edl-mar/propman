@@ -38,6 +38,11 @@ pub enum Mode {
     /// new key name (pre-filled with the header prefix + `.`). Enter confirms
     /// the name and transitions straight to value Editing for that key.
     KeyNaming,
+    /// The user pressed Enter on the key column (col 0). The editor TextArea
+    /// holds the current key name for editing. Enter confirms the rename;
+    /// Tab toggles between renaming the exact key vs. the whole prefix subtree
+    /// (only shown/active when the key has children).
+    KeyRenaming,
     Filter,
 }
 
@@ -64,8 +69,14 @@ pub struct AppState {
     pub pending_writes: Vec<PendingChange>,
     /// Set to true by `Message::Quit`; the TUI loop exits on the next iteration.
     pub quitting: bool,
-    /// Active cell editor; present only while `mode == Mode::Editing`.
+    /// Active cell editor; present while mode is Editing, KeyNaming, or KeyRenaming.
     pub edit_buffer: Option<CellEdit>,
+    /// Whether the active key-rename should also rename all keys sharing the
+    /// same prefix (i.e. children in the trie). Only meaningful in KeyRenaming.
+    pub rename_children: bool,
+    /// One-shot message shown in the status bar until the next keypress.
+    /// Used for rename conflict errors and similar feedback.
+    pub status_message: Option<String>,
 }
 
 impl AppState {
@@ -86,6 +97,8 @@ impl AppState {
             pending_writes: Vec::new(),
             quitting: false,
             edit_buffer: None,
+            rename_children: false,
+            status_message: None,
         }
     }
 }

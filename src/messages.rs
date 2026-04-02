@@ -20,6 +20,13 @@ pub enum Message {
     CancelContinuation,
     /// Enter pressed in KeyNaming mode — validates and confirms the typed key name.
     CommitKeyName,
+    /// `n` pressed in Normal mode — open the key-naming editor to create a new key.
+    NewKey,
+    /// Enter pressed in KeyRenaming mode — validate and apply the rename.
+    CommitKeyRename,
+    /// Tab pressed in KeyRenaming mode — toggle between renaming the exact key
+    /// and renaming the whole prefix subtree (only active for key+parent rows).
+    ToggleRenameScope,
     /// A raw key event forwarded to the active TextArea (Editing/Continuation mode).
     TextInput(crossterm::event::KeyEvent),
     // Filter

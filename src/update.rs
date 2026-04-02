@@ -5,6 +5,7 @@ use crate::{
     parser::FileEntry,
     render_model::{self, DisplayRow},
     state::{AppState, Mode, PendingChange},
+    workspace,
     writer,
 };
 
@@ -15,6 +16,9 @@ use crate::{
 ///   0        = key / prefix column selected
 ///   1..=n    = locale column n-1 selected
 pub fn update(mut state: AppState, msg: Message) -> AppState {
+    // Clear any one-shot status message on every new keypress.
+    state.status_message = None;
+
     let mode = state.mode.clone();
 
     match (mode, msg) {
@@ -51,22 +55,41 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         }
         (Mode::Normal, Message::StartEdit) => {
             if state.cursor_col == 0 {
-                // Key / prefix column — no action yet.
-            } else {
-                // Clone prefix before the mutable borrow of state.
-                let header_prefix = match state.display_rows.get(state.cursor_row) {
-                    Some(DisplayRow::Header { prefix }) => Some(prefix.clone()),
-                    _ => None,
+                // Key column: open the rename editor pre-filled with the current key.
+                let row = match state.display_rows.get(state.cursor_row) {
+                    Some(r) => r,
+                    None => return state,
                 };
-                if let Some(prefix) = header_prefix {
-                    // Header row: open the key-naming editor pre-filled with "prefix.".
-                    state.edit_buffer = Some(CellEdit::new(format!("{prefix}.")));
-                    state.mode = Mode::KeyNaming;
-                } else {
-                    let current_value = current_cell_value(&state).unwrap_or_default();
-                    state.edit_buffer = Some(CellEdit::new(current_value));
-                    state.mode = Mode::Editing;
+                // Block rename of bundle-level Header rows (renaming a bundle would
+                // require renaming the file on disk, which we don't support yet).
+                if let DisplayRow::Header { prefix, .. } = row {
+                    if state.workspace.is_bundle_name(prefix) {
+                        return state;
+                    }
                 }
+                let old_key = match row {
+                    DisplayRow::Key { full_key, .. } => full_key.clone(),
+                    DisplayRow::Header { prefix, .. } => prefix.clone(),
+                };
+                // Header rows have no exact key entry — lock to prefix rename.
+                let is_header = matches!(
+                    state.display_rows.get(state.cursor_row),
+                    Some(DisplayRow::Header { .. })
+                );
+                state.rename_children = is_header;
+                state.edit_buffer = Some(CellEdit::new(old_key));
+                state.mode = Mode::KeyRenaming;
+            } else {
+                // Block value editing on bundle-level Header rows (they have no key).
+                if let Some(DisplayRow::Header { prefix, .. }) = state.display_rows.get(state.cursor_row) {
+                    if state.workspace.is_bundle_name(prefix) {
+                        return state;
+                    }
+                }
+                // Both Key and within-bundle Header rows open a value editor.
+                let current_value = current_cell_value(&state).unwrap_or_default();
+                state.edit_buffer = Some(CellEdit::new(current_value));
+                state.mode = Mode::Editing;
             }
         }
         (Mode::Normal, Message::FocusFilter) => {
@@ -90,6 +113,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     } else {
                         commit_cell_edit(&mut state, new_value);
                     }
+                    // Rebuild display: dangling status may have changed (key is no
+                    // longer dangling after its first translation), and locale-status
+                    // filters (e.g. `:de?`, `*`) should re-evaluate immediately.
+                    apply_filter(&mut state);
                 }
             }
             state.mode = Mode::Normal;
@@ -130,16 +157,54 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.mode = Mode::Normal;
         }
 
+        // ── New key (n) ──────────────────────────────────────────────────────
+        (Mode::Normal, Message::NewKey) => {
+            // Pre-fill the key-naming editor with the parent prefix of the
+            // current row so the user types only the new suffix.
+            let prefix = match state.display_rows.get(state.cursor_row) {
+                Some(DisplayRow::Header { prefix, .. }) => {
+                    if state.workspace.is_bundle_name(prefix) {
+                        // Bundle header: pre-fill "bundle:" so the user types the real key.
+                        format!("{prefix}:")
+                    } else {
+                        // Within-bundle header: "bundle:app.confirm" → "bundle:app.confirm."
+                        format!("{prefix}.")
+                    }
+                }
+                Some(DisplayRow::Key { full_key, .. }) => {
+                    // "messages:app.error" → rfind('.') finds '.' in "app.error"
+                    //   → "messages:app."  (correctly bundle-qualified)
+                    // If no dot: "messages:app" → fall back to "messages:"
+                    match full_key.rfind('.') {
+                        Some(i) => format!("{}.", &full_key[..i]),
+                        None => {
+                            // No dot in real key — pre-fill with bundle prefix if present.
+                            match full_key.find(':') {
+                                Some(i) => format!("{}:", &full_key[..i]),
+                                None    => String::new(),
+                            }
+                        }
+                    }
+                }
+                _ => String::new(),
+            };
+            state.edit_buffer = Some(CellEdit::new(prefix));
+            state.mode = Mode::KeyNaming;
+        }
+
         // ── KeyNaming mode ───────────────────────────────────────────────────
         (Mode::KeyNaming, Message::CommitKeyName) => {
             let new_key = state.edit_buffer.as_ref()
                 .map(|e| e.current_value().trim().to_string())
                 .unwrap_or_default();
 
-            // Valid key: non-empty, contains at least one dot, not already known.
+            // Valid key: non-empty, not already known, and either:
+            //   - contains a '.' (bare key: "app.title")
+            //   - is bundle-qualified with a non-empty real key ("messages:app")
+            let (_, real_part) = workspace::split_key(&new_key);
             let is_valid = !new_key.is_empty()
-                && new_key.contains('.')
-                && !state.workspace.merged_keys.contains(&new_key);
+                && !state.workspace.merged_keys.contains(&new_key)
+                && (new_key.contains('.') || (!real_part.is_empty() && new_key.contains(':')));
 
             if is_valid {
                 state.edit_buffer = None;
@@ -154,14 +219,12 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     matches!(r, DisplayRow::Key { full_key, .. } if *full_key == new_key)
                 }) {
                     state.cursor_row = row_idx;
+                    // Place cursor on the first locale column (default) so the user
+                    // can immediately hit Enter to start adding a translation.
+                    state.cursor_col = state.visible_locales.len().min(1);
                     clamp_scroll(&mut state);
-                    // Open the value editor; commit_cell_insert will handle the write.
-                    state.edit_buffer = Some(CellEdit::new(String::new()));
-                    state.mode = Mode::Editing;
-                } else {
-                    // New key hidden by active filter — return to Normal.
-                    state.mode = Mode::Normal;
                 }
+                state.mode = Mode::Normal;
             }
             // else: invalid key — stay in KeyNaming so the user can correct it.
         }
@@ -170,6 +233,60 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.mode = Mode::Normal;
         }
         (Mode::KeyNaming, Message::TextInput(key)) => {
+            if let Some(edit) = state.edit_buffer.as_mut() {
+                edit.textarea.input(tui_textarea::Input::from(key));
+            }
+        }
+
+        // ── KeyRenaming mode ─────────────────────────────────────────────────
+        (Mode::KeyRenaming, Message::ToggleRenameScope) => {
+            // Only meaningful for Key rows that have children; ignore for headers.
+            let is_header = matches!(
+                state.display_rows.get(state.cursor_row),
+                Some(DisplayRow::Header { .. })
+            );
+            if !is_header {
+                if let Some(DisplayRow::Key { full_key, .. }) = state.display_rows.get(state.cursor_row) {
+                    let prefix = format!("{full_key}.");
+                    let has_children = state.workspace.merged_keys.iter().any(|k| k.starts_with(&prefix));
+                    if has_children {
+                        state.rename_children = !state.rename_children;
+                    }
+                }
+            }
+        }
+        (Mode::KeyRenaming, Message::CommitKeyRename) => {
+            let new_key = state.edit_buffer.as_ref()
+                .map(|e| e.current_value().trim().to_string())
+                .unwrap_or_default();
+
+            let old_key = match state.display_rows.get(state.cursor_row) {
+                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
+                Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
+                _ => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
+            };
+
+            // Validate: non-empty, has a dot or colon, not the same as before.
+            if new_key.is_empty() || (!new_key.contains('.') && !new_key.contains(':')) {
+                state.status_message = Some("Key must contain at least one '.'".to_string());
+                // Stay in KeyRenaming so the user can fix it.
+            } else if new_key != old_key {
+                if state.rename_children {
+                    commit_prefix_rename(&mut state, &old_key, new_key);
+                } else {
+                    commit_exact_rename(&mut state, &old_key, new_key);
+                }
+            } else {
+                // No change — just close.
+                state.edit_buffer = None;
+                state.mode = Mode::Normal;
+            }
+        }
+        (Mode::KeyRenaming, Message::CancelEdit) => {
+            state.edit_buffer = None;
+            state.mode = Mode::Normal;
+        }
+        (Mode::KeyRenaming, Message::TextInput(key)) => {
             if let Some(edit) = state.edit_buffer.as_mut() {
                 edit.textarea.input(tui_textarea::Input::from(key));
             }
@@ -238,23 +355,19 @@ fn current_cell_value(state: &AppState) -> Option<String> {
     let full_key = match state.display_rows.get(state.cursor_row)? {
         DisplayRow::Key { full_key, .. } => full_key.as_str(),
         // Header rows have no stored value; editing will create the key.
-        DisplayRow::Header { prefix } => prefix.as_str(),
+        DisplayRow::Header { prefix, .. } => prefix.as_str(),
     };
 
     let locale = state.visible_locales.get(locale_idx)?;
 
-    state.workspace.groups.iter()
-        .flat_map(|g| g.files.iter())
-        .filter(|f| &f.locale == locale)
-        .find_map(|f| f.get(full_key))
-        .map(|v| v.to_string())
+    state.workspace.get_value(full_key, locale).map(|v| v.to_string())
 }
 
 /// Applies a committed edit to the in-memory workspace and records a pending
 /// disk write.
 ///
 /// Only updates existing keys. Editing a `<missing>` cell (key not in the
-/// locale file) is a no-op — new-key creation is not yet implemented.
+/// locale file) is a no-op — handled by `commit_cell_insert` instead.
 fn commit_cell_edit(state: &mut AppState, new_value: String) {
     if state.cursor_col == 0 {
         return;
@@ -269,16 +382,23 @@ fn commit_cell_edit(state: &mut AppState, new_value: String) {
         _ => return, // Header row — no-op.
     };
 
+    // Split bundle qualifier: files store the real key without bundle prefix.
+    let (bundle, real_key) = workspace::split_key(&full_key);
+    let real_key = real_key.to_string();
+
     // Pass 1 (immutable): locate the entry and collect what we need.
     let mut found: Option<(usize, usize, usize)> = None; // (group_idx, file_idx, entry_idx)
     'find: for (gi, group) in state.workspace.groups.iter().enumerate() {
+        if !bundle.is_empty() && group.base_name != bundle {
+            continue;
+        }
         for (fi, file) in group.files.iter().enumerate() {
             if file.locale != locale {
                 continue;
             }
             for (ei, entry) in file.entries.iter().enumerate() {
                 if let FileEntry::KeyValue { key, .. } = entry {
-                    if *key == full_key {
+                    if *key == real_key {
                         found = Some((gi, fi, ei));
                         break 'find;
                     }
@@ -312,7 +432,7 @@ fn commit_cell_edit(state: &mut AppState, new_value: String) {
         path,
         first_line,
         last_line,
-        key: full_key,
+        key: real_key, // write the bare key — files never store bundle prefix
         value: new_value,
     });
     state.unsaved_changes = true;
@@ -331,42 +451,82 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
     };
     let full_key = match state.display_rows.get(state.cursor_row) {
         Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
-        _ => return, // Header rows handled separately in the future.
+        // Header rows: insert a translation for the prefix key itself.
+        Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
+        _ => return,
     };
 
-    // Find the group that owns this key (where it exists in some other locale).
-    // That group's file for `locale` is where we insert.
+    // If this key isn't in merged_keys yet (e.g. translating a Header row whose
+    // prefix was never a standalone key in any file), register it now so the
+    // Key row appears immediately after apply_filter — without needing a restart.
+    if !state.workspace.merged_keys.contains(&full_key) {
+        state.workspace.merged_keys.push(full_key.clone());
+        state.workspace.merged_keys.sort();
+    }
+
+    // Split bundle qualifier: files store the real key without bundle prefix.
+    // When a bundle is encoded in full_key, we look in exactly that bundle's group.
+    let (bundle, real_key) = workspace::split_key(&full_key);
+    let real_key = real_key.to_string();
+
+    // Find the group and file for this locale.  With bundle support the group is
+    // unambiguous (bundle name == group.base_name).  For dangling keys we also
+    // check sibling keys already in the group as a secondary signal.
     let mut target: Option<(usize, usize)> = None; // (group_idx, file_idx)
+
     'find: for (gi, group) in state.workspace.groups.iter().enumerate() {
-        let key_in_group = group.files.iter().any(|f| f.get(&full_key).is_some());
-        if !key_in_group {
-            continue;
+        if !bundle.is_empty() && group.base_name != bundle {
+            continue; // Different bundle — skip.
         }
-        for (fi, file) in group.files.iter().enumerate() {
-            if file.locale == locale {
-                target = Some((gi, fi));
+        // Prefer a group where the key already exists in another locale.
+        let key_in_group = group.files.iter().any(|f| f.get(&real_key).is_some());
+        if !bundle.is_empty() || key_in_group {
+            for (fi, file) in group.files.iter().enumerate() {
+                if file.locale == locale {
+                    target = Some((gi, fi));
+                    break 'find;
+                }
+            }
+            if !bundle.is_empty() {
+                // The bundle was explicit; no need to continue searching other groups.
                 break 'find;
             }
         }
     }
 
-    // Fallback for brand-new keys not yet present in any locale: find the group
-    // that owns the key's prefix (e.g. "app.confirm" for "app.confirm.cancel").
-    if target.is_none() {
-        let prefix_end = full_key.rfind('.').unwrap_or(full_key.len());
-        let prefix = &full_key[..prefix_end];
-        'prefix_find: for (gi, group) in state.workspace.groups.iter().enumerate() {
-            let has_prefix = group.files.iter().any(|f| {
-                f.entries.iter().any(|e| matches!(e,
-                    FileEntry::KeyValue { key, .. } if key.starts_with(prefix)
-                ))
-            });
-            if has_prefix {
-                for (fi, file) in group.files.iter().enumerate() {
-                    if file.locale == locale {
-                        target = Some((gi, fi));
-                        break 'prefix_find;
+    // Fallback for bare (non-bundle) dangling keys: walk up the dot-boundary prefix
+    // chain until a group is found that owns keys sharing the prefix.
+    if target.is_none() && bundle.is_empty() {
+        let mut end = real_key.len();
+        'walk: while let Some(dot) = real_key[..end].rfind('.') {
+            let prefix = &real_key[..dot];
+            for (gi, group) in state.workspace.groups.iter().enumerate() {
+                let has_prefix = group.files.iter().any(|f| {
+                    f.entries.iter().any(|e| matches!(e,
+                        FileEntry::KeyValue { key, .. } if key.starts_with(prefix)
+                    ))
+                });
+                if has_prefix {
+                    for (fi, file) in group.files.iter().enumerate() {
+                        if file.locale == locale {
+                            target = Some((gi, fi));
+                            break 'walk;
+                        }
                     }
+                    break 'walk;
+                }
+            }
+            end = dot;
+        }
+    }
+
+    // Last resort: first file that serves this locale.
+    if target.is_none() {
+        'last: for (gi, group) in state.workspace.groups.iter().enumerate() {
+            for (fi, file) in group.files.iter().enumerate() {
+                if file.locale == locale {
+                    target = Some((gi, fi));
+                    break 'last;
                 }
             }
         }
@@ -374,11 +534,11 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
 
     let (gi, fi) = match target {
         Some(t) => t,
-        None => return, // No file for this locale in the key's group — skip.
+        None => return, // No file for this locale — skip.
     };
 
     let after_line = state.workspace.groups[gi].files[fi]
-        .insertion_point_for(&full_key);
+        .insertion_point_for(&real_key);
 
     // How many physical lines does the new value occupy?
     let n_lines = new_value.split('\n').count();
@@ -403,21 +563,153 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
     }
 
     // Register the new entry in the in-memory workspace.
+    // Files always store the bare real_key — never the bundle-qualified form.
     let path = state.workspace.groups[gi].files[fi].path.clone();
     state.workspace.groups[gi].files[fi].entries.push(FileEntry::KeyValue {
         first_line: new_first_line,
         last_line:  new_last_line,
-        key:   full_key.clone(),
+        key:   real_key.clone(),
         value: new_value.clone(),
     });
 
     state.pending_writes.push(PendingChange::Insert {
         path,
         after_line,
-        key:   full_key,
+        key:   real_key,
         value: new_value,
     });
     state.unsaved_changes = true;
+}
+
+/// Rename one exact key across all locale files that contain it.
+/// Updates `merged_keys` and queues `PendingChange::Update` entries.
+/// Sets `state.status_message` and returns without changing mode on conflict.
+fn commit_exact_rename(state: &mut AppState, old_key: &str, new_key: String) {
+    // Cross-bundle rename is not supported (would require moving entries between files).
+    let (old_bundle, _) = workspace::split_key(old_key);
+    let (new_bundle, new_real) = workspace::split_key(&new_key);
+    if old_bundle != new_bundle {
+        state.status_message = Some("Cannot rename across bundles".to_string());
+        return;
+    }
+    if new_real.is_empty() {
+        state.status_message = Some("Key must have a name after ':'".to_string());
+        return;
+    }
+    if state.workspace.merged_keys.contains(&new_key) {
+        state.status_message = Some(format!("'{new_key}' already exists"));
+        return;
+    }
+    rename_key_in_workspace(state, old_key, &new_key);
+    if let Some(pos) = state.workspace.merged_keys.iter().position(|k| k == old_key) {
+        state.workspace.merged_keys[pos] = new_key;
+        state.workspace.merged_keys.sort();
+    }
+    state.edit_buffer = None;
+    state.mode = Mode::Normal;
+    apply_filter(state);
+}
+
+/// Rename every key that equals `old_prefix` or starts with `old_prefix.`
+/// across all locale files.  Both prefixes must be in the same bundle.
+fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String) {
+    let (old_bundle, _) = workspace::split_key(old_prefix);
+    let (new_bundle, new_real) = workspace::split_key(&new_prefix);
+    if old_bundle != new_bundle {
+        state.status_message = Some("Cannot rename across bundles".to_string());
+        return;
+    }
+    if new_real.is_empty() {
+        state.status_message = Some("Key must have a name after ':'".to_string());
+        return;
+    }
+    let dot_prefix = format!("{old_prefix}.");
+    let keys_to_rename: Vec<String> = state.workspace.merged_keys.iter()
+        .filter(|k| *k == old_prefix || k.starts_with(&dot_prefix))
+        .cloned()
+        .collect();
+
+    // Conflict check: ensure no renamed key collides with an existing unrelated key.
+    for k in &keys_to_rename {
+        let new_k = format!("{}{}", new_prefix, &k[old_prefix.len()..]);
+        if state.workspace.merged_keys.contains(&new_k) && !keys_to_rename.contains(&new_k) {
+            state.status_message = Some(format!("'{new_k}' already exists"));
+            return;
+        }
+    }
+
+    for k in keys_to_rename.clone() {
+        let new_k = format!("{}{}", new_prefix, &k[old_prefix.len()..]);
+        rename_key_in_workspace(state, &k, &new_k);
+    }
+
+    let old_set: std::collections::HashSet<String> = keys_to_rename.iter().cloned().collect();
+    state.workspace.merged_keys.retain(|k| !old_set.contains(k));
+    for k in &keys_to_rename {
+        state.workspace.merged_keys.push(format!("{}{}", new_prefix, &k[old_prefix.len()..]));
+    }
+    state.workspace.merged_keys.sort();
+
+    state.edit_buffer = None;
+    state.mode = Mode::Normal;
+    apply_filter(state);
+}
+
+/// Rewrite every `old_key` entry in every locale file to `new_key`, keeping
+/// the value unchanged.  Updates the in-memory workspace and queues
+/// `PendingChange::Update` entries for the next Ctrl+S flush.
+///
+/// Both keys must be in the same bundle (cross-bundle renames are blocked before
+/// reaching here).  Files store the bare real key — the bundle prefix is stripped
+/// before any file-level operation.
+fn rename_key_in_workspace(state: &mut AppState, old_key: &str, new_key: &str) {
+    let (old_bundle, old_real) = workspace::split_key(old_key);
+    let (_new_bundle, new_real) = workspace::split_key(new_key);
+
+    // Pass 1 (immutable): collect all matching entries in the right bundle.
+    let mut found: Vec<(std::path::PathBuf, usize, usize, String)> = Vec::new();
+    for group in &state.workspace.groups {
+        if !old_bundle.is_empty() && group.base_name != old_bundle {
+            continue;
+        }
+        for file in &group.files {
+            for entry in &file.entries {
+                if let FileEntry::KeyValue { key, value, first_line, last_line } = entry {
+                    if key == old_real {
+                        found.push((file.path.clone(), *first_line, *last_line, value.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Pass 2 (mutable): update key names in-memory.
+    for group in &mut state.workspace.groups {
+        if !old_bundle.is_empty() && group.base_name != old_bundle {
+            continue;
+        }
+        for file in &mut group.files {
+            for entry in &mut file.entries {
+                if let FileEntry::KeyValue { key, .. } = entry {
+                    if key == old_real {
+                        *key = new_real.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Queue a pending write for each affected file entry.
+    for (path, first_line, last_line, value) in found {
+        state.pending_writes.push(PendingChange::Update {
+            path,
+            first_line,
+            last_line,
+            key: new_real.to_string(), // always write the bare key to the file
+            value,
+        });
+        state.unsaved_changes = true;
+    }
 }
 
 /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,

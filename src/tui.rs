@@ -65,6 +65,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
         Mode::Editing      => &keybindings.editing,
         Mode::Continuation => &keybindings.continuation,
         Mode::KeyNaming    => &keybindings.key_naming,
+        Mode::KeyRenaming  => &keybindings.key_renaming,
         Mode::Filter       => &keybindings.filter,
     };
 
@@ -76,9 +77,9 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
     // are silently ignored (Normal mode).
     match state.mode {
         Mode::Editing | Mode::Continuation => update(state, Message::TextInput(key)),
-        Mode::KeyNaming                    => update(state, Message::TextInput(key)),
-        Mode::Filter                       => update(state, Message::FilterInput(key)),
-        Mode::Normal                       => state,
+        Mode::KeyNaming | Mode::KeyRenaming => update(state, Message::TextInput(key)),
+        Mode::Filter                        => update(state, Message::FilterInput(key)),
+        Mode::Normal                        => state,
     }
 }
 
@@ -87,7 +88,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
 fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming) {
+    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::KeyRenaming) {
         // Pane grows with content: 2 border lines + one per TextArea line, capped at 8.
         let content_lines = state.edit_buffer.as_ref()
             .map(|e| e.textarea.lines().len())
@@ -123,6 +124,7 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
 
     let full_key = match state.display_rows.get(state.cursor_row) {
         Some(DisplayRow::Key { full_key, .. }) => full_key.as_str(),
+        Some(DisplayRow::Header { prefix, .. }) => prefix.as_str(),
         _ => "",
     };
     let locale = state.visible_locales
@@ -131,12 +133,24 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
         .unwrap_or("");
 
     let title = if matches!(state.mode, Mode::KeyNaming) {
-        // Show the header prefix the new key will live under.
-        let prefix = match state.display_rows.get(state.cursor_row) {
-            Some(DisplayRow::Header { prefix }) => prefix.as_str(),
-            _ => full_key,
-        };
-        format!(" new key under {prefix} [{locale}] ")
+        format!(" new key [{locale}] ")
+    } else if matches!(state.mode, Mode::KeyRenaming) {
+        let is_header = matches!(
+            state.display_rows.get(state.cursor_row),
+            Some(DisplayRow::Header { .. })
+        );
+        if is_header {
+            format!(" rename prefix · {full_key} ")
+        } else {
+            let prefix = format!("{full_key}.");
+            let has_children = state.workspace.merged_keys.iter().any(|k| k.starts_with(&prefix));
+            if has_children {
+                let scope = if state.rename_children { "+children" } else { "exact" };
+                format!(" rename · {full_key} [{scope}] Tab: toggle ")
+            } else {
+                format!(" rename · {full_key} ")
+            }
+        }
     } else {
         format!(" {full_key} [{locale}] ")
     };
@@ -194,12 +208,24 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
 
         // Resolve key text, full key for lookups, and indentation.
         let (indent, key_text, full_key, is_header) = match display_row {
-            DisplayRow::Header { prefix } => ("", format!("{prefix}:"), prefix.as_str(), true),
-            DisplayRow::Key { display, full_key } => {
-                let indent = if display.starts_with('.') { "  " } else { "" };
-                (indent, format!("{display}: "), full_key.as_str(), false)
+            DisplayRow::Header { display, prefix, depth } => {
+                (
+                    "  ".repeat(*depth),
+                    format!("{display}:"),
+                    prefix.as_str(),
+                    true,
+                )
+            }
+            DisplayRow::Key { display, full_key, depth } => {
+                let indent = "  ".repeat(*depth);
+                let dangling = if state.workspace.is_dangling(full_key) { "*" } else { "" };
+                (indent, format!("{dangling}{display}: "), full_key.as_str(), false)
             }
         };
+
+        // Bundle-level headers (depth 0, prefix == bundle name) never have
+        // locale columns — the bundle name is not itself a translatable key.
+        let is_bundle_header = is_header && state.workspace.is_bundle_name(full_key);
 
         // Key / prefix column (cursor_col == 0).
         let key_col_style = if is_selected_row && state.cursor_col == 0 {
@@ -214,24 +240,22 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
 
         let mut spans = vec![Span::raw(indent), Span::styled(key_text, key_col_style)];
 
+        if is_bundle_header {
+            lines.push(Line::from(spans));
+            continue;
+        }
+
         // Locale columns (cursor_col == locale_idx + 1).
         for (col_idx, locale) in locales.iter().enumerate() {
             let locale_col = col_idx + 1;
             let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
 
             // Headers have no stored values — their cells are empty/creatable.
-            // Search all files matching the locale (across groups) so that a key
-            // present in group B is not hidden by group A's file for that locale.
+            // Bundle headers (prefix == bundle name) are also always empty.
             let value = if is_header {
                 None
             } else {
-                state
-                    .workspace
-                    .groups
-                    .iter()
-                    .flat_map(|g| g.files.iter())
-                    .filter(|f| &f.locale == locale)
-                    .find_map(|f| f.get(full_key))
+                state.workspace.get_value(full_key, locale)
             };
 
             let tag_style = if is_selected_row {
@@ -278,14 +302,21 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Editing      => "EDIT  ",
         Mode::Continuation => "CONT  ",
         Mode::KeyNaming    => "NEWKEY",
+        Mode::KeyRenaming  => "RENAME",
         Mode::Filter       => "FILTER",
     };
     let dirty = if state.unsaved_changes { " [+]" } else { "    " };
-    let hints = match state.mode {
-        Mode::Editing      => "  Enter commit  Esc cancel  \\ continuation",
-        Mode::Continuation => "  Enter new line  Esc cancel \\",
-        Mode::KeyNaming    => "  Enter confirm key name  Esc cancel",
-        _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit  / filter  Ctrl+S save",
+    // Status message (e.g. rename conflict) overrides the normal hints for one keypress.
+    let hints: std::borrow::Cow<str> = if let Some(msg) = &state.status_message {
+        format!("  {msg}").into()
+    } else {
+        match state.mode {
+            Mode::Editing      => "  Enter commit  Esc cancel  \\ continuation".into(),
+            Mode::Continuation => "  Enter new line  Esc cancel \\".into(),
+            Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
+            Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
+            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  / filter  Ctrl+S save".into(),
+        }
     };
     let status = format!(" {mode_label}{dirty}{hints}");
     f.render_widget(

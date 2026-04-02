@@ -1,4 +1,4 @@
-use crate::workspace::Workspace;
+use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchMode {
@@ -25,13 +25,22 @@ pub enum FilterExpr {
     LocaleStatus { locale: String, modifier: StatusModifier, mode: MatchMode },
     /// Bare `?` shorthand: at least one locale is missing.
     AnyMissing,
+    /// `*pattern` — key is dangling (unsaved) and matches the pattern.
+    /// Bare `*` matches all dangling keys.
+    DanglingKey { pattern: String, mode: MatchMode },
+    /// `bundle1, bundle2 /` — key must belong to one of the listed bundles.
+    /// Unquoted = prefix match on the bundle name; quoted = exact match.
+    BundleFilter(Vec<(String, MatchMode)>),
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 /// Parse a filter query string into a `FilterExpr`.
 ///
-/// Format: `[key_pattern, ...] : [locale][modifier], ...`
+/// Full format: `[bundle, ... /] [key_pattern, ...] [: locale[modifier], ...]`
+///
+/// The `/` separator is mandatory when bundle selectors are present; without it
+/// all existing `:` behaviour is unchanged (backward compatible).
 ///
 /// Returns `FilterExpr::And([])` (matches everything) for empty input.
 pub fn parse(input: &str) -> FilterExpr {
@@ -40,13 +49,36 @@ pub fn parse(input: &str) -> FilterExpr {
         return FilterExpr::And(vec![]);
     }
 
-    // Split on the first `:` to separate key patterns from locale selectors.
-    let (key_part, locale_part) = match input.find(':') {
-        Some(idx) => (input[..idx].trim(), Some(input[idx + 1..].trim())),
-        None => (input, None),
+    let mut terms: Vec<FilterExpr> = Vec::new();
+
+    // Split on '/' first to extract optional bundle selectors.
+    let key_locale_part = if let Some(slash_idx) = input.find('/') {
+        let bundle_str = input[..slash_idx].trim();
+        let mut bundle_terms: Vec<(String, MatchMode)> = Vec::new();
+        for raw in bundle_str.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            if let Some(inner) = strip_quotes(raw) {
+                bundle_terms.push((inner.to_string(), MatchMode::Exact));
+            } else {
+                bundle_terms.push((raw.to_string(), MatchMode::Unquoted));
+            }
+        }
+        if !bundle_terms.is_empty() {
+            terms.push(FilterExpr::BundleFilter(bundle_terms));
+        }
+        input[slash_idx + 1..].trim()
+    } else {
+        input
     };
 
-    let mut terms: Vec<FilterExpr> = Vec::new();
+    // Split on the first `:` to separate key patterns from locale selectors.
+    let (key_part, locale_part) = match key_locale_part.find(':') {
+        Some(idx) => (key_locale_part[..idx].trim(), Some(key_locale_part[idx + 1..].trim())),
+        None => (key_locale_part, None),
+    };
 
     for raw in key_part.split(',') {
         let raw = raw.trim();
@@ -70,6 +102,13 @@ pub fn parse(input: &str) -> FilterExpr {
 }
 
 fn parse_key_term(raw: &str) -> FilterExpr {
+    if let Some(rest) = raw.strip_prefix('*') {
+        // `*"pattern"` → exact dangling match; `*pattern` → substring dangling match.
+        if let Some(inner) = strip_quotes(rest) {
+            return FilterExpr::DanglingKey { pattern: inner.to_string(), mode: MatchMode::Exact };
+        }
+        return FilterExpr::DanglingKey { pattern: rest.to_string(), mode: MatchMode::Unquoted };
+    }
     if let Some(inner) = strip_quotes(raw) {
         return FilterExpr::KeyPattern { pattern: inner.to_string(), mode: MatchMode::Exact };
     }
@@ -147,6 +186,24 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace) -> bool {
             .iter()
             .any(|locale| !has_value(key, locale, workspace)),
 
+        FilterExpr::DanglingKey { pattern, mode } => {
+            if !workspace.is_dangling(key) {
+                return false;
+            }
+            match mode {
+                MatchMode::Exact => key == pattern.as_str(),
+                MatchMode::Unquoted => key.contains(pattern.as_str()),
+            }
+        }
+
+        FilterExpr::BundleFilter(bundles) => {
+            let (key_bundle, _) = workspace::split_key(key);
+            bundles.iter().any(|(pattern, mode)| match mode {
+                MatchMode::Exact => key_bundle == pattern.as_str(),
+                MatchMode::Unquoted => key_bundle.starts_with(pattern.as_str()),
+            })
+        }
+
         FilterExpr::LocaleStatus { locale, modifier, mode } => {
             match modifier {
                 // Any modifier: column-visibility hint only, never filters keys.
@@ -208,7 +265,8 @@ fn collect_locale_selectors<'a>(expr: &'a FilterExpr, out: &mut Vec<(&'a str, &'
         FilterExpr::LocaleStatus { locale, mode, .. } => {
             out.push((locale.as_str(), mode));
         }
-        _ => {}
+        FilterExpr::BundleFilter(_) | FilterExpr::KeyPattern { .. }
+        | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. } => {}
     }
 }
 
@@ -222,12 +280,7 @@ fn locale_matches(locale: &str, pattern: &str, mode: &MatchMode) -> bool {
 }
 
 fn has_value(key: &str, locale: &str, workspace: &Workspace) -> bool {
-    workspace
-        .groups
-        .iter()
-        .flat_map(|g| g.files.iter())
-        .filter(|f| f.locale == locale)
-        .any(|f| f.get(key).is_some())
+    workspace.get_value(key, locale).is_some()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

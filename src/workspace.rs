@@ -129,7 +129,8 @@ impl Workspace {
                 for file in &files {
                     for entry in &file.entries {
                         if let FileEntry::KeyValue { key, .. } = entry {
-                            all_keys.insert(key.clone());
+                            // Store as "bundle:real_key" in merged_keys.
+                            all_keys.insert(format!("{base_name}:{key}"));
                         }
                     }
                 }
@@ -145,6 +146,33 @@ impl Workspace {
         Ok(Workspace { groups, merged_keys })
     }
 
+    /// Returns `true` if `full_key` is in `merged_keys` but has no entry in any
+    /// locale file — i.e. it was just created this session and not yet saved.
+    pub fn is_dangling(&self, full_key: &str) -> bool {
+        let (bundle, real_key) = split_key(full_key);
+        !self.groups.iter()
+            .filter(|g| bundle.is_empty() || g.base_name == bundle)
+            .flat_map(|g| g.files.iter())
+            .any(|f| f.get(real_key).is_some())
+    }
+
+    /// Look up the value for `full_key` (bundle-qualified or bare) in `locale`.
+    /// Routes to the correct bundle group, then looks up by the real key.
+    pub fn get_value<'a>(&'a self, full_key: &str, locale: &str) -> Option<&'a str> {
+        let (bundle, real_key) = split_key(full_key);
+        self.groups.iter()
+            .filter(|g| bundle.is_empty() || g.base_name == bundle)
+            .flat_map(|g| g.files.iter())
+            .filter(|f| f.locale == locale)
+            .find_map(|f| f.get(real_key))
+    }
+
+    /// Returns `true` if `prefix` is the name of a bundle (i.e. matches a group's
+    /// `base_name`). Used to detect bundle-level `Header` rows.
+    pub fn is_bundle_name(&self, prefix: &str) -> bool {
+        self.groups.iter().any(|g| g.base_name == prefix)
+    }
+
     /// All distinct locale strings across all groups, "default" first.
     pub fn all_locales(&self) -> Vec<String> {
         let mut seen: HashSet<&str> = HashSet::new();
@@ -157,6 +185,17 @@ impl Workspace {
             }
         }
         out
+    }
+}
+
+/// Splits a bundle-qualified key into `(bundle, real_key)`.
+///
+/// `"messages:app.title"` → `("messages", "app.title")`
+/// `"app.title"`          → `("", "app.title")`  (no bundle prefix)
+pub fn split_key(full_key: &str) -> (&str, &str) {
+    match full_key.find(':') {
+        Some(idx) => (&full_key[..idx], &full_key[idx + 1..]),
+        None => ("", full_key),
     }
 }
 
