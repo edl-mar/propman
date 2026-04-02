@@ -656,14 +656,13 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
 }
 
 /// Rename one exact key across all locale files that contain it.
-/// Updates `merged_keys` and queues `PendingChange::Update` entries.
-/// Sets `state.status_message` and returns without changing mode on conflict.
+/// Routes to `commit_cross_bundle_rename` when the bundle prefix changes.
+/// Sets `state.status_message` and stays in KeyRenaming on conflict.
 fn commit_exact_rename(state: &mut AppState, old_key: &str, new_key: String) {
-    // Cross-bundle rename is not supported (would require moving entries between files).
     let (old_bundle, _) = workspace::split_key(old_key);
     let (new_bundle, new_real) = workspace::split_key(&new_key);
     if old_bundle != new_bundle {
-        state.status_message = Some("Cannot rename across bundles".to_string());
+        commit_cross_bundle_rename(state, old_key, new_key);
         return;
     }
     if new_real.is_empty() {
@@ -685,12 +684,12 @@ fn commit_exact_rename(state: &mut AppState, old_key: &str, new_key: String) {
 }
 
 /// Rename every key that equals `old_prefix` or starts with `old_prefix.`
-/// across all locale files.  Both prefixes must be in the same bundle.
+/// Routes to `commit_cross_bundle_prefix_rename` when the bundle prefix changes.
 fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String) {
     let (old_bundle, _) = workspace::split_key(old_prefix);
     let (new_bundle, new_real) = workspace::split_key(&new_prefix);
     if old_bundle != new_bundle {
-        state.status_message = Some("Cannot rename across bundles".to_string());
+        commit_cross_bundle_prefix_rename(state, old_prefix, new_prefix);
         return;
     }
     if new_real.is_empty() {
@@ -724,6 +723,192 @@ fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: Stri
     }
     state.workspace.merged_keys.sort();
 
+    state.edit_buffer = None;
+    state.mode = Mode::Normal;
+    apply_filter(state);
+}
+
+/// Inserts `real_key = value` into a specific locale file in-memory and queues
+/// a `PendingChange::Insert`.  Adjusts line numbers of all subsequent entries.
+/// `real_key` must be the bare key (no bundle prefix).
+fn insert_into_file(state: &mut AppState, gi: usize, fi: usize, real_key: &str, value: &str) {
+    let after_line = state.workspace.groups[gi].files[fi].insertion_point_for(real_key);
+    let n_lines = value.split('\n').count();
+    let new_first_line = after_line + 1;
+    let new_last_line  = after_line + n_lines;
+
+    for entry in &mut state.workspace.groups[gi].files[fi].entries {
+        match entry {
+            FileEntry::KeyValue { first_line, last_line, .. } => {
+                if *first_line > after_line {
+                    *first_line += n_lines;
+                    *last_line  += n_lines;
+                }
+            }
+            FileEntry::Comment { line, .. } | FileEntry::Blank { line } => {
+                if *line > after_line {
+                    *line += n_lines;
+                }
+            }
+        }
+    }
+
+    let path = state.workspace.groups[gi].files[fi].path.clone();
+    state.workspace.groups[gi].files[fi].entries.push(FileEntry::KeyValue {
+        first_line: new_first_line,
+        last_line:  new_last_line,
+        key:   real_key.to_string(),
+        value: value.to_string(),
+    });
+
+    state.pending_writes.push(PendingChange::Insert {
+        path,
+        after_line,
+        key:   real_key.to_string(),
+        value: value.to_string(),
+    });
+    state.unsaved_changes = true;
+}
+
+/// Move one key from its current bundle to a different bundle, preserving all
+/// locale translations that have a matching locale file in the destination.
+///
+/// Sets `status_message` with a summary (and lists any locales that could not
+/// be moved because the destination has no file for them).
+fn commit_cross_bundle_rename(state: &mut AppState, old_key: &str, new_key: String) {
+    let (old_bundle, old_real) = workspace::split_key(old_key);
+    let (new_bundle, new_real) = workspace::split_key(&new_key);
+
+    // Destination bundle must exist.
+    if !state.workspace.is_bundle_name(new_bundle) {
+        state.status_message = Some(format!("Bundle '{new_bundle}' does not exist"));
+        return;
+    }
+    if new_real.is_empty() {
+        state.status_message = Some("Key must have a name after ':'".to_string());
+        return;
+    }
+    if state.workspace.merged_keys.contains(&new_key) {
+        state.status_message = Some(format!("'{new_key}' already exists"));
+        return;
+    }
+
+    // Snapshot all (locale, value) pairs from the source bundle before deleting.
+    let collected: Vec<(String, String)> = state.workspace.groups.iter()
+        .filter(|g| old_bundle.is_empty() || g.base_name == old_bundle)
+        .flat_map(|g| g.files.iter())
+        .filter_map(|f| f.get(old_real).map(|v| (f.locale.clone(), v.to_string())))
+        .collect();
+
+    // Remove from source.
+    delete_key_inner(state, old_key);
+
+    // Register the new bundle-qualified key.
+    state.workspace.merged_keys.push(new_key.clone());
+    state.workspace.merged_keys.sort();
+
+    // Insert into destination for each locale; track any that have no target file.
+    let mut missed: Vec<String> = Vec::new();
+    for (locale, value) in &collected {
+        let target = state.workspace.groups.iter().enumerate()
+            .find(|(_, g)| g.base_name == new_bundle)
+            .and_then(|(gi, g)| {
+                g.files.iter().enumerate()
+                    .find(|(_, f)| &f.locale == locale)
+                    .map(|(fi, _)| (gi, fi))
+            });
+        match target {
+            Some((gi, fi)) => insert_into_file(state, gi, fi, new_real, value),
+            None => missed.push(locale.clone()),
+        }
+    }
+
+    let base = format!("Moved {old_key} → {new_key}");
+    state.status_message = Some(if missed.is_empty() {
+        base
+    } else {
+        format!("{base}  (no file for: {})", missed.join(", "))
+    });
+    state.edit_buffer = None;
+    state.mode = Mode::Normal;
+    apply_filter(state);
+}
+
+/// Move every key that equals `old_prefix` or starts with `old_prefix.` from
+/// its current bundle to a different bundle.
+fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String) {
+    let (old_bundle, _) = workspace::split_key(old_prefix);
+    let (new_bundle, new_real) = workspace::split_key(&new_prefix);
+
+    if !state.workspace.is_bundle_name(new_bundle) {
+        state.status_message = Some(format!("Bundle '{new_bundle}' does not exist"));
+        return;
+    }
+    if new_real.is_empty() {
+        state.status_message = Some("Key must have a name after ':'".to_string());
+        return;
+    }
+
+    let dot_prefix = format!("{old_prefix}.");
+    let keys_to_move: Vec<String> = state.workspace.merged_keys.iter()
+        .filter(|k| *k == old_prefix || k.starts_with(&dot_prefix))
+        .cloned()
+        .collect();
+
+    // Conflict check: none of the new keys may already exist.
+    for k in &keys_to_move {
+        let new_k = format!("{new_prefix}{}", &k[old_prefix.len()..]);
+        if state.workspace.merged_keys.contains(&new_k) {
+            state.status_message = Some(format!("'{new_k}' already exists"));
+            return;
+        }
+    }
+
+    let mut all_missed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let count = keys_to_move.len();
+
+    for old_k in &keys_to_move {
+        let new_k = format!("{new_prefix}{}", &old_k[old_prefix.len()..]);
+        let (_, old_real) = workspace::split_key(old_k);
+        let (_, new_real_part) = workspace::split_key(&new_k);
+        let new_real_owned = new_real_part.to_string();
+
+        // Snapshot translations before deletion.
+        let collected: Vec<(String, String)> = state.workspace.groups.iter()
+            .filter(|g| old_bundle.is_empty() || g.base_name == old_bundle)
+            .flat_map(|g| g.files.iter())
+            .filter_map(|f| f.get(old_real).map(|v| (f.locale.clone(), v.to_string())))
+            .collect();
+
+        delete_key_inner(state, old_k);
+
+        state.workspace.merged_keys.push(new_k);
+
+        for (locale, value) in &collected {
+            let target = state.workspace.groups.iter().enumerate()
+                .find(|(_, g)| g.base_name == new_bundle)
+                .and_then(|(gi, g)| {
+                    g.files.iter().enumerate()
+                        .find(|(_, f)| &f.locale == locale)
+                        .map(|(fi, _)| (gi, fi))
+                });
+            match target {
+                Some((gi, fi)) => insert_into_file(state, gi, fi, &new_real_owned, value),
+                None => { all_missed.insert(locale.clone()); }
+            }
+        }
+    }
+
+    state.workspace.merged_keys.sort();
+
+    let base = format!("Moved {count} key(s): {old_prefix} → {new_prefix}");
+    state.status_message = Some(if all_missed.is_empty() {
+        base
+    } else {
+        let mut missed_vec: Vec<_> = all_missed.into_iter().collect();
+        missed_vec.sort();
+        format!("{base}  (no file for: {})", missed_vec.join(", "))
+    });
     state.edit_buffer = None;
     state.mode = Mode::Normal;
     apply_filter(state);
