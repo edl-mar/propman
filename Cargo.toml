@@ -1,0 +1,15 @@
+[package]
+name = "propman"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "propman"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = { version = "0.7", features = ["crossterm"] }
+anyhow = "1"
+walkdir = "2"
