@@ -46,6 +46,38 @@ pub fn write_insert(
     Ok(())
 }
 
+/// Removes the lines `first_line..=last_line` from `path`.
+///
+/// All lines outside the range are preserved verbatim.  Subsequent entries
+/// in the in-memory workspace must have their line numbers shifted down by
+/// `last_line - first_line + 1` before this is called.
+pub fn write_delete(path: &Path, first_line: usize, last_line: usize) -> io::Result<()> {
+    let file = fs::File::open(path)?;
+    let lines: Vec<String> = io::BufReader::new(file)
+        .lines()
+        .collect::<io::Result<_>>()?;
+
+    if first_line == 0 || last_line > lines.len() || first_line > last_line {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "line range {first_line}..={last_line} out of range (file has {} lines)",
+                lines.len()
+            ),
+        ));
+    }
+
+    let mut out = fs::File::create(path)?;
+    for (idx, original) in lines.iter().enumerate() {
+        let line_num = idx + 1;
+        if line_num < first_line || line_num > last_line {
+            writeln!(out, "{original}")?;
+        }
+        // Lines within the range are simply dropped.
+    }
+    Ok(())
+}
+
 /// Rewrites a key-value entry in `path`, replacing `first_line..=last_line`.
 ///
 /// For single-line values `first_line == last_line`. For entries that spanned

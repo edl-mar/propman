@@ -66,6 +66,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
         Mode::Continuation => &keybindings.continuation,
         Mode::KeyNaming    => &keybindings.key_naming,
         Mode::KeyRenaming  => &keybindings.key_renaming,
+        Mode::Deleting     => &keybindings.deleting,
         Mode::Filter       => &keybindings.filter,
     };
 
@@ -79,7 +80,8 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
         Mode::Editing | Mode::Continuation => update(state, Message::TextInput(key)),
         Mode::KeyNaming | Mode::KeyRenaming => update(state, Message::TextInput(key)),
         Mode::Filter                        => update(state, Message::FilterInput(key)),
-        Mode::Normal                        => state,
+        // Deleting pane is read-only — unbound keys are silently ignored.
+        Mode::Deleting | Mode::Normal       => state,
     }
 }
 
@@ -88,7 +90,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
 fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::KeyRenaming) {
+    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting) {
         // Pane grows with content: 2 border lines + one per TextArea line, capped at 8.
         let content_lines = state.edit_buffer.as_ref()
             .map(|e| e.textarea.lines().len())
@@ -149,6 +151,23 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
                 format!(" rename · {full_key} [{scope}] Tab: toggle ")
             } else {
                 format!(" rename · {full_key} ")
+            }
+        }
+    } else if matches!(state.mode, Mode::Deleting) {
+        let is_header = matches!(
+            state.display_rows.get(state.cursor_row),
+            Some(DisplayRow::Header { .. })
+        );
+        if is_header {
+            format!(" delete prefix · {full_key} ")
+        } else {
+            let prefix = format!("{full_key}.");
+            let has_children = state.workspace.merged_keys.iter().any(|k| k.starts_with(&prefix));
+            if has_children {
+                let scope = if state.delete_children { "+children" } else { "exact" };
+                format!(" delete · {full_key} [{scope}] Tab: toggle ")
+            } else {
+                format!(" delete · {full_key} ")
             }
         }
     } else {
@@ -303,6 +322,7 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Continuation => "CONT  ",
         Mode::KeyNaming    => "NEWKEY",
         Mode::KeyRenaming  => "RENAME",
+        Mode::Deleting     => "DELETE",
         Mode::Filter       => "FILTER",
     };
     let dirty = if state.unsaved_changes { " [+]" } else { "    " };
@@ -315,7 +335,8 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::Continuation => "  Enter new line  Esc cancel \\".into(),
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
             Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
-            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  / filter  Ctrl+S save".into(),
+            Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
+            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  / filter  Ctrl+S save".into(),
         }
     };
     let status = format!(" {mode_label}{dirty}{hints}");

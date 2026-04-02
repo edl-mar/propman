@@ -25,6 +25,12 @@ pub enum PendingChange {
         key: String,
         value: String,
     },
+    /// Remove the key-value entry at `first_line..=last_line` from the file.
+    Delete {
+        path: PathBuf,
+        first_line: usize,
+        last_line: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -43,6 +49,10 @@ pub enum Mode {
     /// Tab toggles between renaming the exact key vs. the whole prefix subtree
     /// (only shown/active when the key has children).
     KeyRenaming,
+    /// The user pressed `d` on the key column (col 0). The editor TextArea
+    /// shows the key name (read-only). Enter confirms deletion; Tab toggles
+    /// between deleting the exact key vs. the whole prefix subtree.
+    Deleting,
     Filter,
 }
 
@@ -74,6 +84,9 @@ pub struct AppState {
     /// Whether the active key-rename should also rename all keys sharing the
     /// same prefix (i.e. children in the trie). Only meaningful in KeyRenaming.
     pub rename_children: bool,
+    /// Whether the active key-deletion should also delete all keys sharing the
+    /// same prefix. Only meaningful in Deleting mode.
+    pub delete_children: bool,
     /// One-shot message shown in the status bar until the next keypress.
     /// Used for rename conflict errors and similar feedback.
     pub status_message: Option<String>,
@@ -98,6 +111,7 @@ impl AppState {
             quitting: false,
             edit_buffer: None,
             rename_children: false,
+            delete_children: false,
             status_message: None,
         }
     }

@@ -36,6 +36,13 @@ pub enum Message {
     ClearFilter,
     // File ops
     SaveFile,
+    /// `d` in Normal mode — on col 0: enter Deleting mode; on locale col: delete
+    /// that one locale's entry immediately.
+    DeleteKey,
+    /// Enter in Deleting mode — confirms key/prefix deletion.
+    CommitDelete,
+    /// Tab in Deleting mode — toggle between exact and +children scope.
+    ToggleDeleteScope,
     // App
     Quit,
 }
