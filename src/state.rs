@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use tui_textarea::TextArea;
 use crate::{
     editor::CellEdit,
+    filter,
     render_model::{self, DisplayRow},
-    workspace::Workspace,
+    workspace::{self, Workspace},
 };
 
 /// A committed edit queued for the next Ctrl+S flush.
@@ -33,6 +34,33 @@ pub enum PendingChange {
     },
 }
 
+/// Scope of the current selection in Normal mode.
+/// Tab cycles through the states; actions (rename, delete, pin) inherit it.
+/// `ChildrenAll` (show hidden affected entries) is added with the pinning feature.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SelectionScope {
+    /// Only the key under the cursor is in scope.
+    Exact,
+    /// The key and all visible (filter-matching) children are in scope.
+    Children,
+}
+
+impl SelectionScope {
+    pub fn cycle(&self) -> Self {
+        match self {
+            Self::Exact    => Self::Children,
+            Self::Children => Self::Exact,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Exact    => "exact",
+            Self::Children => "+children",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Mode {
     Normal,
@@ -40,18 +68,16 @@ pub enum Mode {
     /// Sub-mode of Editing: the user just typed `\`. Enter inserts a newline
     /// instead of committing; any other key returns to Editing.
     Continuation,
-    /// The user pressed Enter on a Header row. The editor TextArea holds the
-    /// new key name (pre-filled with the header prefix + `.`). Enter confirms
-    /// the name and transitions straight to value Editing for that key.
+    /// The user pressed `n`. The editor TextArea holds the new key name
+    /// (pre-filled with the current prefix). Enter confirms creation.
     KeyNaming,
     /// The user pressed Enter on the key column (col 0). The editor TextArea
-    /// holds the current key name for editing. Enter confirms the rename;
-    /// Tab toggles between renaming the exact key vs. the whole prefix subtree
-    /// (only shown/active when the key has children).
+    /// holds the current key name for editing. Enter confirms the rename.
+    /// Scope (exact / +children) is set in Normal mode before entering.
     KeyRenaming,
     /// The user pressed `d` on the key column (col 0). The editor TextArea
-    /// shows the key name (read-only). Enter confirms deletion; Tab toggles
-    /// between deleting the exact key vs. the whole prefix subtree.
+    /// shows the key name (read-only). Enter confirms deletion.
+    /// Scope (exact / +children) is set in Normal mode before entering.
     Deleting,
     Filter,
 }
@@ -81,12 +107,9 @@ pub struct AppState {
     pub quitting: bool,
     /// Active cell editor; present while mode is Editing, KeyNaming, or KeyRenaming.
     pub edit_buffer: Option<CellEdit>,
-    /// Whether the active key-rename should also rename all keys sharing the
-    /// same prefix (i.e. children in the trie). Only meaningful in KeyRenaming.
-    pub rename_children: bool,
-    /// Whether the active key-deletion should also delete all keys sharing the
-    /// same prefix. Only meaningful in Deleting mode.
-    pub delete_children: bool,
+    /// Scope of the current selection; set by Tab in Normal mode and inherited
+    /// by rename, delete, and pin actions.  Resets to Exact on row movement.
+    pub selection_scope: SelectionScope,
     /// One-shot message shown in the status bar until the next keypress.
     /// Used for rename conflict errors and similar feedback.
     pub status_message: Option<String>,
@@ -97,6 +120,84 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Returns the current value at the active locale cell, or `None` when on the
+    /// key column or the key is absent from that locale file.
+    pub fn current_cell_value(&self) -> Option<String> {
+        if self.cursor_col == 0 {
+            return None;
+        }
+        let locale_idx = self.cursor_col - 1;
+        let full_key = match self.display_rows.get(self.cursor_row)? {
+            DisplayRow::Key { full_key, .. } => full_key.as_str(),
+            DisplayRow::Header { prefix, .. } => prefix.as_str(),
+        };
+        let locale = self.visible_locales.get(locale_idx)?;
+        self.workspace.get_value(full_key, locale).map(|v| v.to_string())
+    }
+
+    /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
+    /// then clamps the cursor to the new bounds.
+    pub fn apply_filter(&mut self) {
+        let query = self.filter_textarea.lines()[0].clone();
+        let (filtered, visible) = if query.trim().is_empty() {
+            (
+                self.workspace.merged_keys.clone(),
+                self.workspace.all_locales(),
+            )
+        } else {
+            let expr = filter::parse(&query);
+            let filtered = self.workspace.merged_keys.iter()
+                .filter(|key| filter::evaluate(&expr, key, &self.workspace))
+                .cloned()
+                .collect();
+            let visible = filter::visible_locales(&expr, &self.workspace);
+            (filtered, visible)
+        };
+        self.display_rows = render_model::build_display_rows(&filtered);
+        self.visible_locales = visible;
+        self.cursor_col = self.cursor_col.min(self.visible_locales.len());
+        let max_row = self.display_rows.len().saturating_sub(1);
+        self.cursor_row = self.cursor_row.min(max_row);
+        self.clamp_cursor_col();
+        self.clamp_scroll();
+    }
+
+    /// Returns the bundle name for the current cursor row, or `""` for bare keys.
+    pub fn current_row_bundle(&self) -> &str {
+        match self.display_rows.get(self.cursor_row) {
+            Some(DisplayRow::Key { full_key, .. }) => workspace::split_key(full_key).0,
+            Some(DisplayRow::Header { prefix, .. }) => workspace::split_key(prefix).0,
+            None => "",
+        }
+    }
+
+    /// Snaps `cursor_col` down to the nearest column available for the current
+    /// row's bundle.  Stays at 0 (key column) as a safe fallback.
+    pub fn clamp_cursor_col(&mut self) {
+        if self.cursor_col == 0 {
+            return;
+        }
+        let bundle = self.current_row_bundle().to_string();
+        while self.cursor_col > 0 {
+            let locale = &self.visible_locales[self.cursor_col - 1];
+            if self.workspace.bundle_has_locale(&bundle, locale) {
+                break;
+            }
+            self.cursor_col -= 1;
+        }
+    }
+
+    /// Keeps `scroll_offset` in sync so the cursor stays visible.
+    /// Uses a hardcoded viewport estimate; the renderer will clip naturally anyway.
+    pub fn clamp_scroll(&mut self) {
+        const VIEWPORT: usize = 20;
+        if self.cursor_row < self.scroll_offset {
+            self.scroll_offset = self.cursor_row;
+        } else if self.cursor_row >= self.scroll_offset + VIEWPORT {
+            self.scroll_offset = self.cursor_row - VIEWPORT + 1;
+        }
+    }
+
     pub fn new(workspace: Workspace) -> Self {
         let display_rows = render_model::build_display_rows(&workspace.merged_keys);
         let visible_locales = workspace.all_locales();
@@ -114,8 +215,7 @@ impl AppState {
             pending_writes: Vec::new(),
             quitting: false,
             edit_buffer: None,
-            rename_children: false,
-            delete_children: false,
+            selection_scope: SelectionScope::Exact,
             status_message: None,
             show_preview: false,
         }

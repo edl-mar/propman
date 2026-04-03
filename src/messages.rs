@@ -24,9 +24,8 @@ pub enum Message {
     NewKey,
     /// Enter pressed in KeyRenaming mode — validate and apply the rename.
     CommitKeyRename,
-    /// Tab pressed in KeyRenaming mode — toggle between renaming the exact key
-    /// and renaming the whole prefix subtree (only active for key+parent rows).
-    ToggleRenameScope,
+    /// Tab pressed in Normal mode — cycle selection scope (exact / +children).
+    CycleScope,
     /// A raw key event forwarded to the active TextArea (Editing/Continuation mode).
     TextInput(crossterm::event::KeyEvent),
     // Filter
@@ -41,8 +40,6 @@ pub enum Message {
     DeleteKey,
     /// Enter in Deleting mode — confirms key/prefix deletion.
     CommitDelete,
-    /// Tab in Deleting mode — toggle between exact and +children scope.
-    ToggleDeleteScope,
     // App
     Quit,
     /// `Space` in Normal mode — toggle the read-only preview pane.

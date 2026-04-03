@@ -297,6 +297,11 @@ careful — the writer must never corrupt a file.
 
 ### Near-term
 
+- **Pinned keys**: `m` pins/unpins a key (or prefix subtree); pinned keys bypass
+  the filter and stay visible. `M` clears all pins. `#` in the filter bar shows
+  only pinned entries. Bulk ops (`+children`) temporarily pin hidden affected
+  entries so the user can see the real scope; changed entries are auto-promoted
+  to permanent pins as a receipt. See `docs/pinned_keys.md` for full design.
 - **Value preview**: `Space` in Normal mode opens a read-only preview pane
   showing the full value of the selected cell (important for multiline values
   that are truncated in the table). Also useful on key rows to show the full
@@ -327,6 +332,11 @@ careful — the writer must never corrupt a file.
 
 ### Future
 
+- **Selection-phase scope toggle**: Tab in Normal mode cycles
+  `exact → +children [filtered] → +children [all]`. Actions (rename, delete,
+  pin) inherit the active scope — no in-mode Tab toggle needed. The `[all]`
+  state temporarily pins hidden affected children so they surface in the table.
+  Prerequisite for the pinned-keys bulk-op integration.
 - **Multi-selection**: Shift+A selects all visible rows; actions apply to all
   selected entries (e.g. bulk-copy default value to missing locales).
 - **User config file**: load keybindings from a TOML config at startup.

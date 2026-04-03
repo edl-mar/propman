@@ -47,10 +47,13 @@ pub fn default_keybindings() -> Keybindings {
         (KeyCode::Char('n'),      none) => Message::NewKey,
         (KeyCode::Char('d'),      none) => Message::DeleteKey,
         (KeyCode::Char(' '),      none) => Message::TogglePreview,
+        (KeyCode::Tab,            none) => Message::CycleScope,
     ];
 
     let editing = map![
         (KeyCode::Enter,          none) => Message::CommitEdit,
+        (KeyCode::Up,             none) => Message::MoveCursorUp,
+        (KeyCode::Down,           none) => Message::MoveCursorDown,
         (KeyCode::Esc,            none) => Message::CancelEdit,
         (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
@@ -66,6 +69,8 @@ pub fn default_keybindings() -> Keybindings {
 
     let key_naming = map![
         (KeyCode::Enter,          none) => Message::CommitKeyName,
+        (KeyCode::Up,             none) => Message::MoveCursorUp,
+        (KeyCode::Down,           none) => Message::MoveCursorDown,
         (KeyCode::Esc,            none) => Message::CancelEdit,
         (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
@@ -73,16 +78,20 @@ pub fn default_keybindings() -> Keybindings {
 
     let key_renaming = map![
         (KeyCode::Enter,          none) => Message::CommitKeyRename,
+        (KeyCode::Tab,            none) => Message::CycleScope,
+        (KeyCode::Up,             none) => Message::MoveCursorUp,
+        (KeyCode::Down,           none) => Message::MoveCursorDown,
         (KeyCode::Esc,            none) => Message::CancelEdit,
-        (KeyCode::Tab,            none) => Message::ToggleRenameScope,
         (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
     ];
 
     let deleting = map![
         (KeyCode::Enter,          none) => Message::CommitDelete,
+        (KeyCode::Tab,            none) => Message::CycleScope,
+        (KeyCode::Up,             none) => Message::MoveCursorUp,
+        (KeyCode::Down,           none) => Message::MoveCursorDown,
         (KeyCode::Esc,            none) => Message::CancelEdit,
-        (KeyCode::Tab,            none) => Message::ToggleDeleteScope,
         (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
     ];

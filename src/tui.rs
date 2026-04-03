@@ -1,7 +1,7 @@
 use crate::{
     messages::Message,
     render_model::DisplayRow,
-    state::{AppState, Mode},
+    state::{AppState, Mode, SelectionScope},
     update::update,
 };
 use anyhow::Result;
@@ -151,39 +151,11 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let title = if matches!(state.mode, Mode::KeyNaming) {
         format!(" new key [{locale}] ")
     } else if matches!(state.mode, Mode::KeyRenaming) {
-        let is_header = matches!(
-            state.display_rows.get(state.cursor_row),
-            Some(DisplayRow::Header { .. })
-        );
-        if is_header {
-            format!(" rename prefix · {full_key} ")
-        } else {
-            let prefix = format!("{full_key}.");
-            let has_children = state.workspace.merged_keys.iter().any(|k| k.starts_with(&prefix));
-            if has_children {
-                let scope = if state.rename_children { "+children" } else { "exact" };
-                format!(" rename · {full_key} [{scope}] Tab: toggle ")
-            } else {
-                format!(" rename · {full_key} ")
-            }
-        }
+        let scope = state.selection_scope.label();
+        format!(" rename · {full_key} [{scope}] ")
     } else if matches!(state.mode, Mode::Deleting) {
-        let is_header = matches!(
-            state.display_rows.get(state.cursor_row),
-            Some(DisplayRow::Header { .. })
-        );
-        if is_header {
-            format!(" delete prefix · {full_key} ")
-        } else {
-            let prefix = format!("{full_key}.");
-            let has_children = state.workspace.merged_keys.iter().any(|k| k.starts_with(&prefix));
-            if has_children {
-                let scope = if state.delete_children { "+children" } else { "exact" };
-                format!(" delete · {full_key} [{scope}] Tab: toggle ")
-            } else {
-                format!(" delete · {full_key} ")
-            }
-        }
+        let scope = state.selection_scope.label();
+        format!(" delete · {full_key} [{scope}] ")
     } else {
         format!(" {full_key} [{locale}] ")
     };
@@ -302,6 +274,19 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     let viewport = area.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(viewport);
 
+    // Compute the scope prefix for subtree highlighting in Normal mode.
+    let scope_prefix: Option<String> = if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting)
+        && state.selection_scope == SelectionScope::Children
+    {
+        match state.display_rows.get(state.cursor_row) {
+            Some(DisplayRow::Key    { full_key, .. }) => Some(format!("{full_key}.")),
+            Some(DisplayRow::Header { prefix,   .. }) => Some(format!("{prefix}.")),
+            None => None,
+        }
+    } else {
+        None
+    };
+
     for (row_idx, display_row) in state
         .display_rows
         .iter()
@@ -310,6 +295,16 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         .take(viewport)
     {
         let is_selected_row = row_idx == state.cursor_row;
+
+        // A row is "in scope" when +children is active and its key is a child
+        // of the cursor row.
+        let in_scope = scope_prefix.as_ref().map_or(false, |p| {
+            let row_key = match display_row {
+                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
+                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
+            };
+            row_key.starts_with(p.as_str())
+        });
 
         // Resolve key text, full key for lookups, and indentation.
         let (indent, key_text, full_key, is_header) = match display_row {
@@ -339,6 +334,8 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray)
         } else if is_selected_row {
             Style::default().add_modifier(Modifier::BOLD)
+        } else if in_scope {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         } else {
             Style::default()
         };
@@ -433,7 +430,10 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
             Mode::Filter       => "  Enter/Esc/↑↓ exit filter".into(),
-            Mode::Normal       => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save".into(),
+            Mode::Normal => {
+                let scope = state.selection_scope.label();
+                format!("  [{scope}] Tab  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save").into()
+            }
         }
     };
     let status = format!(" {mode_label}{dirty}{hints}");

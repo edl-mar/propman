@@ -2,6 +2,7 @@ mod editor;
 mod filter;
 mod keybindings;
 mod messages;
+mod ops;
 mod parser;
 mod render_model;
 mod search;
