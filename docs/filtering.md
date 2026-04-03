@@ -7,11 +7,17 @@ evaluation or UI logic.
 
 ## Syntax
 ```
-[key_pattern, ...] : [locale][modifier], ...
+[bundle, ...] [/ key_pattern, ...] [: locale[modifier], ...]
 ```
 
-The `:` is the separator between the key filter and the locale filter.
-It is required even when only filtering by locale.
+Sections are delimited by `/` and `:`. Each section runs from its opening
+separator to the next separator (or end of input):
+
+- **Line start → `/` or `:`** — bundle selectors
+- **After `/` → `:`**         — key patterns
+- **After `:`**               — locale selectors
+
+All sections are optional. `:` is required even when filtering by locale only.
 
 ## Match modes
 
@@ -33,19 +39,29 @@ de          — prefix: locale.starts_with("de")
 Use quotes to pin an exact locale code when the prefix would be too broad
 (e.g. `"de"` to exclude `default`, or `de_` to match only locale variants).
 
+## Bundle selectors
+
+Whitespace-separated bundle names at the start of the input (before `/` or `:`).
+Unquoted = prefix match; quoted = exact match.
+```
+messages                — prefix: matches bundle "messages"
+messages errors         — matches either bundle
+"messages"              — exact: only bundle named "messages"
+```
+
 ## Key patterns
 
-Comma-separated patterns matched against the full key string.
+Whitespace-separated patterns after `/`, matched against the full key string.
 Multiple patterns are combined with AND.
 ```
-error                   — substring: matches any key containing "error"
-notfound, timeout       — substring AND substring: key must match both
-"app.error.notfound"    — exact: matches only this key
+/error                  — substring: matches any key containing "error"
+/notfound timeout       — substring AND substring: key must match both
+/"app.error.notfound"   — exact: matches only this key
 ```
 
 ## Locale selectors
 
-Comma-separated locale identifiers, each with an optional modifier.
+Whitespace-separated locale identifiers after `:`, each with an optional modifier.
 Multiple selectors are combined with AND.
 ```
 de!         — prefix: all locales starting with "de" must be present
@@ -89,18 +105,24 @@ locale selectors, all columns are visible.
 :"de"?
     exactly [de] is missing
 
-:"de"!, "si"!
+:"de"! "si"!
     [de] is present AND [si] is present
 
-error:
+/error:
     all keys containing "error", all locales visible
 
-notfound, timeout: "default"!, "de"?
+/notfound timeout: "default"! "de"?
     keys matching both "notfound" and "timeout",
     where [default] is present AND [de] is missing
 
-:"de"?, "si"?
+:"de"? "si"?
     both [de] and [si] are missing
+
+messages/
+    all keys in the "messages" bundle
+
+messages/error:de
+    keys containing "error" in the "messages" bundle, narrowed to de* locales
 ```
 
 ## Internal representation

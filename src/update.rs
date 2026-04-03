@@ -25,6 +25,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         // ── Normal mode ──────────────────────────────────────────────────────
         (Mode::Normal, Message::MoveCursorUp) => {
             state.cursor_row = state.cursor_row.saturating_sub(1);
+            clamp_cursor_col(&mut state);
             clamp_scroll(&mut state);
         }
         (Mode::Normal, Message::MoveCursorDown) => {
@@ -32,25 +33,39 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             if state.cursor_row < max {
                 state.cursor_row += 1;
             }
+            clamp_cursor_col(&mut state);
             clamp_scroll(&mut state);
         }
         (Mode::Normal, Message::MoveCursorLeft) => {
-            state.cursor_col = state.cursor_col.saturating_sub(1);
+            // Step left, skipping locale columns that have no file in this row's bundle.
+            let bundle = current_row_bundle(&state).to_string();
+            let mut col = state.cursor_col.saturating_sub(1);
+            while col > 0 && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[col - 1]) {
+                col -= 1;
+            }
+            state.cursor_col = col;
         }
         (Mode::Normal, Message::MoveCursorRight) => {
-            // col 0 = key column; cols 1..=n_locales = locale columns
+            // Step right, skipping locale columns that have no file in this row's bundle.
+            let bundle = current_row_bundle(&state).to_string();
             let max = state.visible_locales.len();
-            if state.cursor_col < max {
-                state.cursor_col += 1;
+            let mut col = state.cursor_col + 1;
+            while col <= max && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[col - 1]) {
+                col += 1;
+            }
+            if col <= max {
+                state.cursor_col = col;
             }
         }
         (Mode::Normal, Message::PageUp) => {
             state.cursor_row = state.cursor_row.saturating_sub(20);
+            clamp_cursor_col(&mut state);
             clamp_scroll(&mut state);
         }
         (Mode::Normal, Message::PageDown) => {
             let max = state.display_rows.len().saturating_sub(1);
             state.cursor_row = (state.cursor_row + 20).min(max);
+            clamp_cursor_col(&mut state);
             clamp_scroll(&mut state);
         }
         (Mode::Normal, Message::StartEdit) => {
@@ -383,6 +398,22 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Filter, Message::CommitEdit) => {
             state.mode = Mode::Normal;
         }
+        // Up/Down exit filter mode and immediately move the cursor.
+        (Mode::Filter, Message::MoveCursorUp) => {
+            state.mode = Mode::Normal;
+            state.cursor_row = state.cursor_row.saturating_sub(1);
+            clamp_cursor_col(&mut state);
+            clamp_scroll(&mut state);
+        }
+        (Mode::Filter, Message::MoveCursorDown) => {
+            state.mode = Mode::Normal;
+            let max = state.display_rows.len().saturating_sub(1);
+            if state.cursor_row < max {
+                state.cursor_row += 1;
+            }
+            clamp_cursor_col(&mut state);
+            clamp_scroll(&mut state);
+        }
 
         // Escape in Normal cycles to Filter.
         (Mode::Normal, Message::CancelEdit) => {
@@ -597,8 +628,11 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
         }
     }
 
-    // Last resort: first file that serves this locale.
-    if target.is_none() {
+    // Last resort: first file that serves this locale (bare/non-bundle keys only).
+    // For bundle-qualified keys the target bundle has no file for this locale;
+    // inserting into a different bundle's file would be silently wrong — the
+    // value would never be found by get_value() which searches the key's bundle.
+    if target.is_none() && bundle.is_empty() {
         'last: for (gi, group) in state.workspace.groups.iter().enumerate() {
             for (fi, file) in group.files.iter().enumerate() {
                 if file.locale == locale {
@@ -611,7 +645,17 @@ fn commit_cell_insert(state: &mut AppState, new_value: String) {
 
     let (gi, fi) = match target {
         Some(t) => t,
-        None => return, // No file for this locale — skip.
+        None => {
+            // No file for this locale.  For bundle-qualified keys this means the
+            // bundle has no [locale] file — inform the user instead of silently
+            // no-op'ing (or worse, inserting into a different bundle's file).
+            if !bundle.is_empty() {
+                state.status_message = Some(
+                    format!("No [{locale}] file in bundle '{bundle}' — create it first")
+                );
+            }
+            return;
+        }
     };
 
     let after_line = state.workspace.groups[gi].files[fi]
@@ -1147,7 +1191,35 @@ fn apply_filter(state: &mut AppState) {
     state.cursor_col = state.cursor_col.min(state.visible_locales.len());
     let max_row = state.display_rows.len().saturating_sub(1);
     state.cursor_row = state.cursor_row.min(max_row);
+    clamp_cursor_col(state);
     clamp_scroll(state);
+}
+
+/// Returns the bundle name for the current cursor row, or `""` for bare keys.
+fn current_row_bundle(state: &AppState) -> &str {
+    match state.display_rows.get(state.cursor_row) {
+        Some(DisplayRow::Key { full_key, .. }) => workspace::split_key(full_key).0,
+        Some(DisplayRow::Header { prefix, .. }) => workspace::split_key(prefix).0,
+        None => "",
+    }
+}
+
+/// Snaps `cursor_col` down to the nearest column that is available for the
+/// current row's bundle.  Stays at 0 (key column) if no locale column is
+/// available (shouldn't happen in practice but is a safe fallback).
+fn clamp_cursor_col(state: &mut AppState) {
+    if state.cursor_col == 0 {
+        return;
+    }
+    let bundle = current_row_bundle(state).to_string();
+    // Walk downward from current col until we find an available one.
+    while state.cursor_col > 0 {
+        let locale = &state.visible_locales[state.cursor_col - 1];
+        if state.workspace.bundle_has_locale(&bundle, locale) {
+            break;
+        }
+        state.cursor_col -= 1;
+    }
 }
 
 /// Keeps `scroll_offset` in sync so the cursor stays visible.

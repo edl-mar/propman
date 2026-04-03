@@ -173,6 +173,18 @@ impl Workspace {
         self.groups.iter().any(|g| g.base_name == prefix)
     }
 
+    /// Returns `true` if the named bundle (group) has a locale file for `locale`.
+    /// Always returns `true` for bare (non-bundle) keys (`bundle` is `""`).
+    pub fn bundle_has_locale(&self, bundle: &str, locale: &str) -> bool {
+        if bundle.is_empty() {
+            return true;
+        }
+        self.groups.iter()
+            .filter(|g| g.base_name == bundle)
+            .flat_map(|g| g.files.iter())
+            .any(|f| f.locale == locale)
+    }
+
     /// All distinct locale strings across all groups, "default" first.
     pub fn all_locales(&self) -> Vec<String> {
         let mut seen: HashSet<&str> = HashSet::new();

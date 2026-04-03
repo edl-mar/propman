@@ -37,10 +37,18 @@ pub enum FilterExpr {
 
 /// Parse a filter query string into a `FilterExpr`.
 ///
-/// Full format: `[bundle, ... /] [key_pattern, ...] [: locale[modifier], ...]`
+/// Full format: `[bundle, ...] [/ key_pattern, ...] [: locale[modifier], ...]`
 ///
-/// The `/` separator is mandatory when bundle selectors are present; without it
-/// all existing `:` behaviour is unchanged (backward compatible).
+/// Section rules (each section ends at the next separator or end of input):
+///   - From line start to the first `/` or `:` → bundle selectors
+///   - After `/` to the next `:` or end          → key patterns
+///   - After `:`  to end                          → locale selectors
+///
+/// Examples:
+///   `messages`          — bundle filter only
+///   `/error`            — key filter only
+///   `:de`               — locale filter only
+///   `messages/error:de` — all three sections
 ///
 /// Returns `FilterExpr::And([])` (matches everything) for empty input.
 pub fn parse(input: &str) -> FilterExpr {
@@ -51,49 +59,48 @@ pub fn parse(input: &str) -> FilterExpr {
 
     let mut terms: Vec<FilterExpr> = Vec::new();
 
-    // Split on '/' first to extract optional bundle selectors.
-    let key_locale_part = if let Some(slash_idx) = input.find('/') {
-        let bundle_str = input[..slash_idx].trim();
-        let mut bundle_terms: Vec<(String, MatchMode)> = Vec::new();
-        for raw in bundle_str.split(',') {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
-            }
-            if let Some(inner) = strip_quotes(raw) {
-                bundle_terms.push((inner.to_string(), MatchMode::Exact));
-            } else {
-                bundle_terms.push((raw.to_string(), MatchMode::Unquoted));
-            }
-        }
-        if !bundle_terms.is_empty() {
-            terms.push(FilterExpr::BundleFilter(bundle_terms));
-        }
-        input[slash_idx + 1..].trim()
-    } else {
-        input
-    };
+    let slash_idx = input.find('/');
+    let colon_idx = input.find(':');
 
-    // Split on the first `:` to separate key patterns from locale selectors.
-    let (key_part, locale_part) = match key_locale_part.find(':') {
-        Some(idx) => (key_locale_part[..idx].trim(), Some(key_locale_part[idx + 1..].trim())),
-        None => (key_locale_part, None),
+    // Bundle section: from start to whichever separator comes first.
+    let bundle_end = match (slash_idx, colon_idx) {
+        (Some(s), Some(c)) => Some(s.min(c)),
+        (Some(s), None)    => Some(s),
+        (None,    Some(c)) => Some(c),
+        (None,    None)    => None,
     };
-
-    for raw in key_part.split(',') {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
+    let bundle_str = match bundle_end {
+        Some(idx) => input[..idx].trim(),
+        None      => input,  // entire input is the bundle section
+    };
+    let mut bundle_terms: Vec<(String, MatchMode)> = Vec::new();
+    for raw in bundle_str.split_whitespace() {
+        if let Some(inner) = strip_quotes(raw) {
+            bundle_terms.push((inner.to_string(), MatchMode::Exact));
+        } else {
+            bundle_terms.push((raw.to_string(), MatchMode::Unquoted));
         }
-        terms.push(parse_key_term(raw));
+    }
+    if !bundle_terms.is_empty() {
+        terms.push(FilterExpr::BundleFilter(bundle_terms));
     }
 
-    if let Some(locale_part) = locale_part {
-        for raw in locale_part.split(',') {
-            let raw = raw.trim();
-            if raw.is_empty() {
-                continue;
-            }
+    // Key section: after '/' up to the next ':' (or end). Only present when '/' exists.
+    if let Some(s_idx) = slash_idx {
+        let after_slash = &input[s_idx + 1..];
+        let key_str = match after_slash.find(':') {
+            Some(c_idx) => after_slash[..c_idx].trim(),
+            None        => after_slash.trim(),
+        };
+        for raw in key_str.split_whitespace() {
+            terms.push(parse_key_term(raw));
+        }
+    }
+
+    // Locale section: after ':' to end. Only present when ':' exists.
+    if let Some(c_idx) = colon_idx {
+        let locale_str = input[c_idx + 1..].trim();
+        for raw in locale_str.split_whitespace() {
             terms.push(parse_locale_term(raw));
         }
     }
@@ -303,8 +310,28 @@ mod tests {
     }
 
     #[test]
+    fn bundle_unquoted() {
+        let expr = parse("messages");
+        let t = terms(&expr);
+        assert!(matches!(&t[0],
+            FilterExpr::BundleFilter(v)
+            if v.len() == 1 && v[0].0 == "messages" && v[0].1 == MatchMode::Unquoted
+        ));
+    }
+
+    #[test]
+    fn bundle_exact() {
+        let expr = parse("\"messages\"");
+        let t = terms(&expr);
+        assert!(matches!(&t[0],
+            FilterExpr::BundleFilter(v)
+            if v.len() == 1 && v[0].0 == "messages" && v[0].1 == MatchMode::Exact
+        ));
+    }
+
+    #[test]
     fn key_unquoted() {
-        let expr = parse("error");
+        let expr = parse("/error");
         let t = terms(&expr);
         assert!(matches!(&t[0],
             FilterExpr::KeyPattern { pattern, mode }
@@ -314,7 +341,7 @@ mod tests {
 
     #[test]
     fn key_exact() {
-        let expr = parse("\"app.error.notfound\"");
+        let expr = parse("/\"app.error.notfound\"");
         let t = terms(&expr);
         assert!(matches!(&t[0],
             FilterExpr::KeyPattern { pattern, mode }
@@ -361,7 +388,8 @@ mod tests {
 
     #[test]
     fn multi_term_and() {
-        let expr = parse("error, timeout: de?");
+        // Key patterns require '/' prefix; whitespace separates multiple terms.
+        let expr = parse("/error timeout: de?");
         let t = terms(&expr);
         assert_eq!(t.len(), 3);
         assert!(matches!(&t[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "error"));
@@ -370,6 +398,33 @@ mod tests {
             FilterExpr::LocaleStatus { locale, modifier, .. }
             if locale == "de" && *modifier == StatusModifier::Missing
         ));
+    }
+
+    #[test]
+    fn all_three_sections() {
+        let expr = parse("messages /error :de");
+        let t = terms(&expr);
+        assert_eq!(t.len(), 3);
+        assert!(matches!(&t[0], FilterExpr::BundleFilter(v) if v[0].0 == "messages"));
+        assert!(matches!(&t[1], FilterExpr::KeyPattern { pattern, .. } if pattern == "error"));
+        assert!(matches!(&t[2], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
+    }
+
+    #[test]
+    fn multi_bundle_whitespace() {
+        let expr = parse("messages errors");
+        let t = terms(&expr);
+        assert_eq!(t.len(), 1);
+        assert!(matches!(&t[0], FilterExpr::BundleFilter(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn multi_locale_whitespace() {
+        let expr = parse(":de fr");
+        let t = terms(&expr);
+        assert_eq!(t.len(), 2);
+        assert!(matches!(&t[0], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
+        assert!(matches!(&t[1], FilterExpr::LocaleStatus { locale, .. } if locale == "fr"));
     }
 
     #[test]

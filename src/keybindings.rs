@@ -90,6 +90,8 @@ pub fn default_keybindings() -> Keybindings {
     let filter = map![
         (KeyCode::Enter,          none) => Message::CommitEdit,
         (KeyCode::Esc,            none) => Message::CancelEdit,
+        (KeyCode::Up,             none) => Message::MoveCursorUp,
+        (KeyCode::Down,           none) => Message::MoveCursorDown,
         (KeyCode::Char('s'),      ctrl) => Message::SaveFile,
         (KeyCode::Char('c'),      ctrl) => Message::Quit,
     ];

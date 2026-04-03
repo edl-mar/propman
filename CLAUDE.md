@@ -169,14 +169,16 @@ permanent `TextArea<'static>`; the query is `filter_textarea.lines()[0]`,
 parsed live into a `FilterExpr` AST on every keystroke.
 
 ```
-Full format: [bundle, ... /] [key_pattern, ...] [: locale[modifier], ...]
+Full format: [bundle, ...] [/ key_pattern, ...] [: locale[modifier], ...]
 
-bundle selectors  — require / after them; unquoted = prefix match on bundle name
-key patterns      — unquoted = substring; "quoted" = exact
-locale selectors  — unquoted = prefix (de matches de, default, de_AT)
+Section rules — each section runs to the next separator or end of input:
+  line start → / or :   bundle selectors  (whitespace-separated; unquoted = prefix)
+  after /    → :        key patterns      (whitespace-separated; unquoted = substring)
+  after :               locale selectors  (whitespace-separated; unquoted = prefix)
+
 modifiers         — ! = must be present, ? = must be missing, none = column hint only
-?                 — bare ? shorthand for AnyMissing (at least one locale missing)
-*pattern          — DanglingKey: unsaved key matching the pattern
+:?                — AnyMissing shorthand (at least one locale missing)
+/*pattern         — DanglingKey: unsaved key matching the pattern
 ```
 
 `visible_locales` is narrowed to the matched locales when any `LocaleStatus`

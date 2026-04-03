@@ -100,7 +100,7 @@ fn draw(f: &mut Frame, state: &AppState) {
         let chunks = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(pane_height),
-            Constraint::Length(1), // filter bar
+            Constraint::Length(3), // filter pane
             Constraint::Length(1), // status bar
         ])
         .split(area);
@@ -114,7 +114,7 @@ fn draw(f: &mut Frame, state: &AppState) {
         let chunks = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Length(pane_height),
-            Constraint::Length(1), // filter bar
+            Constraint::Length(3), // filter pane
             Constraint::Length(1), // status bar
         ])
         .split(area);
@@ -125,7 +125,7 @@ fn draw(f: &mut Frame, state: &AppState) {
     } else {
         let chunks = Layout::vertical([
             Constraint::Fill(1),   // main table
-            Constraint::Length(1), // filter bar
+            Constraint::Length(3), // filter pane
             Constraint::Length(1), // status bar
         ])
         .split(area);
@@ -244,24 +244,49 @@ fn draw_preview_pane(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
     let query = &state.filter_textarea.lines()[0];
+    let focused = matches!(state.mode, Mode::Filter);
 
-    let (text, style) = match state.mode {
-        // Focused: show cursor at the correct position within the query.
-        Mode::Filter => {
-            let col = state.filter_textarea.cursor().1;
-            let byte_pos = query.char_indices().nth(col).map(|(i, _)| i).unwrap_or(query.len());
-            let (before, after) = query.split_at(byte_pos);
-            (
-                format!("/ {before}_{after}"),
-                Style::default().bg(Color::Yellow),
-            )
-        }
-        // Active filter, unfocused: always show the applied query.
-        _ if !query.is_empty() => (format!("/ {query}"), Style::default()),
-        // No filter: dim placeholder.
-        _ => (String::from("/ "), Style::default().fg(Color::Blue)),
+    // The DSL hint lives in the title so it remains visible while the user types.
+    let hint = Span::styled(
+        " bundle  /key  :locale[?!]  :?  /*dangling ",
+        Style::default().fg(Color::DarkGray),
+    );
+    let block = if focused {
+        let label = Span::styled(" Filter ", Style::default().fg(Color::Yellow));
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(Line::from(vec![label, hint]))
+    } else if !query.is_empty() {
+        let label = Span::raw(" Filter ");
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Line::from(vec![label, hint]))
+    } else {
+        let label = Span::styled(" Filter ", Style::default().fg(Color::DarkGray));
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Line::from(vec![label, hint]))
     };
-    f.render_widget(Paragraph::new(text).style(style), area);
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if focused {
+        let col = state.filter_textarea.cursor().1;
+        let byte_pos = query.char_indices().nth(col).map(|(i, _)| i).unwrap_or(query.len());
+        let (before, after) = query.split_at(byte_pos);
+        f.render_widget(Paragraph::new(format!("{before}_{after}")), inner);
+    } else if !query.is_empty() {
+        f.render_widget(Paragraph::new(query.as_str()), inner);
+    } else {
+        f.render_widget(
+            Paragraph::new("press / to filter")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+    }
 }
 
 fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
@@ -325,9 +350,19 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             continue;
         }
 
+        // The bundle this row belongs to (used to skip locales with no file).
+        let (row_bundle, _) = crate::workspace::split_key(full_key);
+
         // Locale columns (cursor_col == locale_idx + 1).
         for (col_idx, locale) in locales.iter().enumerate() {
             let locale_col = col_idx + 1;
+
+            // Skip locales that have no backing file in this row's bundle.
+            // Those cells can never hold a value and are confusing to show.
+            if !state.workspace.bundle_has_locale(row_bundle, locale) {
+                continue;
+            }
+
             let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
 
             // Headers have no stored values — their cells are empty/creatable.
@@ -397,7 +432,8 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
             Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
-            _                  => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save".into(),
+            Mode::Filter       => "  Enter/Esc/↑↓ exit filter".into(),
+            Mode::Normal       => "  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save".into(),
         }
     };
     let status = format!(" {mode_label}{dirty}{hints}");
