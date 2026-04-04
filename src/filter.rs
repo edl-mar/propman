@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use crate::workspace::{self, Workspace};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +32,9 @@ pub enum FilterExpr {
     /// `bundle1, bundle2 /` — key must belong to one of the listed bundles.
     /// Unquoted = prefix match on the bundle name; quoted = exact match.
     BundleFilter(Vec<(String, MatchMode)>),
+    /// `#` — key has unsaved changes (present in `dirty_keys`).
+    /// Usable in both the key section (`/#`) and the locale section (`:#`).
+    DirtyKey,
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -109,6 +113,9 @@ pub fn parse(input: &str) -> FilterExpr {
 }
 
 fn parse_key_term(raw: &str) -> FilterExpr {
+    if raw == "#" {
+        return FilterExpr::DirtyKey;
+    }
     if let Some(rest) = raw.strip_prefix('*') {
         // `*"pattern"` → exact dangling match; `*pattern` → substring dangling match.
         if let Some(inner) = strip_quotes(rest) {
@@ -123,9 +130,12 @@ fn parse_key_term(raw: &str) -> FilterExpr {
 }
 
 fn parse_locale_term(raw: &str) -> FilterExpr {
-    // Bare `?` → AnyMissing shorthand.
+    // Bare `?` → AnyMissing shorthand; bare `#` → DirtyKey.
     if raw == "?" {
         return FilterExpr::AnyMissing;
+    }
+    if raw == "#" {
+        return FilterExpr::DirtyKey;
     }
 
     if raw.starts_with('"') {
@@ -178,9 +188,9 @@ fn split_modifier(s: &str) -> (&str, StatusModifier) {
 // ── Evaluator ─────────────────────────────────────────────────────────────────
 
 /// Returns `true` if `key` should be visible given `expr` and the workspace.
-pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace) -> bool {
+pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys: &HashSet<String>) -> bool {
     match expr {
-        FilterExpr::And(terms) => terms.iter().all(|t| evaluate(t, key, workspace)),
+        FilterExpr::And(terms) => terms.iter().all(|t| evaluate(t, key, workspace, dirty_keys)),
 
         FilterExpr::KeyPattern { pattern, mode } => match mode {
             MatchMode::Exact => key == pattern.as_str(),
@@ -227,6 +237,8 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace) -> bool {
                 }
             }
         }
+
+        FilterExpr::DirtyKey => dirty_keys.contains(key),
     }
 }
 
@@ -273,7 +285,8 @@ fn collect_locale_selectors<'a>(expr: &'a FilterExpr, out: &mut Vec<(&'a str, &'
             out.push((locale.as_str(), mode));
         }
         FilterExpr::BundleFilter(_) | FilterExpr::KeyPattern { .. }
-        | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. } => {}
+        | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. }
+        | FilterExpr::DirtyKey => {}
     }
 }
 

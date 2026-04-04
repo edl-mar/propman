@@ -17,11 +17,18 @@ Two related issues arise when a filter is active:
 
 ```rust
 pub temp_pins: Vec<String>,        // current op only; discarded on mode exit
-pub pinned_keys: HashSet<String>,  // persistent; user-controlled
+pub pinned_keys: HashSet<String>,  // persistent; user-controlled via m/M
 ```
 
-Visibility rule: `visible = matches_filter(key) OR is_pinned(key)`
-where `is_pinned` checks both `temp_pins` and `pinned_keys`.
+Visibility rule: `visible = matches_filter(key) OR is_temp_pinned(key) OR is_pinned(key)`
+
+Pinning is **not** the same as dirty (see `docs/dirty.md`):
+- `pinned_keys` = explicit user bookmarks; bypass the filter so the user can
+  read them while working on something else.
+- `dirty_keys` = auto-tracked changes; queried via `#` in the filter DSL.
+  The `ChildrenAll` bulk-op receipt will eventually populate `dirty_keys`, not
+  `pinned_keys`.  The current implementation uses `pinned_keys` as a
+  placeholder until dirty tracking is wired up.
 
 ### Pinned mode (filter bar)
 

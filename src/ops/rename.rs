@@ -40,11 +40,15 @@ pub fn commit_exact_rename(state: &mut AppState, old_key: &str, new_key: String)
 
 /// Rename every key that equals `old_prefix` or starts with `old_prefix.`
 /// Routes to `commit_cross_bundle_prefix_rename` when the bundle prefix changes.
-pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String) {
+///
+/// `all_children`: when `true`, renames hidden children too (`ChildrenAll` scope).
+/// When `false`, only renames keys currently visible in `display_rows` (`Children`
+/// scope — hidden ones are left untouched).
+pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String, all_children: bool) {
     let (old_bundle, _) = workspace::split_key(old_prefix);
     let (new_bundle, new_real) = workspace::split_key(&new_prefix);
     if old_bundle != new_bundle {
-        commit_cross_bundle_prefix_rename(state, old_prefix, new_prefix);
+        commit_cross_bundle_prefix_rename(state, old_prefix, new_prefix, all_children);
         return;
     }
     if new_real.is_empty() {
@@ -52,8 +56,23 @@ pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: 
         return;
     }
     let dot_prefix = format!("{old_prefix}.");
+
+    let visible: std::collections::HashSet<&str> = if !all_children {
+        state.display_rows.iter()
+            .filter_map(|r| match r {
+                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let keys_to_rename: Vec<String> = state.workspace.merged_keys.iter()
-        .filter(|k| *k == old_prefix || k.starts_with(&dot_prefix))
+        .filter(|k| {
+            (*k == old_prefix || k.starts_with(&dot_prefix))
+                && (all_children || visible.contains(k.as_str()))
+        })
         .cloned()
         .collect();
 
@@ -149,7 +168,7 @@ fn commit_cross_bundle_rename(state: &mut AppState, old_key: &str, new_key: Stri
 
 /// Move every key that equals `old_prefix` or starts with `old_prefix.` from
 /// its current bundle to a different bundle.
-fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String) {
+fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String, all_children: bool) {
     let (old_bundle, _) = workspace::split_key(old_prefix);
     let (new_bundle, new_real) = workspace::split_key(&new_prefix);
 
@@ -163,8 +182,23 @@ fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new
     }
 
     let dot_prefix = format!("{old_prefix}.");
+
+    let visible: std::collections::HashSet<&str> = if !all_children {
+        state.display_rows.iter()
+            .filter_map(|r| match r {
+                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let keys_to_move: Vec<String> = state.workspace.merged_keys.iter()
-        .filter(|k| *k == old_prefix || k.starts_with(&dot_prefix))
+        .filter(|k| {
+            (*k == old_prefix || k.starts_with(&dot_prefix))
+                && (all_children || visible.contains(k.as_str()))
+        })
         .cloned()
         .collect();
 
@@ -272,6 +306,7 @@ fn rename_key_in_workspace(state: &mut AppState, old_key: &str, new_key: &str) {
     }
 
     // Queue a pending write for each affected file entry.
+    state.dirty_keys.insert(new_key.to_string());
     for (path, first_line, last_line, value) in found {
         state.pending_writes.push(PendingChange::Update {
             path,
@@ -279,6 +314,7 @@ fn rename_key_in_workspace(state: &mut AppState, old_key: &str, new_key: &str) {
             last_line,
             key: new_real.to_string(), // always write the bare key to the file
             value,
+            full_key: new_key.to_string(),
         });
         state.unsaved_changes = true;
     }

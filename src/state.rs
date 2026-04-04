@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use tui_textarea::TextArea;
 use crate::{
@@ -15,22 +16,25 @@ pub enum PendingChange {
         path: PathBuf,
         first_line: usize,
         last_line: usize,
-        key: String,
+        key: String,   // bare key written to the file (no bundle prefix)
         value: String,
+        full_key: String, // bundle-qualified key used for dirty tracking
     },
     /// Insert a brand-new key-value entry after `after_line`
     /// (0 means prepend before the first line).
     Insert {
         path: PathBuf,
         after_line: usize,
-        key: String,
+        key: String,   // bare key written to the file (no bundle prefix)
         value: String,
+        full_key: String, // bundle-qualified key used for dirty tracking
     },
     /// Remove the key-value entry at `first_line..=last_line` from the file.
     Delete {
         path: PathBuf,
         first_line: usize,
         last_line: usize,
+        full_key: String, // bundle-qualified key used for dirty tracking
     },
 }
 
@@ -41,22 +45,29 @@ pub enum PendingChange {
 pub enum SelectionScope {
     /// Only the key under the cursor is in scope.
     Exact,
-    /// The key and all visible (filter-matching) children are in scope.
+    /// The key and all filter-visible children are in scope.
+    /// Hidden children are silently unaffected; a "+N ignored" hint comes later.
     Children,
+    /// The key and ALL children (visible + hidden) are in scope.
+    /// Hidden children are temp-pinned and surfaced in the table while this
+    /// scope is active.
+    ChildrenAll,
 }
 
 impl SelectionScope {
     pub fn cycle(&self) -> Self {
         match self {
-            Self::Exact    => Self::Children,
-            Self::Children => Self::Exact,
+            Self::Exact        => Self::Children,
+            Self::Children     => Self::ChildrenAll,
+            Self::ChildrenAll  => Self::Exact,
         }
     }
 
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Exact    => "exact",
-            Self::Children => "+children",
+            Self::Exact        => "exact",
+            Self::Children     => "+children",
+            Self::ChildrenAll  => "+children all",
         }
     }
 }
@@ -117,6 +128,18 @@ pub struct AppState {
     /// and Filter modes.  The pane updates live as the cursor moves.
     /// Edit modes implicitly suppress it (they use the same pane slot).
     pub show_preview: bool,
+    /// Bundle-qualified keys that have unsaved changes.  Derived from
+    /// `pending_writes` after every save: a key is dirty iff it still has at
+    /// least one entry in the pending queue.  Also populated immediately when a
+    /// mutation is queued so the filter `#` sigil reflects in-flight changes.
+    pub dirty_keys: HashSet<String>,
+    /// Keys that are temporarily surfaced while `ChildrenAll` scope is active.
+    /// Cleared on scope change, cancel, or commit.  Never written to disk.
+    pub temp_pins: Vec<String>,
+    /// Keys promoted to permanent pins after a `ChildrenAll` bulk op, or
+    /// manually pinned by the user (`m`).  Bypasses the filter so they stay
+    /// visible until explicitly unpinned.
+    pub pinned_keys: HashSet<String>,
 }
 
 impl AppState {
@@ -147,7 +170,12 @@ impl AppState {
         } else {
             let expr = filter::parse(&query);
             let filtered = self.workspace.merged_keys.iter()
-                .filter(|key| filter::evaluate(&expr, key, &self.workspace))
+                .filter(|key| {
+                    filter::evaluate(&expr, key, &self.workspace, &self.dirty_keys)
+                        || self.temp_pins.contains(*key)
+                        || self.pinned_keys.contains(*key)
+                        || self.dirty_keys.contains(*key)
+                })
                 .cloned()
                 .collect();
             let visible = filter::visible_locales(&expr, &self.workspace);
@@ -218,6 +246,9 @@ impl AppState {
             selection_scope: SelectionScope::Exact,
             status_message: None,
             show_preview: false,
+            temp_pins: Vec::new(),
+            pinned_keys: HashSet::new(),
+            dirty_keys: HashSet::new(),
         }
     }
 }

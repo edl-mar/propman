@@ -297,11 +297,17 @@ careful — the writer must never corrupt a file.
 
 ### Near-term
 
-- **Pinned keys**: `m` pins/unpins a key (or prefix subtree); pinned keys bypass
-  the filter and stay visible. `M` clears all pins. `#` in the filter bar shows
-  only pinned entries. Bulk ops (`+children`) temporarily pin hidden affected
-  entries so the user can see the real scope; changed entries are auto-promoted
-  to permanent pins as a receipt. See `docs/pinned_keys.md` for full design.
+- **Dirty tracking**: auto-mark keys as dirty on any mutation; clear on save.
+  `#` in the filter DSL surfaces dirty entries (`#`, `/confirm#`, `:[de]#`).
+  `dirty_keys: HashSet<String>` in AppState; populated by every ops/ mutation
+  path; `FilterExpr::DirtyKey` variant in filter.rs. The `ChildrenAll` bulk-op
+  receipt currently promotes to `pinned_keys` (placeholder) and will switch to
+  `dirty_keys` once wired up. See `docs/dirty.md` for full design.
+- **Manual pinning**: `m` pins/unpins a key (or prefix subtree) as a bookmark;
+  pinned keys bypass the filter so the user can read them while working on
+  something else. `M` clears all pins. Pinned keys are independent of dirty —
+  see `docs/pinned_keys.md`. The `[+children all]` temp-pin surfacing mechanism
+  is already implemented.
 - **Value preview**: `Space` in Normal mode opens a read-only preview pane
   showing the full value of the selected cell (important for multiline values
   that are truncated in the table). Also useful on key rows to show the full
@@ -332,11 +338,9 @@ careful — the writer must never corrupt a file.
 
 ### Future
 
-- **Selection-phase scope toggle**: Tab in Normal mode cycles
-  `exact → +children [filtered] → +children [all]`. Actions (rename, delete,
-  pin) inherit the active scope — no in-mode Tab toggle needed. The `[all]`
-  state temporarily pins hidden affected children so they surface in the table.
-  Prerequisite for the pinned-keys bulk-op integration.
+- **"+N ignored" hint**: when `[+children]` scope is active and hidden children
+  exist, show a summary row just below the focused entry (e.g. `  +3 hidden
+  entries ignored`) instead of listing them individually.
 - **Multi-selection**: Shift+A selects all visible rows; actions apply to all
   selected entries (e.g. bulk-copy default value to missing locales).
 - **User config file**: load keybindings from a TOML config at startup.

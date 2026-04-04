@@ -274,9 +274,27 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     let viewport = area.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(viewport);
 
-    // Compute the scope prefix for subtree highlighting in Normal mode.
+    // Build a (full_key, locale) set of cells with pending writes for dirty cell indicators.
+    let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = state.workspace.groups.iter()
+        .flat_map(|g| g.files.iter())
+        .map(|f| (f.path.as_path(), f.locale.as_str()))
+        .collect();
+    let dirty_cells: std::collections::HashSet<(&str, &str)> = state.pending_writes.iter()
+        .filter_map(|c| {
+            use crate::state::PendingChange;
+            let (path, full_key) = match c {
+                PendingChange::Update { path, full_key, .. } => (path.as_path(), full_key.as_str()),
+                PendingChange::Insert { path, full_key, .. } => (path.as_path(), full_key.as_str()),
+                PendingChange::Delete { path, full_key, .. } => (path.as_path(), full_key.as_str()),
+            };
+            path_to_locale.get(path).map(|locale| (full_key, *locale))
+        })
+        .collect();
+
+    // Compute the scope prefix for subtree highlighting.
+    // Used for both +children (cyan) and +children all (cyan for visible, green for temp-pinned).
     let scope_prefix: Option<String> = if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting)
-        && state.selection_scope == SelectionScope::Children
+        && matches!(state.selection_scope, SelectionScope::Children | SelectionScope::ChildrenAll)
     {
         match state.display_rows.get(state.cursor_row) {
             Some(DisplayRow::Key    { full_key, .. }) => Some(format!("{full_key}.")),
@@ -319,9 +337,16 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             DisplayRow::Key { display, full_key, depth } => {
                 let indent = "  ".repeat(*depth);
                 let dangling = if state.workspace.is_dangling(full_key) { "*" } else { "" };
-                (indent, format!("{dangling}{display}: "), full_key.as_str(), false)
+                let dirty   = if state.dirty_keys.contains(full_key.as_str()) { "#" } else { "" };
+                let pinned  = if state.pinned_keys.contains(full_key.as_str()) { "@" } else { "" };
+                (indent, format!("{dangling}{dirty}{pinned}{display}: "), full_key.as_str(), false)
             }
         };
+
+        // Pin/dirty flags used for cell styling below.
+        let is_temp_pinned = state.temp_pins.iter().any(|k| k == full_key);
+        let is_perm_pinned = !is_header && state.pinned_keys.contains(full_key);
+        let is_dirty_row   = !is_header && state.dirty_keys.contains(full_key);
 
         // Bundle-level headers (depth 0, prefix == bundle name) never have
         // locale columns — the bundle name is not itself a translatable key.
@@ -334,6 +359,13 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default().fg(Color::DarkGray)
         } else if is_selected_row {
             Style::default().add_modifier(Modifier::BOLD)
+        } else if is_temp_pinned {
+            // Temp-pinned = hidden child surfaced by +children all; always in scope.
+            Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+        } else if is_perm_pinned {
+            Style::default().fg(Color::Yellow)
+        } else if is_dirty_row {
+            Style::default().fg(Color::Yellow)
         } else if in_scope {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         } else {
@@ -370,12 +402,20 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 state.workspace.get_value(full_key, locale)
             };
 
+            let is_dirty_cell = dirty_cells.contains(&(full_key, locale.as_str()));
             let tag_style = if is_selected_row {
                 Style::default()
+            } else if is_temp_pinned {
+                Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+            } else if is_perm_pinned {
+                Style::default().fg(Color::Yellow)
+            } else if is_dirty_cell {
+                Style::default().fg(Color::Yellow)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
-            spans.push(Span::styled(format!("[{locale}] "), tag_style));
+            let locale_tag = if is_dirty_cell { format!("#[{locale}] ") } else { format!("[{locale}] ") };
+            spans.push(Span::styled(locale_tag, tag_style));
 
             // Strip `\`+newline continuation markers — they're an on-disk format
             // detail. The logical value (without them) is what the cell should show.

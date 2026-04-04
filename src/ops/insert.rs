@@ -38,11 +38,19 @@ pub fn insert_into_file(state: &mut AppState, gi: usize, fi: usize, real_key: &s
         value: value.to_string(),
     });
 
+    let bundle = &state.workspace.groups[gi].base_name;
+    let full_key = if bundle.is_empty() {
+        real_key.to_string()
+    } else {
+        format!("{bundle}:{real_key}")
+    };
+    state.dirty_keys.insert(full_key.clone());
     state.pending_writes.push(PendingChange::Insert {
         path,
         after_line,
         key:   real_key.to_string(),
         value: value.to_string(),
+        full_key,
     });
     state.unsaved_changes = true;
 }
@@ -112,12 +120,14 @@ pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
         *value = new_value.clone();
     }
 
+    state.dirty_keys.insert(full_key.clone());
     state.pending_writes.push(PendingChange::Update {
         path,
         first_line,
         last_line,
         key: real_key, // write the bare key — files never store bundle prefix
         value: new_value,
+        full_key,
     });
     state.unsaved_changes = true;
 }

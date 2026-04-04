@@ -63,10 +63,13 @@ pub fn delete_key_inner(state: &mut AppState, full_key: &str) {
             path: path.clone(),
             first_line: *fl,
             last_line:  *ll,
+            full_key: full_key.to_string(),
         });
     }
 
     state.workspace.merged_keys.retain(|k| k != full_key);
+    // Key is gone — remove from dirty too (no point tracking a deleted key).
+    state.dirty_keys.remove(full_key);
     if !found.is_empty() {
         state.unsaved_changes = true;
     }
@@ -80,10 +83,29 @@ pub fn delete_key(state: &mut AppState, full_key: &str) {
 
 /// Deletes every key that equals `prefix` or starts with `prefix.` from all
 /// locale files, then sets a summary status message.
-pub fn delete_key_prefix(state: &mut AppState, prefix: &str) {
+///
+/// `all_children`: when `true`, deletes hidden (filter-invisible) children too
+/// (`ChildrenAll` scope).  When `false`, only deletes keys currently visible in
+/// `display_rows` (`Children` scope — hidden ones are silently left untouched).
+pub fn delete_key_prefix(state: &mut AppState, prefix: &str, all_children: bool) {
     let dot_prefix = format!("{prefix}.");
+
+    let visible: std::collections::HashSet<&str> = if !all_children {
+        state.display_rows.iter()
+            .filter_map(|r| match r {
+                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     let keys: Vec<String> = state.workspace.merged_keys.iter()
-        .filter(|k| *k == prefix || k.starts_with(&dot_prefix))
+        .filter(|k| {
+            (*k == prefix || k.starts_with(&dot_prefix))
+                && (all_children || visible.contains(k.as_str()))
+        })
         .cloned()
         .collect();
 
@@ -148,7 +170,13 @@ pub fn delete_locale_entry(state: &mut AppState, full_key: &str, locale: &str) {
         }
     }
 
-    state.pending_writes.push(PendingChange::Delete { path, first_line: fl, last_line: ll });
+    state.dirty_keys.insert(full_key.to_string());
+    state.pending_writes.push(PendingChange::Delete {
+        path,
+        first_line: fl,
+        last_line: ll,
+        full_key: full_key.to_string(),
+    });
     state.unsaved_changes = true;
     state.status_message = Some(format!("Deleted [{locale}] entry for {full_key}"));
 }

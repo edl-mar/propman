@@ -8,6 +8,48 @@ use crate::{
     writer,
 };
 
+/// Recompute `temp_pins` for the key at the current cursor row.
+///
+/// - Clears any existing temp pins and rebuilds display without them first.
+/// - If scope is `ChildrenAll`, finds every child of the cursor key that is
+///   NOT currently visible in `display_rows` and adds them to `temp_pins`,
+///   then triggers another `apply_filter` so they surface in the table.
+/// - For any other scope, just clears temp pins (one `apply_filter` call).
+fn refresh_temp_pins(state: &mut AppState) {
+    state.temp_pins.clear();
+    state.apply_filter(); // Rebuild with no old pins; gives us the "true" visible set.
+
+    if state.selection_scope != SelectionScope::ChildrenAll {
+        return;
+    }
+
+    let key = match state.display_rows.get(state.cursor_row) {
+        Some(DisplayRow::Key    { full_key, .. }) => full_key.clone(),
+        Some(DisplayRow::Header { prefix,   .. }) => prefix.clone(),
+        None => return,
+    };
+
+    let dot_key = format!("{key}.");
+    let currently_visible: std::collections::HashSet<&str> = state.display_rows.iter()
+        .filter_map(|r| match r {
+            DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    state.temp_pins = state.workspace.merged_keys.iter()
+        .filter(|k| {
+            (*k == &key || k.starts_with(&dot_key))
+                && !currently_visible.contains(k.as_str())
+        })
+        .cloned()
+        .collect();
+
+    if !state.temp_pins.is_empty() {
+        state.apply_filter(); // Rebuild again to include the newly temp-pinned rows.
+    }
+}
+
 /// Pure state transition: (AppState, Message) → AppState.
 /// No I/O, no side effects.
 ///
@@ -26,6 +68,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.cursor_row = state.cursor_row.saturating_sub(1);
             state.clamp_cursor_col();
             state.clamp_scroll();
+            refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::MoveCursorDown) => {
             let max = state.display_rows.len().saturating_sub(1);
@@ -34,6 +77,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
             state.clamp_cursor_col();
             state.clamp_scroll();
+            refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::MoveCursorLeft) => {
             // Step left, skipping locale columns that have no file in this row's bundle.
@@ -60,15 +104,21 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.cursor_row = state.cursor_row.saturating_sub(20);
             state.clamp_cursor_col();
             state.clamp_scroll();
+            refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::PageDown) => {
             let max = state.display_rows.len().saturating_sub(1);
             state.cursor_row = (state.cursor_row + 20).min(max);
             state.clamp_cursor_col();
             state.clamp_scroll();
+            refresh_temp_pins(&mut state);
         }
         (_, Message::CycleScope) => {
             state.selection_scope = state.selection_scope.cycle();
+            // In Normal mode: refresh temp pins live (ChildrenAll gives an immediate
+            // preview; other scopes clear the pins).
+            // In KeyRenaming/Deleting: same — the active operation's visible set updates.
+            refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::StartEdit) => {
             if state.cursor_col == 0 {
@@ -98,6 +148,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
                 state.edit_buffer = Some(CellEdit::new(old_key));
                 state.mode = Mode::KeyRenaming;
+                refresh_temp_pins(&mut state);
             } else {
                 // Block value editing on bundle-level Header rows (they have no key).
                 if let Some(DisplayRow::Header { prefix, .. }) = state.display_rows.get(state.cursor_row) {
@@ -134,6 +185,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
                 state.edit_buffer = Some(CellEdit::new(key));
                 state.mode = Mode::Deleting;
+                refresh_temp_pins(&mut state);
             } else {
                 // Locale cell: immediately delete just this one locale's entry.
                 if let Some(DisplayRow::Key { full_key, .. }) = state.display_rows.get(state.cursor_row) {
@@ -332,20 +384,38 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 state.status_message = Some("Key must contain at least one '.'".to_string());
                 // Stay in KeyRenaming so the user can fix it.
             } else if new_key != old_key {
-                if state.selection_scope == SelectionScope::Children {
-                    ops::rename::commit_prefix_rename(&mut state, &old_key, new_key);
-                } else {
-                    ops::rename::commit_exact_rename(&mut state, &old_key, new_key);
+                match state.selection_scope {
+                    SelectionScope::Children => {
+                        // Only filter-visible children; hidden ones ignored.
+                        // Clear temp_pins before the op so they don't stay visible.
+                        state.temp_pins.clear();
+                        ops::rename::commit_prefix_rename(&mut state, &old_key, new_key, false);
+                    }
+                    SelectionScope::ChildrenAll => {
+                        // All children including hidden (temp-pinned).
+                        // Dirty tracking is automatic (rename_key_in_workspace marks new keys dirty).
+                        // Use `#` in the filter to review changed entries after the op.
+                        state.temp_pins.clear();
+                        ops::rename::commit_prefix_rename(&mut state, &old_key, new_key, true);
+                    }
+                    SelectionScope::Exact => {
+                        state.temp_pins.clear();
+                        ops::rename::commit_exact_rename(&mut state, &old_key, new_key);
+                    }
                 }
             } else {
                 // No change — just close.
+                state.temp_pins.clear();
                 state.edit_buffer = None;
                 state.mode = Mode::Normal;
+                state.apply_filter();
             }
         }
         (Mode::KeyRenaming, Message::CancelEdit) => {
+            state.temp_pins.clear();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
+            state.apply_filter();
         }
         (Mode::KeyRenaming, Message::TextInput(key)) => {
             if let Some(edit) = state.edit_buffer.as_mut() {
@@ -359,10 +429,11 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 .map(|e| e.current_value())
                 .unwrap_or_default();
 
-            if state.selection_scope == SelectionScope::Children {
-                ops::delete::delete_key_prefix(&mut state, &key);
-            } else {
-                ops::delete::delete_key(&mut state, &key);
+            state.temp_pins.clear(); // Discard temp pins before the op.
+            match state.selection_scope {
+                SelectionScope::Children   => ops::delete::delete_key_prefix(&mut state, &key, false),
+                SelectionScope::ChildrenAll => ops::delete::delete_key_prefix(&mut state, &key, true),
+                SelectionScope::Exact      => ops::delete::delete_key(&mut state, &key),
             }
 
             state.edit_buffer = None;
@@ -370,8 +441,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.apply_filter();
         }
         (Mode::Deleting, Message::CancelEdit) => {
+            state.temp_pins.clear();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
+            state.apply_filter();
         }
 
         // Up/Down in any edit mode: cancel and immediately move (mirrors Filter).
@@ -379,8 +452,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             Mode::Editing | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting,
             Message::MoveCursorUp,
         ) => {
+            state.temp_pins.clear();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
+            state.apply_filter();
             state.cursor_row = state.cursor_row.saturating_sub(1);
             state.clamp_cursor_col();
             state.clamp_scroll();
@@ -389,8 +464,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             Mode::Editing | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting,
             Message::MoveCursorDown,
         ) => {
+            state.temp_pins.clear();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
+            state.apply_filter();
             let max = state.display_rows.len().saturating_sub(1);
             if state.cursor_row < max {
                 state.cursor_row += 1;
@@ -444,11 +521,11 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             let changes = std::mem::take(&mut state.pending_writes);
             for change in changes {
                 let result = match &change {
-                    PendingChange::Update { path, first_line, last_line, key, value } =>
+                    PendingChange::Update { path, first_line, last_line, key, value, .. } =>
                         writer::write_change(path, *first_line, *last_line, key, value),
-                    PendingChange::Insert { path, after_line, key, value } =>
+                    PendingChange::Insert { path, after_line, key, value, .. } =>
                         writer::write_insert(path, *after_line, key, value),
-                    PendingChange::Delete { path, first_line, last_line } =>
+                    PendingChange::Delete { path, first_line, last_line, .. } =>
                         writer::write_delete(path, *first_line, *last_line),
                 };
                 if result.is_err() {
@@ -456,6 +533,15 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
             }
             state.unsaved_changes = !state.pending_writes.is_empty();
+            // Rebuild dirty_keys to reflect only writes that are still pending.
+            state.dirty_keys = state.pending_writes.iter()
+                .map(|c| match c {
+                    PendingChange::Update { full_key, .. } => full_key,
+                    PendingChange::Insert { full_key, .. } => full_key,
+                    PendingChange::Delete { full_key, .. } => full_key,
+                })
+                .cloned()
+                .collect();
         }
         (_, Message::Quit) => {
             state.quitting = true;
