@@ -6,10 +6,14 @@ Two related issues arise when a filter is active:
 
 1. **Post-commit disappearance** — after editing/renaming a key, it may no longer match
    the filter and vanishes from view. The user loses track of what they just changed.
+   → Solved by dirty tracking: dirty keys bypass the filter automatically.
 
-2. **Invisible bulk edits** — a prefix rename or prefix delete with `+children` scope
-   silently modifies keys that are hidden by the filter. The user had no idea those
-   entries were in scope.
+2. **Invisible bulk edits** — a prefix rename or prefix delete with `+children all` scope
+   silently modifies keys that are hidden by the filter.
+   → Solved by temp-pins (surfacing) + dirty tracking (post-op receipt).
+
+Manual pinning is a separate, persistent bookmark mechanism for keys the user
+wants to keep visible across sessions or operations, independent of dirty state.
 
 ## Design
 
@@ -20,68 +24,58 @@ pub temp_pins: Vec<String>,        // current op only; discarded on mode exit
 pub pinned_keys: HashSet<String>,  // persistent; user-controlled via m/M
 ```
 
-Visibility rule: `visible = matches_filter(key) OR is_temp_pinned(key) OR is_pinned(key)`
+Visibility rule:
+```
+visible = matches_filter(key) OR is_dirty(key) OR is_temp_pinned(key) OR is_pinned(key)
+```
 
 Pinning is **not** the same as dirty (see `docs/dirty.md`):
-- `pinned_keys` = explicit user bookmarks; bypass the filter so the user can
-  read them while working on something else.
-- `dirty_keys` = auto-tracked changes; queried via `#` in the filter DSL.
-  The `ChildrenAll` bulk-op receipt will eventually populate `dirty_keys`, not
-  `pinned_keys`.  The current implementation uses `pinned_keys` as a
-  placeholder until dirty tracking is wired up.
+- `dirty_keys` = auto-tracked unsaved changes; bypass filter until saved; `#` filter sigil.
+- `pinned_keys` = explicit user bookmarks; bypass filter until manually unpinned; `@` indicator.
 
-### Pinned mode (filter bar)
-
-`#` in the filter bar → `visible = is_pinned(key)` only.
-Shows all pinned entries at once, regardless of other filter state.
-
-### Manual pinning (Normal mode)
+### Manual pinning (Normal mode) — not yet implemented
 
 - `m` on a Key row: pin/unpin that exact key
-- `m` on a Header row (or with selection scope set to `+children`): pin/unpin the whole prefix subtree
+- `m` on a Header row (or with selection scope `+children`/`+children all`): pin/unpin the whole prefix subtree
 - `M`: drop all entries from `pinned_keys` at once
-- Pinned entries are marked with a visible indicator in the key column
+- Pinned entries show an `@` prefix in the key column
 
-### Bulk op integration (KeyRenaming / Deleting)
+### Temp-pins and ChildrenAll scope
 
-When entering `KeyRenaming` or `Deleting` with `+children` scope and a filter is
-active, hidden children that would be affected are **temporarily pinned** so they
-surface in the main table. This lets the user see the real scope of the operation.
-
-Tab cycles through three scope states:
+Tab cycles through three scope states in KeyRenaming and Deleting modes:
 
 | State | Hidden affected entries | Will be modified |
 |---|---|---|
-| `exact` | not shown (only one key in scope) | no |
-| `+children [filtered]` | shown, dimmed gray | no |
-| `+children [all]` | shown, dim green | yes |
+| `exact` | not shown | no |
+| `+children` | not shown; silently unaffected | no |
+| `+children all` | temp-pinned on scope enter | yes |
 
-Coloring comes from the **op context** (is the entry in scope?), not from the pin
-state. The pin is only the mechanism that makes them visible.
+When `+children all` is active, hidden children of the cursor key are added to
+`temp_pins` so they surface in the table.  This lets the user see the real scope
+of the operation before committing.
 
-**On commit:**
-- `[filtered]`: `temp_pins` discarded → hidden entries go back to being hidden
-- `[all]`: entries that were actually changed → promoted from `temp_pins` to
-  `pinned_keys` (visible receipt of what was touched); rest discarded
+**On commit (`+children all`):** `temp_pins` is cleared; the modified keys are
+automatically marked dirty and remain visible via the dirty bypass.
 
-**On cancel:** all `temp_pins` discarded.
+**On commit (`+children`):** `temp_pins` cleared (none were set).
+
+**On cancel:** all `temp_pins` discarded; `apply_filter` re-run.
 
 ### Rendering
 
-| Row type | Style |
+| Row type | Key column style |
 |---|---|
-| Normal filtered row | default |
-| Temp-pinned, out of scope | dimmed / gray |
-| Temp-pinned, in scope | dim green |
-| Permanently pinned | pin indicator in key column, otherwise normal |
+| Normal | default |
+| Dirty (unsaved changes) | yellow, `#` prefix |
+| Temp-pinned, out of scope | dim green |
+| Temp-pinned, in scope | dim green (same — always in scope for ChildrenAll) |
+| Permanently pinned | `@` prefix |
 
 ## Implementation order
 
-1. `pinned_keys: HashSet<String>` + `temp_pins: Vec<String>` on `AppState`
-2. Update `apply_filter` / visibility rule to include pinned keys
-3. Manual pin/unpin (`p` / `P`) in Normal mode
-4. `#` pinned mode in filter bar
-5. Bulk op temp-pinning: populate `temp_pins` on entering `+children` scope,
-   promote/discard on commit/cancel
-6. Rendering: dimmed gray / dim green for temp-pinned rows; pin indicator for
-   permanent pins
+1. ✅ `pinned_keys: HashSet<String>` + `temp_pins: Vec<String>` on `AppState`
+2. ✅ Update `apply_filter` / visibility rule to include pinned keys and dirty keys
+3. ✅ `ChildrenAll` temp-pin surfacing: populate `temp_pins` on entering `+children all` scope
+4. ✅ Discard temp_pins on commit/cancel
+5. ⬜ Manual pin/unpin (`m` / `M`) keybindings and message handlers
+6. ⬜ `@` indicator rendering for permanently pinned rows (indicator character is set; styling TBD)

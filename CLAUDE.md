@@ -71,9 +71,15 @@ pub pending_writes: Vec<PendingChange>, // flushed on SaveFile
 pub quitting: bool,
 pub edit_buffer: Option<CellEdit>,   // present while mode is Editing / KeyNaming
                                      // / KeyRenaming / Deleting
-pub rename_children: bool,           // Tab-toggle in KeyRenaming
-pub delete_children: bool,           // Tab-toggle in Deleting
+pub selection_scope: SelectionScope, // Exact / Children / ChildrenAll; Tab-cycles
+                                     // in Normal, KeyRenaming, Deleting
 pub status_message: Option<String>,  // one-shot; cleared on next keypress
+pub show_preview: bool,              // Space toggles read-only value preview pane
+pub dirty_keys: HashSet<String>,     // keys with unsaved changes; auto-set on any
+                                     // mutation, cleared per-key on Ctrl+S
+pub temp_pins: Vec<String>,          // hidden children surfaced while ChildrenAll
+                                     // is active; discarded on mode exit
+pub pinned_keys: HashSet<String>,    // manual bookmarks; bypass filter until unpinned
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -179,6 +185,10 @@ Section rules — each section runs to the next separator or end of input:
 modifiers         — ! = must be present, ? = must be missing, none = column hint only
 :?                — AnyMissing shorthand (at least one locale missing)
 /*pattern         — DanglingKey: unsaved key matching the pattern
+/#                — DirtyKey: all keys with unsaved changes
+/confirm#         — keys matching "confirm" AND dirty (# in key section = AND term)
+:#                — dirty keys; all locale columns visible
+:[de]#            — dirty keys; narrows visible columns to de
 ```
 
 `visible_locales` is narrowed to the matched locales when any `LocaleStatus`
@@ -193,11 +203,14 @@ status bar reflects `unsaved_changes`.
 
 ```rust
 enum PendingChange {
-    Update { path, first_line, last_line, key, value }, // rewrite existing entry
-    Insert { path, after_line, key, value },            // append new entry
-    Delete { path, first_line, last_line },             // remove entry
+    Update { path, first_line, last_line, key, value, full_key }, // rewrite existing entry
+    Insert { path, after_line, key, value, full_key },            // append new entry
+    Delete { path, first_line, last_line, full_key },             // remove entry
 }
 ```
+
+`full_key` is the bundle-qualified key name used to rebuild `dirty_keys` after a
+save: once all pending writes for a key flush successfully, the key leaves `dirty_keys`.
 
 `insert_into_file(state, gi, fi, real_key, value)` is the shared helper used
 by cell insert and cross-bundle move. It finds the insertion point, bumps
@@ -206,13 +219,44 @@ subsequent line numbers in-memory, and queues a `PendingChange::Insert`.
 When entries are deleted, line numbers of all subsequent entries in the same
 file are shifted down immediately so in-memory state stays consistent.
 
+**Dirty tracking**
+A key is dirty when it has unsaved changes in the current session. `dirty_keys`
+is a `HashSet<String>` of bundle-qualified key names; every mutation path
+(`ops::insert`, `ops::delete`, `ops::rename`) inserts the affected key immediately.
+On Ctrl+S, `dirty_keys` is rebuilt from the keys still referenced by `pending_writes`
+— keys whose writes flushed successfully are automatically removed.
+
+Dirty keys bypass the filter (always visible, like pinned keys) and are shown with
+a yellow key name and `#` prefix in the key column. Individual locale cells with a
+pending write show a yellow `#[locale]` tag instead of the normal gray `[locale]`.
+Per-cell dirty state is derived at render time from `pending_writes` + a path→locale
+map — no separate per-cell state is stored.
+
+The `#` sigil in the filter DSL (key section `/#`, locale section `:#`) narrows the
+visible set to dirty keys. All terms are ANDed, so `/#` = all dirty keys, `/confirm#`
+= dirty AND matching "confirm", `:[de]#` = dirty AND narrow to de column.
+
+**Selection scope**
+`SelectionScope` cycles (Tab) through three states in Normal, KeyRenaming, and
+Deleting modes:
+
+| Scope | Affected keys | Hidden children |
+|---|---|---|
+| `Exact` | key under cursor only | — |
+| `Children` | cursor key + visible children | silently unaffected |
+| `ChildrenAll` | cursor key + ALL children | temp-pinned on scope enter |
+
+`temp_pins` holds hidden children surfaced by `ChildrenAll` so they appear in the
+table for the duration of the operation. On commit they are discarded — dirty
+tracking marks the changed keys, which keeps them visible automatically. On cancel
+all temp pins are cleared.
+
 **Deletion**
 - `d` on a locale cell: removes that one `(key, locale)` entry immediately,
   leaving the key in `merged_keys` (other locales still visible).
 - `d` on the key column: enters `Mode::Deleting`. The pane shows the key
-  (read-only). Tab toggles `delete_children` (exact vs. +children). Enter
-  confirms; Esc cancels. Dangling (unsaved) keys are dropped without a file
-  write.
+  (read-only). Tab cycles selection scope. Enter confirms; Esc cancels. Dangling
+  (unsaved) keys are dropped without a file write.
 
 **Cell editor / KeyNaming / KeyRenaming**
 The bottom edit pane is used for Editing, KeyNaming, KeyRenaming, and
@@ -297,17 +341,10 @@ careful — the writer must never corrupt a file.
 
 ### Near-term
 
-- **Dirty tracking**: auto-mark keys as dirty on any mutation; clear on save.
-  `#` in the filter DSL surfaces dirty entries (`#`, `/confirm#`, `:[de]#`).
-  `dirty_keys: HashSet<String>` in AppState; populated by every ops/ mutation
-  path; `FilterExpr::DirtyKey` variant in filter.rs. The `ChildrenAll` bulk-op
-  receipt currently promotes to `pinned_keys` (placeholder) and will switch to
-  `dirty_keys` once wired up. See `docs/dirty.md` for full design.
-- **Manual pinning**: `m` pins/unpins a key (or prefix subtree) as a bookmark;
-  pinned keys bypass the filter so the user can read them while working on
-  something else. `M` clears all pins. Pinned keys are independent of dirty —
-  see `docs/pinned_keys.md`. The `[+children all]` temp-pin surfacing mechanism
-  is already implemented.
+- **Manual pinning**: `m` pins/unpins a key (or prefix subtree) as a permanent
+  bookmark; pinned keys bypass the filter (`@` indicator in key column). `M`
+  clears all pins. `pinned_keys: HashSet<String>` is already in AppState; only
+  the keybindings and message handlers remain. See `docs/pinned_keys.md`.
 - **Value preview**: `Space` in Normal mode opens a read-only preview pane
   showing the full value of the selected cell (important for multiline values
   that are truncated in the table). Also useful on key rows to show the full
