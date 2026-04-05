@@ -198,6 +198,14 @@ impl Workspace {
             .collect()
     }
 
+    /// All non-empty bundle names, in file-discovery order.
+    pub fn bundle_names(&self) -> Vec<String> {
+        self.groups.iter()
+            .filter(|g| !g.base_name.is_empty())
+            .map(|g| g.base_name.clone())
+            .collect()
+    }
+
     /// All distinct locale strings across all groups, "default" first.
     pub fn all_locales(&self) -> Vec<String> {
         let mut seen: HashSet<&str> = HashSet::new();

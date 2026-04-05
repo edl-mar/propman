@@ -91,6 +91,15 @@ pub enum Mode {
     /// Scope (exact / +children) is set in Normal mode before entering.
     Deleting,
     Filter,
+    /// The user pressed `n` on a bundle-level header. The editor TextArea holds
+    /// the locale name being typed. Enter creates a new empty locale file.
+    LocaleNaming,
+    /// The user pressed `N`. The editor TextArea holds the bundle name being typed.
+    /// Enter creates a new empty `{name}_{first_locale}.properties` file.
+    BundleNaming,
+    /// The user pressed `p`. Clipboard history is shown as a horizontal panel;
+    /// normal navigation moves the table cursor to choose a destination.
+    Pasting,
 }
 
 #[derive(Debug)]
@@ -143,6 +152,15 @@ pub struct AppState {
     /// Column visibility directive derived from `:?` / `:!` filter terms.
     /// Applied per-row in the table renderer to hide present/missing cells.
     pub column_directive: ColumnDirective,
+    /// Per-locale yank history.  Newest entry first; capped at 10 per locale.
+    /// `p` opens paste mode where entries are reviewed and applied.
+    pub clipboard: std::collections::HashMap<String, Vec<String>>,
+    /// The most recently yanked value, used for Ctrl+P quick-paste.
+    pub clipboard_last: Option<String>,
+    /// Index into the sorted clipboard locales; the focused column in paste mode.
+    pub paste_locale_cursor: usize,
+    /// Per-locale position in the history list (the `>` marker in paste mode).
+    pub paste_history_pos: std::collections::HashMap<String, usize>,
 }
 
 impl AppState {
@@ -189,6 +207,13 @@ impl AppState {
     /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
     /// then clamps the cursor to the new bounds.
     pub fn apply_filter(&mut self) {
+        // Remember the selected key so we can restore cursor position after rebuild.
+        let selected_key: Option<String> = match self.display_rows.get(self.cursor_row) {
+            Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.clone()),
+            Some(DisplayRow::Header { prefix,   .. }) => Some(prefix.clone()),
+            None => None,
+        };
+
         let query = self.filter_textarea.lines()[0].clone();
         let (filtered, visible, directive) = if query.trim().is_empty() {
             (
@@ -212,21 +237,53 @@ impl AppState {
             let directive = filter::column_directive(&expr);
             (filtered, visible, directive)
         };
-        self.display_rows = render_model::build_display_rows(&filtered);
+        let bundle_names = self.workspace.bundle_names();
+        self.display_rows = render_model::build_display_rows(&filtered, &bundle_names);
         self.visible_locales = visible;
         self.column_directive = directive;
         self.cursor_col = self.cursor_col.min(self.visible_locales.len());
         let max_row = self.display_rows.len().saturating_sub(1);
-        self.cursor_row = self.cursor_row.min(max_row);
+        // Restore cursor to the same key if still visible; otherwise clamp.
+        self.cursor_row = selected_key
+            .and_then(|key| self.display_rows.iter().position(|r| match r {
+                DisplayRow::Key    { full_key, .. } => *full_key == key,
+                DisplayRow::Header { prefix,   .. } => *prefix   == key,
+            }))
+            .unwrap_or_else(|| self.cursor_row.min(max_row));
         self.clamp_cursor_col();
         self.clamp_scroll();
+    }
+
+    /// Returns clipboard locales in table column order (`visible_locales` first,
+    /// then any clipboard locales not currently visible, alphabetically).
+    pub fn paste_locales(&self) -> Vec<String> {
+        let visible_set: std::collections::HashSet<&str> =
+            self.visible_locales.iter().map(|s| s.as_str()).collect();
+        let mut keys: Vec<String> = self.visible_locales.iter()
+            .filter(|l| self.clipboard.contains_key(*l))
+            .cloned()
+            .collect();
+        let mut extra: Vec<String> = self.clipboard.keys()
+            .filter(|l| !visible_set.contains(l.as_str()))
+            .cloned()
+            .collect();
+        extra.sort();
+        keys.extend(extra);
+        keys
     }
 
     /// Returns the bundle name for the current cursor row, or `""` for bare keys.
     pub fn current_row_bundle(&self) -> &str {
         match self.display_rows.get(self.cursor_row) {
             Some(DisplayRow::Key { full_key, .. }) => workspace::split_key(full_key).0,
-            Some(DisplayRow::Header { prefix, .. }) => workspace::split_key(prefix).0,
+            Some(DisplayRow::Header { prefix, .. }) => {
+                // Bundle-level headers have no colon — the prefix IS the bundle name.
+                if self.workspace.is_bundle_name(prefix) {
+                    prefix.as_str()
+                } else {
+                    workspace::split_key(prefix).0
+                }
+            }
             None => "",
         }
     }
@@ -237,6 +294,8 @@ impl AppState {
         if self.cursor_col == 0 {
             return;
         }
+        // `current_row_bundle()` now returns the real bundle name for bundle-level
+        // headers too, so the loop below handles them correctly without a special case.
         let bundle = self.current_row_bundle().to_string();
         while self.cursor_col > 0 {
             let locale = &self.visible_locales[self.cursor_col - 1];
@@ -259,7 +318,8 @@ impl AppState {
     }
 
     pub fn new(workspace: Workspace) -> Self {
-        let display_rows = render_model::build_display_rows(&workspace.merged_keys);
+        let bundle_names = workspace.bundle_names();
+        let display_rows = render_model::build_display_rows(&workspace.merged_keys, &bundle_names);
         let visible_locales = workspace.all_locales();
         let cursor_row = 0;
         Self {
@@ -282,6 +342,10 @@ impl AppState {
             pinned_keys: HashSet::new(),
             dirty_keys: HashSet::new(),
             column_directive: ColumnDirective::None,
+            clipboard: std::collections::HashMap::new(),
+            clipboard_last: None,
+            paste_locale_cursor: 0,
+            paste_history_pos: std::collections::HashMap::new(),
         }
     }
 }

@@ -44,10 +44,14 @@ The control flow in Normal mode follows a consistent pattern:
 
 - **`Enter` on a locale cell**: open value editor (`Mode::Editing`)
 - **`Enter` on the key column**: open rename editor (`Mode::KeyRenaming`)
-- **`n`**: open new-key editor (`Mode::KeyNaming`)
-- **`d` on a locale cell**: immediate locale-entry deletion (no sub-mode)
+- **`n` on key column**: open new-key editor (`Mode::KeyNaming`)
+- **`n` on bundle header, key column**: open locale-naming editor (`Mode::LocaleNaming`)
+- **`n` on bundle header, locale column**: open new-key editor pre-filled with `bundle:locale:`
+- **`N`**: open bundle-naming editor (`Mode::BundleNaming`)
+- **`d` on a locale cell**: yank then immediately delete that locale entry
 - **`d` on the key column**: open deletion confirmation (`Mode::Deleting`)
 - **`/`**: focus filter bar (`Mode::Filter`)
+- **`p`**: open paste mode (`Mode::Pasting`)
 
 Sub-modes with Tab-toggle (KeyRenaming, Deleting) offer `[exact]` vs
 `[+children]` scope. The pane title always reflects the current scope.
@@ -70,7 +74,8 @@ pub unsaved_changes: bool,
 pub pending_writes: Vec<PendingChange>, // flushed on SaveFile
 pub quitting: bool,
 pub edit_buffer: Option<CellEdit>,   // present while mode is Editing / KeyNaming
-                                     // / KeyRenaming / Deleting
+                                     // / KeyRenaming / LocaleNaming / BundleNaming
+                                     // / Deleting
 pub selection_scope: SelectionScope, // Exact / Children / ChildrenAll; Tab-cycles
                                      // in Normal, KeyRenaming, Deleting
 pub status_message: Option<String>,  // one-shot; cleared on next keypress
@@ -83,6 +88,12 @@ pub pinned_keys: HashSet<String>,    // manual bookmarks; bypass filter until un
 pub column_directive: ColumnDirective, // derived from filter expr on every apply_filter;
                                      // MissingOnly (:?) or PresentOnly (:!) drives
                                      // per-row locale cell skipping in the renderer
+// Clipboard
+pub clipboard: HashMap<String, Vec<String>>, // per-locale yank history; newest first,
+                                             // capped at 10 per locale
+pub clipboard_last: Option<String>,  // most recently yanked value; used for Ctrl+P quick-paste
+pub paste_locale_cursor: usize,      // focused column in the paste panel
+pub paste_history_pos: HashMap<String, usize>, // per-locale > marker position in paste panel
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -91,13 +102,16 @@ was never needed since `update` takes ownership of state.
 ## Modes
 
 ```
-Normal      — navigation and action dispatch
-Editing     — editing a cell value in the bottom pane (Enter commit, Esc cancel)
+Normal       — navigation and action dispatch
+Editing      — editing a cell value in the bottom pane (Enter commit, Esc cancel)
 Continuation — sub-mode of Editing: \ was typed; Enter inserts a newline
-KeyNaming   — typing a new key name; Enter creates the key, Esc cancels
-KeyRenaming — editing the current key name; Tab toggles exact/+children scope
-Deleting    — confirming key deletion; Tab toggles exact/+children scope
-Filter      — typing in the filter bar; Esc returns to Normal (keeps query)
+KeyNaming    — typing a new key name; Enter creates the key, Esc cancels
+KeyRenaming  — editing the current key name; Tab toggles exact/+children scope
+Deleting     — confirming key deletion; Tab toggles exact/+children scope
+Filter       — typing in the filter bar; Esc returns to Normal (keeps query)
+LocaleNaming — typing a new locale name for an existing bundle; Enter creates the file
+BundleNaming — typing a new bundle name; Enter creates bundle_firstlocale.properties
+Pasting      — clipboard panel open; table navigation active; Ctrl+←→ move panel focus
 ```
 
 Escape cycles: `Normal → Filter → Normal`.
@@ -113,8 +127,16 @@ Files are grouped by bundle (base filename before `_`). Keys are stored in
 bundle group. Files on disk always store the bare real key — the bundle
 prefix is an in-memory convention only.
 
-Bundle-level Header rows (depth 0, prefix == bundle name) are shown without
-locale columns and are blocked from value editing and rename.
+Bundle-level Header rows (depth 0, prefix == bundle name) display `[locale]`
+tags for the locales that belong to that bundle. These cells are navigable
+with ←→. `n` on a bundle locale cell opens key-naming pre-filled with
+`bundle:locale:` (see Key naming below). Bundle headers are blocked from
+value editing and rename.
+
+`current_row_bundle()` returns the bundle name for any row type:
+- `Key` row: `split_key(full_key).0`
+- Within-bundle `Header`: `split_key(prefix).0`
+- Bundle-level `Header`: the prefix itself (it IS the bundle name — no colon)
 
 Cross-bundle rename/move is supported: renaming a key to a different bundle
 prefix runs `commit_cross_bundle_rename`, which snapshots values, deletes
@@ -142,9 +164,11 @@ them for rendering). The writer collapses multi-line values to a single line
 on save (re-splitting is a future TODO).
 
 **Render model**
-`build_display_rows(keys: &[String]) -> Vec<DisplayRow>` groups keys by
-bundle, emits a bundle `Header` at depth 0 for each bundle, then walks a
-dot-split trie for the real keys within it:
+`build_display_rows(keys: &[String], always_bundles: &[String]) -> Vec<DisplayRow>`
+groups keys by bundle, emits a bundle `Header` at depth 0 for each bundle,
+then walks a dot-split trie for the real keys within it. `always_bundles`
+ensures bundle headers are emitted even when all their keys are filtered out
+(e.g. the `-/` filter that hides all keys).
 
 ```rust
 enum DisplayRow {
@@ -170,7 +194,8 @@ Keys without `:` (legacy / test keys) take the bare path — no bundle header.
 `cursor_row` indexes into `display_rows`. All rows (Header and Key) are
 navigable. `cursor_col` indexes into `visible_locales` offset by 1 (col 0 is
 the key column). `<missing>` in red marks cells where the key is absent from
-that locale file. Bundle-level Header cells are always blank.
+that locale file. Bundle-level Header locale cells show `[locale]` in dark
+gray (navigable, but no stored value).
 
 **Filter system**
 The filter bar is always visible. `/` focuses it. The bar is backed by a
@@ -184,6 +209,7 @@ Space = AND (higher precedence), comma = OR (lower precedence).
 bundle term   messages          no prefix — bundle prefix match
               "messages"        quoted — exact match
 key term      /confirm          / prefix — key substring match
+              /                 show only bundle headers (no key matches "/")
               /?                keys with any missing translation
               -/?               completely translated keys
               /*pattern         dangling (unsaved) key matching pattern
@@ -207,6 +233,9 @@ all locales are shown when no locale terms are present. Negative locale terms
 starting set is all locales. `:#` / `#` add dirty locale columns; `-:#` removes
 them. `:?` / `:!` are per-row directives stored in `AppState.column_directive`
 and applied in the renderer.
+
+`apply_filter` restores the cursor to the same key by identity (not row index)
+after every rebuild, so changing the filter never jumps the user to a different entry.
 
 See `docs/filtering.md` for the full syntax and AST.
 
@@ -266,21 +295,77 @@ tracking marks the changed keys, which keeps them visible automatically. On canc
 all temp pins are cleared.
 
 **Deletion**
-- `d` on a locale cell: removes that one `(key, locale)` entry immediately,
+- `d` on a locale cell: yanks the value then removes that one `(key, locale)` entry,
   leaving the key in `merged_keys` (other locales still visible).
 - `d` on the key column: enters `Mode::Deleting`. The pane shows the key
   (read-only). Tab cycles selection scope. Enter confirms; Esc cancels. Dangling
   (unsaved) keys are dropped without a file write.
 
+**Key naming — 3-segment format**
+`CommitKeyName` accepts three input forms:
+
+| Input | Behavior |
+|-------|----------|
+| `bundle:key` | Dangling entry, cursor placed on first locale column |
+| `bundle:locale:key` | Dangling entry, cursor on `locale` column, edit mode opens immediately |
+| `bundle:locale:key=value` | Entry created with value written directly, Normal mode |
+
+When `locale` does not yet exist in the bundle, the locale file is auto-created
+via `ensure_locale_file` (same logic as `CommitLocaleName`).
+
+Pre-fill rules for `n`:
+- Bundle header, col 0 → `LocaleNaming` mode (add locale to bundle)
+- Bundle header, col > 0 → key-naming pre-filled `bundle:locale:`
+- Key row, col 0 → key-naming pre-filled `bundle:key_prefix.`
+- Key row, col > 0 → key-naming pre-filled `bundle:locale:key_prefix.`
+- Within-bundle header, col > 0 → key-naming pre-filled `bundle:locale:header_key.`
+
+**File management**
+New locale and bundle creation happen immediately (not deferred to Ctrl+S):
+- `n` on bundle header col 0 → `Mode::LocaleNaming`; Enter creates `bundle_locale.properties`
+  and registers the new `PropertiesFile` in the workspace group.
+- `N` → `Mode::BundleNaming`; Enter creates `bundle_firstlocale.properties` using the
+  directory and first locale from an existing bundle as defaults.
+- Auto-creation via 3-segment key naming (see above).
+
+`ensure_locale_file(state, bundle, locale)` is the shared helper for locale file
+creation used by both `CommitLocaleName` and locale-targeted key naming.
+
+**Clipboard / Paste system**
+`clipboard: HashMap<String, Vec<String>>` stores up to 10 values per locale,
+newest first. `clipboard_last` is always the most recently yanked value across
+all locales, used for Ctrl+P quick-paste.
+
+`paste_locales()` returns clipboard locales in table column order (`visible_locales`
+first, then clipboard-only locales alphabetically) so the paste panel mirrors the
+table layout.
+
+Yank (`y`) deduplicates to front and resets `paste_history_pos` to 0 for the
+locale. `d` on a locale cell yanks before deleting (vim-style).
+
+Paste mode (`p`) opens a horizontal panel below the table showing per-locale
+history with a `>` selection marker. The table cursor remains active so the user
+navigates to the destination key while the panel is open.
+
+**Manual pinning**
+`m` toggles a permanent pin on the current key. Pinned keys bypass the filter
+and show `@` in the key column. `pinned_keys: HashSet<String>` persists for the
+session but is not saved to disk.
+
+**Bundle navigation**
+`Shift+↑` / `Shift+↓` jump to the previous / next bundle-level header row.
+`-/` in the filter hides all keys (no key matches the literal string `/`),
+leaving only bundle headers visible — useful for bundle-level navigation.
+
 **Cell editor / KeyNaming / KeyRenaming**
-The bottom edit pane is used for Editing, KeyNaming, KeyRenaming, and
-Deleting modes. It is backed by a `CellEdit` wrapping `TextArea<'static>`.
-The pane height grows with the number of lines (capped at 8).
+The bottom edit pane is used for Editing, KeyNaming, KeyRenaming, LocaleNaming,
+BundleNaming, and Deleting modes. It is backed by a `CellEdit` wrapping
+`TextArea<'static>`. The pane height grows with the number of lines (capped at 8).
 
 - *Editing*: Enter commits, Esc cancels. `\` enters `Mode::Continuation`
   where Enter inserts a real newline instead of committing.
-- *KeyNaming*: `n` in Normal pre-fills `"bundle:"` or `"bundle:prefix."`;
-  Enter validates (non-empty, unique, has `.` or `:`) and creates the key.
+- *KeyNaming*: pre-fill includes locale when cursor is on a locale column;
+  supports 2-segment (`bundle:key`) and 3-segment (`bundle:locale:key[=value]`) forms.
 - *KeyRenaming*: Enter on col 0. Tab toggles exact/+children. Cross-bundle
   rename (different prefix before `:`) triggers a move instead.
 - *Deleting*: read-only display of the key; Tab and Enter only.
@@ -289,7 +374,7 @@ The pane height grows with the number of lines (capped at 8).
 `keybindings.rs` exposes a `Keybindings` struct with one
 `HashMap<KeyEvent, Message>` per mode. Unbound keys fall through to
 `TextInput` / `FilterInput` in text modes; silently ignored in Normal /
-Deleting. No keybinding is hardcoded in rendering or update logic.
+Deleting / Pasting. No keybinding is hardcoded in rendering or update logic.
 
 On Windows: crossterm fires both Press and Release; loop filters to Press.
 AltGr emits as Ctrl+Alt — `normalize_altgr()` strips those modifiers from
@@ -299,11 +384,20 @@ Char keys so `\`, `@`, `[`, `]` etc. work correctly.
 
 ```
 Normal:       ↑↓←→ / hjkl navigate  PgUp/PgDn
-              Enter  edit value (locale col) or rename key (col 0)
-              n      new key
-              d      delete locale entry (locale col) or enter Deleting (col 0)
-              /      focus filter bar
-              Ctrl+S save   q / Ctrl+C quit
+              Shift+↑/↓   jump to prev/next bundle
+              Enter        edit value (locale col) or rename key (col 0)
+              n            new key / new locale (bundle header col 0) / new locale-targeted key (bundle header col>0)
+              N            new bundle
+              d            yank+delete locale entry (locale col) or enter Deleting (col 0)
+              m            toggle permanent pin (@)
+              y            yank cell value into per-locale clipboard
+              Ctrl+Y       yank and open paste mode
+              p            open paste mode
+              Ctrl+P       quick-paste clipboard_last into current cell
+              Space        toggle value preview pane
+              Tab          cycle selection scope (exact / +children / +children all)
+              /            focus filter bar
+              Ctrl+S save  q / Ctrl+C quit
 
 Editing:      Enter commit  Esc cancel  \ continuation
               Ctrl+S save  Ctrl+C quit
@@ -316,17 +410,38 @@ KeyNaming:    Enter confirm  Esc cancel
               Ctrl+S save  Ctrl+C quit
               (all other keys → TextArea)
 
-KeyRenaming:  Enter confirm  Tab toggle exact/+children  Esc cancel
+KeyRenaming:  Enter confirm  Ctrl+P copy  Tab scope  Esc cancel
               Ctrl+S save  Ctrl+C quit
               (all other keys → TextArea)
 
-Deleting:     Enter confirm  Tab toggle exact/+children  Esc cancel
+Deleting:     Enter confirm  Tab scope  Esc cancel
               Ctrl+S save  Ctrl+C quit
               (no text input — pane is read-only)
 
 Filter:       Enter / Esc close (keeps query)
               Ctrl+S save  Ctrl+C quit
               (all other keys → filter TextArea)
+
+LocaleNaming: Enter create locale file  Esc cancel
+              Ctrl+S save  Ctrl+C quit
+              (all other keys → TextArea)
+
+BundleNaming: Enter create bundle  Esc cancel
+              Ctrl+S save  Ctrl+C quit
+              (all other keys → TextArea)
+
+Pasting:      ↑↓←→ / hjkl / PgUp/PgDn / Shift+↑↓   table navigation (same as Normal)
+              Ctrl+←→      move paste panel focus left/right
+              Ctrl+↑↓      move > selection up/down in focused locale's history
+              y            yank current table cell into its locale's history
+              Ctrl+Y       yank current cell into the panel-focused locale's history
+              d            remove selected history entry from focused locale
+              p            open paste (same as Normal p — no-op if already open)
+              Ctrl+P       paste clipboard_last into current cell, stay in paste mode
+              Enter        structural paste: apply all > selections into cursor row, close
+              Ctrl+Enter   structural paste: apply all > selections, stay in paste mode
+              Esc          close paste mode
+              Ctrl+S save  Ctrl+C quit
 ```
 
 ## Stack
@@ -355,14 +470,6 @@ careful — the writer must never corrupt a file.
 
 ### Near-term
 
-- **Manual pinning**: `m` pins/unpins a key (or prefix subtree) as a permanent
-  bookmark; pinned keys bypass the filter (`@` indicator in key column). `M`
-  clears all pins. `pinned_keys: HashSet<String>` is already in AppState; only
-  the keybindings and message handlers remain. See `docs/pinned_keys.md`.
-- **Value preview**: `Space` in Normal mode opens a read-only preview pane
-  showing the full value of the selected cell (important for multiline values
-  that are truncated in the table). Also useful on key rows to show the full
-  key path. Same dynamic-height pane as the edit pane; Esc / Space closes it.
 - **Filter by translation text**: extend the filter DSL to match against
   translation values, not just key names. Possible syntax: `=pattern` (any
   locale contains pattern) or `:de=pattern` (specific locale). New
@@ -386,6 +493,8 @@ careful — the writer must never corrupt a file.
   surrounding whitespace.
 - **Column visibility hint**: `:de` (no `?`/`!`) narrows the column list but
   there is no visual distinction between "shown by filter" and "always shown".
+- **Keybind config file**: load keybindings from a TOML config at startup
+  (after the feature set stabilizes).
 
 ### Future
 
@@ -394,12 +503,11 @@ careful — the writer must never corrupt a file.
   entries ignored`) instead of listing them individually.
 - **Multi-selection**: Shift+A selects all visible rows; actions apply to all
   selected entries (e.g. bulk-copy default value to missing locales).
-- **User config file**: load keybindings from a TOML config at startup.
 - **OR in filter expressions**: `FilterExpr::Or` is reserved in the AST but
   not yet parsed or evaluated.
-- **Create locale file**: when a cross-bundle move has no destination file for
-  a locale, offer to create the file rather than just warning.
 
 ## Further documentation
 
 - [docs/filtering.md](docs/filtering.md) — filter syntax, AST, evaluation
+- [docs/dirty.md](docs/dirty.md) — dirty tracking design
+- [docs/pinned_keys.md](docs/pinned_keys.md) — pinning and temp-pins design

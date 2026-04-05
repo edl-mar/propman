@@ -55,6 +55,71 @@ pub fn insert_into_file(state: &mut AppState, gi: usize, fi: usize, real_key: &s
     state.unsaved_changes = true;
 }
 
+/// Apply `value` to `(full_key, locale)` without going through the cursor.
+/// Updates an existing entry if the key is present in the locale file;
+/// inserts a new one otherwise (locale file must exist in the bundle).
+/// No-ops silently if the bundle has no file for `locale`.
+pub fn apply_cell_value(state: &mut AppState, full_key: &str, locale: &str, value: String) {
+    let (bundle, real_key) = workspace::split_key(full_key);
+    let real_key = real_key.to_string();
+
+    // Locate the entry (if it exists) and the file index.
+    let mut existing: Option<(usize, usize, usize)> = None; // (gi, fi, ei)
+    let mut file_idx: Option<(usize, usize)> = None;         // (gi, fi)
+
+    for (gi, group) in state.workspace.groups.iter().enumerate() {
+        if !bundle.is_empty() && group.base_name != bundle {
+            continue;
+        }
+        for (fi, file) in group.files.iter().enumerate() {
+            if file.locale != locale {
+                continue;
+            }
+            file_idx = Some((gi, fi));
+            for (ei, entry) in file.entries.iter().enumerate() {
+                if let FileEntry::KeyValue { key, .. } = entry {
+                    if *key == real_key {
+                        existing = Some((gi, fi, ei));
+                    }
+                }
+            }
+        }
+    }
+
+    match existing {
+        Some((gi, fi, ei)) => {
+            // Update the existing entry in-memory and queue a write.
+            let path = state.workspace.groups[gi].files[fi].path.clone();
+            let (first_line, last_line) = match &state.workspace.groups[gi].files[fi].entries[ei] {
+                FileEntry::KeyValue { first_line, last_line, .. } => (*first_line, *last_line),
+                _ => return,
+            };
+            if let FileEntry::KeyValue { value: v, .. } =
+                &mut state.workspace.groups[gi].files[fi].entries[ei]
+            {
+                *v = value.clone();
+            }
+            state.dirty_keys.insert(full_key.to_string());
+            state.pending_writes.push(crate::state::PendingChange::Update {
+                path,
+                first_line,
+                last_line,
+                key: real_key,
+                value,
+                full_key: full_key.to_string(),
+            });
+            state.unsaved_changes = true;
+        }
+        None => {
+            // Insert into the locale file if one exists.
+            if let Some((gi, fi)) = file_idx {
+                insert_into_file(state, gi, fi, &real_key, &value);
+            }
+            // If no locale file exists for this bundle, silently skip.
+        }
+    }
+}
+
 /// Applies a committed edit to the in-memory workspace and records a pending
 /// disk write.
 ///

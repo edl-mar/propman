@@ -65,10 +65,13 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
         Mode::Normal       => &keybindings.normal,
         Mode::Editing      => &keybindings.editing,
         Mode::Continuation => &keybindings.continuation,
-        Mode::KeyNaming    => &keybindings.key_naming,
-        Mode::KeyRenaming  => &keybindings.key_renaming,
+        Mode::KeyNaming     => &keybindings.key_naming,
+        Mode::BundleNaming  => &keybindings.bundle_naming,
+        Mode::LocaleNaming  => &keybindings.locale_naming,
+        Mode::KeyRenaming   => &keybindings.key_renaming,
         Mode::Deleting     => &keybindings.deleting,
         Mode::Filter       => &keybindings.filter,
+        Mode::Pasting      => &keybindings.pasting,
     };
 
     if let Some(msg) = mode_map.get(&key).cloned() {
@@ -79,10 +82,10 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
     // are silently ignored (Normal mode).
     match state.mode {
         Mode::Editing | Mode::Continuation => update(state, Message::TextInput(key)),
-        Mode::KeyNaming | Mode::KeyRenaming => update(state, Message::TextInput(key)),
+        Mode::KeyNaming | Mode::BundleNaming | Mode::LocaleNaming | Mode::KeyRenaming => update(state, Message::TextInput(key)),
         Mode::Filter                        => update(state, Message::FilterInput(key)),
-        // Deleting pane is read-only — unbound keys are silently ignored.
-        Mode::Deleting | Mode::Normal       => state,
+        // Deleting and Pasting panes are read-only — unbound keys are silently ignored.
+        Mode::Deleting | Mode::Pasting | Mode::Normal => state,
     }
 }
 
@@ -91,7 +94,7 @@ fn handle_key(state: AppState, key: KeyEvent, keybindings: &Keybindings) -> AppS
 fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
 
-    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting) {
+    if matches!(state.mode, Mode::Editing | Mode::Continuation | Mode::KeyNaming | Mode::BundleNaming | Mode::LocaleNaming | Mode::KeyRenaming | Mode::Deleting) {
         // Edit/confirm pane: height grows with content, capped at 8 lines.
         let content_lines = state.edit_buffer.as_ref()
             .map(|e| e.textarea.lines().len())
@@ -107,6 +110,19 @@ fn draw(f: &mut Frame, state: &AppState) {
         .split(area);
         draw_table(f, chunks[0], state);
         draw_edit_pane(f, chunks[1], state);
+        draw_filter_bar(f, chunks[2], state);
+        draw_status(f, chunks[3], state);
+    } else if matches!(state.mode, Mode::Pasting) {
+        let pane_height = paste_pane_height(state);
+        let chunks = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Length(pane_height),
+            Constraint::Length(3), // filter pane
+            Constraint::Length(1), // status bar
+        ])
+        .split(area);
+        draw_table(f, chunks[0], state);
+        draw_paste_pane(f, chunks[1], state);
         draw_filter_bar(f, chunks[2], state);
         draw_status(f, chunks[3], state);
     } else if state.show_preview {
@@ -151,6 +167,10 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
 
     let title = if matches!(state.mode, Mode::KeyNaming) {
         format!(" new key [{locale}] ")
+    } else if matches!(state.mode, Mode::BundleNaming) {
+        " new bundle ".to_string()
+    } else if matches!(state.mode, Mode::LocaleNaming) {
+        format!(" new locale for [{full_key}] ")
     } else if matches!(state.mode, Mode::KeyRenaming) {
         let scope = state.selection_scope.label();
         format!(" rename · {full_key} [{scope}] ")
@@ -213,6 +233,72 @@ fn draw_preview_pane(f: &mut Frame, area: Rect, state: &AppState) {
         Paragraph::new(content).wrap(Wrap { trim: false }),
         inner,
     );
+}
+
+fn paste_pane_height(state: &AppState) -> u16 {
+    let max_entries = state.clipboard.values().map(|v| v.len()).max().unwrap_or(1);
+    // header row + history entries + top/bottom borders
+    (max_entries + 3).min(12) as u16
+}
+
+fn draw_paste_pane(f: &mut Frame, area: Rect, state: &AppState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(" paste ", Style::default().fg(Color::Yellow)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let locale_keys = state.paste_locales();
+
+    if locale_keys.is_empty() {
+        f.render_widget(
+            Paragraph::new("(empty)").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+
+    let col_constraints: Vec<Constraint> = locale_keys.iter().map(|_| Constraint::Fill(1)).collect();
+    let col_areas = Layout::horizontal(col_constraints).split(inner);
+
+    for (i, locale) in locale_keys.iter().enumerate() {
+        let is_focused = i == state.paste_locale_cursor;
+        let history = state.clipboard.get(locale).map(|v| v.as_slice()).unwrap_or(&[]);
+        let selected_pos = *state.paste_history_pos.get(locale).unwrap_or(&0);
+
+        let header_style = if is_focused {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(format!("[{locale}]"), header_style)),
+        ];
+
+        for (j, entry) in history.iter().enumerate() {
+            let is_selected = j == selected_pos;
+            let marker = if is_selected { "> " } else { "  " };
+            let display: String = entry.replace("\\\n", "").replace('\n', " ");
+            // Truncate to fit the column width (rough estimate of 30 chars).
+            let truncated = if display.chars().count() > 30 {
+                format!("{}…", display.chars().take(29).collect::<String>())
+            } else {
+                display
+            };
+            let style = if is_focused && is_selected {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else if is_selected {
+                Style::default().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(format!("{marker}{truncated}"), style)));
+        }
+
+        f.render_widget(Paragraph::new(lines), col_areas[i]);
+    }
 }
 
 fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
@@ -376,6 +462,21 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         let mut spans = vec![Span::raw(indent), Span::styled(key_text, key_col_style)];
 
         if is_bundle_header {
+            // Render a [locale] tag for each locale that belongs to this bundle.
+            // These cells are navigable (cursor can land on them via ←→).
+            for (col_idx, locale) in locales.iter().enumerate() {
+                let locale_col = col_idx + 1;
+                if !state.workspace.bundle_has_locale(full_key, locale) {
+                    continue;
+                }
+                let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
+                let style = if is_cursor_cell {
+                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(format!("[{locale}] "), style));
+            }
             lines.push(Line::from(spans));
             continue;
         }
@@ -466,9 +567,12 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Editing      => "EDIT  ",
         Mode::Continuation => "CONT  ",
         Mode::KeyNaming    => "NEWKEY",
+        Mode::BundleNaming => "BUNDLE",
+        Mode::LocaleNaming => "LOCALE",
         Mode::KeyRenaming  => "RENAME",
         Mode::Deleting     => "DELETE",
         Mode::Filter       => "FILTER",
+        Mode::Pasting      => "PASTE ",
     };
     let dirty = if state.unsaved_changes { " [+]" } else { "    " };
     // Status message (e.g. rename conflict) overrides the normal hints for one keypress.
@@ -479,12 +583,15 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::Editing      => "  Enter commit  Esc cancel  \\ continuation".into(),
             Mode::Continuation => "  Enter new line  Esc cancel \\".into(),
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
+            Mode::BundleNaming => "  Enter create bundle  Esc cancel".into(),
+            Mode::LocaleNaming => "  Enter create locale file  Esc cancel".into(),
             Mode::KeyRenaming  => "  Enter move  Ctrl+P copy  Tab scope  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
             Mode::Filter       => "  Enter/Esc/↑↓ exit filter".into(),
+            Mode::Pasting      => "  Ctrl+←→ locale  Ctrl+↑↓ history  d remove  p paste last  Ctrl+P paste (stay)  Enter paste all  Ctrl+Enter paste all (stay)  Ctrl+Y yank→locale  Esc cancel".into(),
             Mode::Normal => {
                 let scope = state.selection_scope.label();
-                format!("  [{scope}] Tab  q quit  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  Space preview  / filter  Ctrl+S save").into()
+                format!("  [{scope}] Tab  ↑↓←→/hjkl navigate  Enter edit/rename  n new  d delete  m pin  y yank  p paste  Ctrl+P quick-paste  Space preview  / filter  Ctrl+S save  q quit").into()
             }
         }
     };

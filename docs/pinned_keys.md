@@ -33,12 +33,11 @@ Pinning is **not** the same as dirty (see `docs/dirty.md`):
 - `dirty_keys` = auto-tracked unsaved changes; bypass filter until saved; `#` filter sigil.
 - `pinned_keys` = explicit user bookmarks; bypass filter until manually unpinned; `@` indicator.
 
-### Manual pinning (Normal mode) — not yet implemented
+### Manual pinning (Normal mode)
 
-- `m` on a Key row: pin/unpin that exact key
-- `m` on a Header row (or with selection scope `+children`/`+children all`): pin/unpin the whole prefix subtree
-- `M`: drop all entries from `pinned_keys` at once
+- `m` on any row: pin/unpin that exact key (or header prefix)
 - Pinned entries show an `@` prefix in the key column
+- `M` (clear all pins) is not yet bound
 
 ### Temp-pins and ChildrenAll scope
 
@@ -77,5 +76,5 @@ automatically marked dirty and remain visible via the dirty bypass.
 2. ✅ Update `apply_filter` / visibility rule to include pinned keys and dirty keys
 3. ✅ `ChildrenAll` temp-pin surfacing: populate `temp_pins` on entering `+children all` scope
 4. ✅ Discard temp_pins on commit/cancel
-5. ⬜ Manual pin/unpin (`m` / `M`) keybindings and message handlers
-6. ⬜ `@` indicator rendering for permanently pinned rows (indicator character is set; styling TBD)
+5. ✅ Manual pin/unpin (`m`) keybinding and message handler
+6. ✅ `@` indicator rendering for permanently pinned rows

@@ -27,8 +27,11 @@ pub enum DisplayRow {
 /// - A non-key node emits a `Header` when ≥2 of its immediate children are keys.
 /// - A key-node that also has children emits only a `Key` row; children appear indented below.
 /// - Single-child chains forward depth and display context unchanged.
-pub fn build_display_rows(keys: &[String]) -> Vec<DisplayRow> {
-    let has_bundles = keys.iter().any(|k| k.contains(':'));
+/// `always_bundles` lists bundle names that should always emit a header row even
+/// when no filtered keys belong to them.  Pass `workspace.bundle_names()` here
+/// so bundle headers survive aggressive filters like `-/`.
+pub fn build_display_rows(keys: &[String], always_bundles: &[String]) -> Vec<DisplayRow> {
+    let has_bundles = keys.iter().any(|k| k.contains(':')) || !always_bundles.is_empty();
     let mut rows = Vec::new();
 
     if !has_bundles {
@@ -55,6 +58,10 @@ pub fn build_display_rows(keys: &[String]) -> Vec<DisplayRow> {
                 by_bundle.entry(String::new()).or_default().push(key.clone());
             }
         }
+    }
+    // Ensure every always-bundle has an entry (possibly empty) so its header appears.
+    for bundle in always_bundles {
+        by_bundle.entry(bundle.clone()).or_default();
     }
 
     for (bundle, real_keys) in &by_bundle {
@@ -198,7 +205,7 @@ mod tests {
 
     #[test]
     fn siblings_get_a_header() {
-        let rows = build_display_rows(&keys(&["app.confirm.delete", "app.confirm.discard"]));
+        let rows = build_display_rows(&keys(&["app.confirm.delete", "app.confirm.discard"]), &[]);
         assert!(matches!(&rows[0], DisplayRow::Header { prefix, .. } if prefix == "app.confirm"));
         assert!(matches!(&rows[1], DisplayRow::Key { display, .. } if display == ".delete"));
         assert!(matches!(&rows[2], DisplayRow::Key { display, .. } if display == ".discard"));
@@ -206,7 +213,7 @@ mod tests {
 
     #[test]
     fn lone_key_has_no_header() {
-        let rows = build_display_rows(&keys(&["app.loading"]));
+        let rows = build_display_rows(&keys(&["app.loading"]), &[]);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
             if full_key == "app.loading" && *depth == 0));
@@ -217,7 +224,7 @@ mod tests {
         let rows = build_display_rows(&keys(&[
             "com.myapp.error.notfound",
             "com.myapp.error.timeout",
-        ]));
+        ]), &[]);
         assert!(matches!(&rows[0], DisplayRow::Header { prefix, depth, .. }
             if prefix == "com.myapp.error" && *depth == 0));
         assert_eq!(rows.len(), 3);
@@ -230,7 +237,7 @@ mod tests {
             "app.confirm.delete",
             "app.confirm.discard",
             "app.loading",
-        ]));
+        ]), &[]);
         assert_eq!(headers(&rows), vec!["app.confirm"]);
     }
 
@@ -238,7 +245,7 @@ mod tests {
     fn key_parent_no_duplicate_header() {
         // app.x is both a key and a namespace parent.
         // It should appear as exactly one Key row (no separate Header row).
-        let rows = build_display_rows(&keys(&["app.x", "app.x.a", "app.x.b"]));
+        let rows = build_display_rows(&keys(&["app.x", "app.x.a", "app.x.b"]), &[]);
         let header_prefixes = headers(&rows);
         assert!(!header_prefixes.contains(&"app.x"), "app.x is a key — no Header row expected");
         // Key row for app.x at depth 0, children at depth 1.
@@ -260,7 +267,7 @@ mod tests {
             "com.err.other",
             "com.err.timeout",
             "com.err.timeout.deeper",
-        ]));
+        ]), &[]);
         assert_eq!(headers(&rows), vec!["com.err"]);
         assert_eq!(displays(&rows), vec!["com.err", ".other", ".timeout", ".deeper"]);
         assert_eq!(depths(&rows),   vec![0,         1,        1,          2]);
@@ -275,7 +282,7 @@ mod tests {
             "app.a.b.d",
             "app.a.e",
             "app.a.f",
-        ]));
+        ]), &[]);
         assert_eq!(headers(&rows), vec!["app.a", "app.a.b"]);
         // app.a.b header should display as ".b" (relative to app.a)
         assert!(matches!(&rows[1], DisplayRow::Header { display, depth, .. }
@@ -293,7 +300,7 @@ mod tests {
             "com.err.other",
             "com.err.second",
             "com.err.timeout.deeper",
-        ]));
+        ]), &[]);
         assert_eq!(headers(&rows), vec!["com.err"]);
         // BTreeMap order: other, second, timeout.deeper (t > s > o alphabetically: no, o < s < t)
         assert_eq!(displays(&rows), vec!["com.err", ".other", ".second", ".timeout.deeper"]);
