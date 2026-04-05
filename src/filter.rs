@@ -34,6 +34,7 @@ pub enum ColumnDirective {
 pub enum FilterExpr {
     And(Vec<FilterExpr>),
     Or(Vec<FilterExpr>),
+    Not(Box<FilterExpr>),
 
     // Key terms (/ prefix)
     /// `/pattern` — key substring or exact match.
@@ -100,11 +101,46 @@ pub fn parse(input: &str) -> FilterExpr {
     }
 }
 
+/// Split `input` on whitespace that is not inside quotes or parentheses.
+/// Analogous to `split_on_commas` but splits on whitespace instead of commas.
+fn split_on_whitespace(input: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth: usize = 0;
+    let mut in_quotes = false;
+    let mut in_token = false;
+    let mut start = 0;
+
+    for (i, ch) in input.char_indices() {
+        let is_space = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r';
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '(' if !in_quotes => depth += 1,
+            ')' if !in_quotes => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if is_space && !in_quotes && depth == 0 {
+            if in_token {
+                parts.push(&input[start..i]);
+                in_token = false;
+            }
+        } else {
+            if !in_token {
+                start = i;
+                in_token = true;
+            }
+        }
+    }
+    if in_token {
+        parts.push(&input[start..]);
+    }
+    parts
+}
+
 /// Parse a single AND group (whitespace-separated terms).
 fn parse_and_group(group: &str) -> FilterExpr {
     let group = group.trim();
     let mut terms: Vec<FilterExpr> = Vec::new();
-    for raw in group.split_whitespace() {
+    for raw in split_on_whitespace(group) {
         terms.push(parse_term(raw));
     }
     match terms.len() {
@@ -116,6 +152,14 @@ fn parse_and_group(group: &str) -> FilterExpr {
 
 /// Parse a single term by its leading sigil.
 fn parse_term(raw: &str) -> FilterExpr {
+    // Parenthesised group: (expr)
+    if raw.starts_with('(') && raw.ends_with(')') {
+        return parse(&raw[1..raw.len() - 1]);
+    }
+    // Negation: -term or -(expr)
+    if let Some(rest) = raw.strip_prefix('-') {
+        return FilterExpr::Not(Box::new(parse_term(rest)));
+    }
     if raw == "#" {
         return FilterExpr::Dirty;
     }
@@ -266,6 +310,7 @@ pub fn column_directive(expr: &FilterExpr) -> ColumnDirective {
             }
             ColumnDirective::None
         }
+        FilterExpr::Not(_) => ColumnDirective::None,
         _ => ColumnDirective::None,
     }
 }
@@ -277,6 +322,7 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys:
     match expr {
         FilterExpr::And(terms) => terms.iter().all(|t| evaluate(t, key, workspace, dirty_keys)),
         FilterExpr::Or(branches) => branches.iter().any(|t| evaluate(t, key, workspace, dirty_keys)),
+        FilterExpr::Not(inner) => !evaluate(inner, key, workspace, dirty_keys),
 
         FilterExpr::KeyPattern { pattern, mode } => match mode {
             MatchMode::Exact => key == pattern.as_str(),
@@ -350,49 +396,79 @@ fn matching_locales(pattern: &str, mode: &MatchMode, workspace: &Workspace, bund
 /// Returns the workspace locales that should be visible given `expr`.
 ///
 /// - Collects `LocaleStatus` selectors → narrows to matching locales.
+/// - Negative locale terms (via `Not`) exclude matching locales.
 /// - If `DirtyLocale` or `Dirty` is present, also includes locales from `dirty_locales`.
 /// - If no selectors and no dirty directive → returns all locales.
 pub fn visible_locales(expr: &FilterExpr, workspace: &Workspace, dirty_locales: &HashSet<String>) -> Vec<String> {
-    let mut selectors: Vec<(&str, &MatchMode)> = Vec::new();
+    let mut positive: Vec<(&str, &MatchMode)> = Vec::new();
+    let mut negative: Vec<(&str, &MatchMode)> = Vec::new();
     let mut include_dirty = false;
-    collect_locale_selectors(expr, &mut selectors, &mut include_dirty);
+    let mut exclude_dirty = false;
+    collect_locale_selectors(expr, &mut positive, &mut negative, &mut include_dirty, &mut exclude_dirty, false);
 
-    if selectors.is_empty() && !include_dirty {
+    let has_positive = !positive.is_empty() || include_dirty;
+    let has_negative = !negative.is_empty() || exclude_dirty;
+
+    let candidates: Vec<String> = if has_positive {
+        // Start from locales matched by positive terms.
+        workspace.all_locales().into_iter()
+            .filter(|locale| {
+                positive.iter().any(|(p, m)| locale_matches(locale, p, m))
+                || (include_dirty && dirty_locales.contains(locale.as_str()))
+            })
+            .collect()
+    } else if has_negative {
+        // Only negative terms — start from all locales.
+        workspace.all_locales()
+    } else {
+        // No locale terms at all.
         return workspace.all_locales();
-    }
+    };
 
-    workspace
-        .all_locales()
-        .into_iter()
+    // Apply exclusions.
+    candidates.into_iter()
         .filter(|locale| {
-            let matches_selector = selectors.iter().any(|(pattern, mode)| locale_matches(locale, pattern, mode));
-            let matches_dirty = include_dirty && dirty_locales.contains(locale.as_str());
-            matches_selector || matches_dirty
+            !negative.iter().any(|(p, m)| locale_matches(locale, p, m))
+            && !(exclude_dirty && dirty_locales.contains(locale.as_str()))
         })
         .collect()
 }
 
 fn collect_locale_selectors<'a>(
     expr: &'a FilterExpr,
-    out: &mut Vec<(&'a str, &'a MatchMode)>,
+    positive: &mut Vec<(&'a str, &'a MatchMode)>,
+    negative: &mut Vec<(&'a str, &'a MatchMode)>,
     include_dirty: &mut bool,
+    exclude_dirty: &mut bool,
+    negate: bool,
 ) {
     match expr {
+        FilterExpr::Not(inner) => {
+            collect_locale_selectors(inner, positive, negative, include_dirty, exclude_dirty, !negate);
+        }
         FilterExpr::And(terms) => {
             for t in terms {
-                collect_locale_selectors(t, out, include_dirty);
+                collect_locale_selectors(t, positive, negative, include_dirty, exclude_dirty, negate);
             }
         }
         FilterExpr::Or(branches) => {
             for b in branches {
-                collect_locale_selectors(b, out, include_dirty);
+                collect_locale_selectors(b, positive, negative, include_dirty, exclude_dirty, negate);
             }
         }
         FilterExpr::LocaleStatus { locale, mode, .. } => {
-            out.push((locale.as_str(), mode));
+            if negate {
+                negative.push((locale.as_str(), mode));
+            } else {
+                positive.push((locale.as_str(), mode));
+            }
         }
         FilterExpr::DirtyLocale | FilterExpr::Dirty => {
-            *include_dirty = true;
+            if negate {
+                *exclude_dirty = true;
+            } else {
+                *include_dirty = true;
+            }
         }
         FilterExpr::BundleFilter { .. } | FilterExpr::KeyPattern { .. }
         | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. }
@@ -672,5 +748,80 @@ mod tests {
         // Exact pattern distinguishes de from default.
         assert!("de" == "de");
         assert!("default" != "de");
+    }
+
+    #[test]
+    fn negation_key_term() {
+        // `-/button` → Not(KeyPattern{button})
+        let expr = parse("-/button");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::KeyPattern { pattern, .. } if pattern == "button")
+        ));
+    }
+
+    #[test]
+    fn negation_bundle_term() {
+        let expr = parse("-messages");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::BundleFilter { pattern, .. } if pattern == "messages")
+        ));
+    }
+
+    #[test]
+    fn negation_any_missing() {
+        // `-/?` → Not(AnyMissing) — completely translated keys
+        let expr = parse("-/?");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::AnyMissing)
+        ));
+    }
+
+    #[test]
+    fn negation_locale_term() {
+        // `-:"de"!` → Not(LocaleStatus{de, Present, Exact})
+        let expr = parse("-:\"de\"!");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::LocaleStatus { locale, modifier, mode }
+                if locale == "de" && *modifier == StatusModifier::Present && *mode == MatchMode::Exact)
+        ));
+    }
+
+    #[test]
+    fn negation_grouped_expr() {
+        // `-(:"de"! :"si"!)` → Not(And([LocaleStatus{de,Present}, LocaleStatus{si,Present}]))
+        let expr = parse("-(:\"de\"! :\"si\"!)");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::And(terms) if terms.len() == 2)
+        ));
+    }
+
+    #[test]
+    fn negation_in_and() {
+        // `/confirm -messages` → And([KeyPattern{confirm}, Not(BundleFilter{messages})])
+        let expr = parse("/confirm -messages");
+        let t = and_terms(&expr);
+        assert_eq!(t.len(), 2);
+        assert!(matches!(&t[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "confirm"));
+        assert!(matches!(&t[1], FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::BundleFilter { pattern, .. } if pattern == "messages")
+        ));
+    }
+
+    #[test]
+    fn negation_in_or() {
+        // `messages, -errors` → Or([BundleFilter{messages}, Not(BundleFilter{errors})])
+        let expr = parse("messages, -errors");
+        let b = or_branches(&expr);
+        assert_eq!(b.len(), 2);
+        assert!(matches!(&b[0], FilterExpr::BundleFilter { pattern, .. } if pattern == "messages"));
+        assert!(matches!(&b[1], FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::BundleFilter { pattern, .. } if pattern == "errors")
+        ));
+    }
+
+    #[test]
+    fn negation_column_directive_is_none() {
+        // `-:?` should not produce a column directive
+        assert_eq!(column_directive(&parse("-:?")), ColumnDirective::None);
     }
 }
