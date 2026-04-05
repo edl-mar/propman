@@ -221,7 +221,7 @@ fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     // The DSL hint lives in the title so it remains visible while the user types.
     let hint = Span::styled(
-        " bundle  /key[?#]  :locale[?!#]  :?/:!  #  ,=OR ",
+        " bundle  /key[?#]  :locale[?!#]  =value  #  ,=OR ",
         Style::default().fg(Color::DarkGray),
     );
     let block = if focused {

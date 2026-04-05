@@ -52,6 +52,8 @@ Space = AND (higher precedence), comma = OR (lower precedence).
 | `/?` | Keys with at least one missing translation |
 | `:de?, :si?` | Missing in de OR missing in si |
 | `messages /confirm, errors /delete` | OR across bundles and key patterns |
+| `=confirm` | Any locale value contains "confirm" (case-insensitive) |
+| `="Confirm deletion"` | Any locale value contains "Confirm deletion" |
 | `#` | All dirty (unsaved) keys, narrow to dirty locale columns |
 | `:?` | Per row: show only the missing locale columns |
 | `:!` | Per row: show only the present locale columns |

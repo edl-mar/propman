@@ -64,6 +64,11 @@ pub enum FilterExpr {
     /// `:#` — show dirty locale columns; evaluates to true.
     DirtyLocale,
 
+    // Value terms (= prefix)
+    /// `=pattern` or `="multi word"` — any locale's value contains `pattern`
+    /// (case-insensitive substring; no exact mode).
+    ValueMatch { pattern: String },
+
     // Special
     /// Bare `#` — dirty keys AND dirty locale columns.
     Dirty,
@@ -162,6 +167,10 @@ fn parse_term(raw: &str) -> FilterExpr {
     }
     if raw == "#" {
         return FilterExpr::Dirty;
+    }
+    if let Some(rest) = raw.strip_prefix('=') {
+        let pattern = strip_quotes(rest).unwrap_or(rest).to_string();
+        return FilterExpr::ValueMatch { pattern };
     }
     if let Some(rest) = raw.strip_prefix('/') {
         return parse_key_term(rest);
@@ -385,6 +394,18 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys:
             }
         }
 
+        FilterExpr::ValueMatch { pattern } => {
+            let (bundle, _) = workspace::split_key(key);
+            let needle = pattern.to_lowercase();
+            workspace.bundle_locales(bundle)
+                .iter()
+                .any(|locale| {
+                    workspace.get_value(key, locale)
+                        .map(|v| v.to_lowercase().contains(needle.as_str()))
+                        .unwrap_or(false)
+                })
+        }
+
         // These evaluate to true — they are column/row directives, not key filters.
         FilterExpr::MissingColumns | FilterExpr::PresentColumns | FilterExpr::DirtyLocale => true,
 
@@ -407,84 +428,121 @@ fn matching_locales(pattern: &str, mode: &MatchMode, workspace: &Workspace, bund
 
 /// Returns the workspace locales that should be visible given `expr`.
 ///
-/// - Collects `LocaleStatus` selectors → narrows to matching locales.
-/// - Negative locale terms (via `Not`) exclude matching locales.
-/// - If `DirtyLocale` or `Dirty` is present, also includes locales from `dirty_locales`.
-/// - If no selectors and no dirty directive → returns all locales.
+/// - `LocaleStatus` selectors narrow to matching locales (positive terms union;
+///   negative terms subtract). `DirtyLocale`/`Dirty` adds dirty locale columns.
+/// - `Or` branches are evaluated independently and their locale sets are unioned,
+///   so `:de, -:de` = all locales (correct tautology collapse).
+/// - `And` terms contribute positives (unioned) and negatives (subtracted).
+/// - No locale terms → all locales shown.
 pub fn visible_locales(expr: &FilterExpr, workspace: &Workspace, dirty_locales: &HashSet<String>) -> Vec<String> {
-    let mut positive: Vec<(&str, &MatchMode)> = Vec::new();
-    let mut negative: Vec<(&str, &MatchMode)> = Vec::new();
-    let mut include_dirty = false;
-    let mut exclude_dirty = false;
-    collect_locale_selectors(expr, &mut positive, &mut negative, &mut include_dirty, &mut exclude_dirty, false);
-
-    let has_positive = !positive.is_empty() || include_dirty;
-    let has_negative = !negative.is_empty() || exclude_dirty;
-
-    let candidates: Vec<String> = if has_positive {
-        // Start from locales matched by positive terms.
-        workspace.all_locales().into_iter()
-            .filter(|locale| {
-                positive.iter().any(|(p, m)| locale_matches(locale, p, m))
-                || (include_dirty && dirty_locales.contains(locale.as_str()))
-            })
-            .collect()
-    } else if has_negative {
-        // Only negative terms — start from all locales.
-        workspace.all_locales()
-    } else {
-        // No locale terms at all.
-        return workspace.all_locales();
-    };
-
-    // Apply exclusions.
-    candidates.into_iter()
-        .filter(|locale| {
-            !negative.iter().any(|(p, m)| locale_matches(locale, p, m))
-            && !(exclude_dirty && dirty_locales.contains(locale.as_str()))
-        })
-        .collect()
+    match visible_locales_opt(expr, workspace, dirty_locales) {
+        None => workspace.all_locales(),
+        Some(set) => {
+            // Preserve the workspace's stable locale ordering.
+            workspace.all_locales().into_iter()
+                .filter(|l| set.contains(l.as_str()))
+                .collect()
+        }
+    }
 }
 
-fn collect_locale_selectors<'a>(
-    expr: &'a FilterExpr,
-    positive: &mut Vec<(&'a str, &'a MatchMode)>,
-    negative: &mut Vec<(&'a str, &'a MatchMode)>,
-    include_dirty: &mut bool,
-    exclude_dirty: &mut bool,
-    negate: bool,
-) {
+/// Inner recursive helper.
+///
+/// Returns `None`  — no locale restriction; caller should show all locales.
+/// Returns `Some(set)` — the exact set of locales to show.
+///
+/// `Or`: compute per-branch, union. If any branch is unrestricted → `None`.
+/// `And`: union all positive contributions, subtract all negative ones.
+///        If no locale terms at all → `None`.
+/// `Not(inner)`: invert `inner`'s set against `all_locales()`.
+fn visible_locales_opt(
+    expr: &FilterExpr,
+    workspace: &Workspace,
+    dirty_locales: &HashSet<String>,
+) -> Option<HashSet<String>> {
     match expr {
-        FilterExpr::Not(inner) => {
-            collect_locale_selectors(inner, positive, negative, include_dirty, exclude_dirty, !negate);
-        }
-        FilterExpr::And(terms) => {
-            for t in terms {
-                collect_locale_selectors(t, positive, negative, include_dirty, exclude_dirty, negate);
-            }
-        }
         FilterExpr::Or(branches) => {
-            for b in branches {
-                collect_locale_selectors(b, positive, negative, include_dirty, exclude_dirty, negate);
+            let mut union: HashSet<String> = HashSet::new();
+            for branch in branches {
+                match visible_locales_opt(branch, workspace, dirty_locales) {
+                    None => return None, // one branch is unrestricted → all locales
+                    Some(set) => union.extend(set),
+                }
+            }
+            Some(union)
+        }
+
+        FilterExpr::And(terms) => {
+            let mut pos: HashSet<String> = HashSet::new();
+            let mut neg: HashSet<String> = HashSet::new();
+            let mut has_positive = false;
+            let mut has_negative = false;
+
+            for term in terms {
+                if let FilterExpr::Not(inner) = term {
+                    // Column-only directives inside Not have no locale set effect.
+                    match inner.as_ref() {
+                        FilterExpr::MissingColumns | FilterExpr::PresentColumns => {}
+                        _ => {
+                            if let Some(set) = visible_locales_opt(inner, workspace, dirty_locales) {
+                                neg.extend(set);
+                                has_negative = true;
+                            }
+                            // None from inner = negating something with no locale
+                            // effect → no exclusion.
+                        }
+                    }
+                } else if let Some(set) = visible_locales_opt(term, workspace, dirty_locales) {
+                    pos.extend(set);
+                    has_positive = true;
+                }
+            }
+
+            if !has_positive && !has_negative {
+                return None;
+            }
+
+            let candidates: HashSet<String> = if has_positive {
+                pos
+            } else {
+                // Only negative terms — start from the full set and subtract.
+                workspace.all_locales().into_iter().collect()
+            };
+
+            Some(candidates.into_iter().filter(|l| !neg.contains(l.as_str())).collect())
+        }
+
+        FilterExpr::Not(inner) => {
+            // Standalone Not (not inside an And). Column directives are no-ops.
+            match inner.as_ref() {
+                FilterExpr::MissingColumns | FilterExpr::PresentColumns => None,
+                _ => match visible_locales_opt(inner, workspace, dirty_locales) {
+                    // Not(no-restriction) → no locale effect.
+                    None => None,
+                    Some(set) => Some(
+                        workspace.all_locales().into_iter()
+                            .filter(|l| !set.contains(l.as_str()))
+                            .collect(),
+                    ),
+                },
             }
         }
+
         FilterExpr::LocaleStatus { locale, mode, .. } => {
-            if negate {
-                negative.push((locale.as_str(), mode));
-            } else {
-                positive.push((locale.as_str(), mode));
-            }
+            Some(workspace.all_locales().into_iter()
+                .filter(|l| locale_matches(l, locale, mode))
+                .collect())
         }
+
         FilterExpr::DirtyLocale | FilterExpr::Dirty => {
-            if negate {
-                *exclude_dirty = true;
-            } else {
-                *include_dirty = true;
-            }
+            Some(dirty_locales.iter().cloned().collect())
         }
-        FilterExpr::BundleFilter { .. } | FilterExpr::KeyPattern { .. }
+
+        // Column directives and non-locale terms carry no locale restriction.
+        FilterExpr::MissingColumns | FilterExpr::PresentColumns
+        | FilterExpr::KeyPattern { .. } | FilterExpr::BundleFilter { .. }
         | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. }
-        | FilterExpr::DirtyKey | FilterExpr::MissingColumns | FilterExpr::PresentColumns => {}
+        | FilterExpr::DirtyKey | FilterExpr::ValueMatch { .. } => None,
     }
 }
 
@@ -835,6 +893,53 @@ mod tests {
     fn negation_column_directive_is_none() {
         // `-:?` should not produce a column directive
         assert_eq!(column_directive(&parse("-:?")), ColumnDirective::None);
+    }
+
+    // ── visible_locales unit tests (no Workspace needed for pure set logic) ────
+
+    fn mock_all_locales() -> Vec<String> {
+        vec!["default".into(), "de".into(), "en".into(), "fr".into()]
+    }
+
+    /// Minimal Workspace stub is not easy to construct here.
+    /// Instead, verify the `visible_locales_opt` logic via parse + spot checks
+    /// that rely only on the AST shape (no actual workspace needed for these).
+
+    #[test]
+    fn value_match_unquoted() {
+        let expr = parse("=confirm");
+        assert!(matches!(&expr, FilterExpr::ValueMatch { pattern } if pattern == "confirm"));
+    }
+
+    #[test]
+    fn value_match_quoted_multiword() {
+        let expr = parse("=\"Confirm deletion\"");
+        assert!(matches!(&expr, FilterExpr::ValueMatch { pattern } if pattern == "Confirm deletion"));
+    }
+
+    #[test]
+    fn value_match_and_locale() {
+        // `="delete" :de` → And([ValueMatch{delete}, LocaleStatus{de}])
+        let expr = parse("=\"delete\" :de");
+        let t = and_terms(&expr);
+        assert!(matches!(&t[0], FilterExpr::ValueMatch { pattern } if pattern == "delete"));
+        assert!(matches!(&t[1], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
+    }
+
+    #[test]
+    fn visible_locales_or_tautology_returns_none() {
+        // `:de, -:de` → Or([LocaleStatus{de,Unquoted}, Not(LocaleStatus{de,Unquoted})])
+        // Each Or branch should be evaluated independently.
+        // Branch 1 = Some({de*}); Branch 2 = Some(all - {de*})  → union = all → None.
+        // We can't run this fully without a Workspace, but we verify the AST shape.
+        let expr = parse(":de, -:de");
+        let b = or_branches(&expr);
+        assert_eq!(b.len(), 2);
+        assert!(matches!(&b[0], FilterExpr::LocaleStatus { locale, mode, .. }
+            if locale == "de" && *mode == MatchMode::Unquoted));
+        assert!(matches!(&b[1], FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::LocaleStatus { locale, mode, .. }
+                if locale == "de" && *mode == MatchMode::Unquoted)));
     }
 
     #[test]

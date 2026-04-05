@@ -185,21 +185,28 @@ bundle term   messages          no prefix — bundle prefix match
               "messages"        quoted — exact match
 key term      /confirm          / prefix — key substring match
               /?                keys with any missing translation
+              -/?               completely translated keys
               /*pattern         dangling (unsaved) key matching pattern
               /#                dirty keys (row filter only)
 locale term   :de               show de* columns (no row filter)
               :de?              missing in de* + show de* columns
               :de!              present in de* + show de* columns
+              :de#              dirty in de* + show de* columns  (planned)
               :?                per-row column directive: show only missing columns
               :!                per-row column directive: show only present columns
               :#                show only dirty locale columns
+              -:"de"            hide de column; alone = all columns except de
+              -:#               show all columns except dirty ones
 special       #                 dirty keys + dirty locale columns (reserved token)
+negation      -term             negate any term; -(expr) negate a group (planned)
 ```
 
 `visible_locales` is narrowed to the named locale terms in the expression;
-all locales are shown when no locale terms are present. `:#` / `#` add dirty
-locale columns to the visible set. `:?` / `:!` are per-row directives stored
-in `AppState.column_directive` and applied in the renderer.
+all locales are shown when no locale terms are present. Negative locale terms
+(`-:"de"`) subtract from the visible set; when only negative terms exist the
+starting set is all locales. `:#` / `#` add dirty locale columns; `-:#` removes
+them. `:?` / `:!` are per-row directives stored in `AppState.column_directive`
+and applied in the renderer.
 
 See `docs/filtering.md` for the full syntax and AST.
 
