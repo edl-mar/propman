@@ -411,6 +411,38 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 state.apply_filter();
             }
         }
+        (Mode::KeyRenaming, Message::CommitKeyCopy) => {
+            let new_key = state.edit_buffer.as_ref()
+                .map(|e| e.current_value().trim().to_string())
+                .unwrap_or_default();
+
+            let old_key = match state.display_rows.get(state.cursor_row) {
+                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
+                Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
+                _ => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
+            };
+
+            if new_key.is_empty() || (!new_key.contains('.') && !new_key.contains(':')) {
+                state.status_message = Some("Key must contain at least one '.'".to_string());
+            } else if new_key == old_key {
+                state.status_message = Some("Copy destination is the same as source".to_string());
+            } else {
+                match state.selection_scope {
+                    SelectionScope::Exact => {
+                        state.temp_pins.clear();
+                        ops::rename::commit_exact_copy(&mut state, &old_key, new_key);
+                    }
+                    SelectionScope::Children => {
+                        state.temp_pins.clear();
+                        ops::rename::commit_prefix_copy(&mut state, &old_key, new_key, false);
+                    }
+                    SelectionScope::ChildrenAll => {
+                        state.temp_pins.clear();
+                        ops::rename::commit_prefix_copy(&mut state, &old_key, new_key, true);
+                    }
+                }
+            }
+        }
         (Mode::KeyRenaming, Message::CancelEdit) => {
             state.temp_pins.clear();
             state.edit_buffer = None;

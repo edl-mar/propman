@@ -479,7 +479,7 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::Editing      => "  Enter commit  Esc cancel  \\ continuation".into(),
             Mode::Continuation => "  Enter new line  Esc cancel \\".into(),
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
-            Mode::KeyRenaming  => "  Enter confirm  Esc cancel".into(),
+            Mode::KeyRenaming  => "  Enter move  Ctrl+P copy  Tab scope  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
             Mode::Filter       => "  Enter/Esc/↑↓ exit filter".into(),
             Mode::Normal => {

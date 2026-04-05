@@ -78,6 +78,7 @@ pub fn default_keybindings() -> Keybindings {
 
     let key_renaming = map![
         (KeyCode::Enter,          none) => Message::CommitKeyRename,
+        (KeyCode::Char('p'),      ctrl) => Message::CommitKeyCopy,
         (KeyCode::Tab,            none) => Message::CycleScope,
         (KeyCode::Up,             none) => Message::MoveCursorUp,
         (KeyCode::Down,           none) => Message::MoveCursorDown,

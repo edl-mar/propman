@@ -22,8 +22,10 @@ pub enum Message {
     CommitKeyName,
     /// `n` pressed in Normal mode — open the key-naming editor to create a new key.
     NewKey,
-    /// Enter pressed in KeyRenaming mode — validate and apply the rename.
+    /// Enter pressed in KeyRenaming mode — validate and apply the rename (move).
     CommitKeyRename,
+    /// `p` pressed in KeyRenaming mode — validate and apply as a copy (source kept).
+    CommitKeyCopy,
     /// Tab pressed in Normal mode — cycle selection scope (exact / +children).
     CycleScope,
     /// A raw key event forwarded to the active TextArea (Editing/Continuation mode).
