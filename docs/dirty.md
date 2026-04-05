@@ -40,23 +40,23 @@ saved, the entry reverts to normal filter-based visibility.
 
 ## Filter DSL integration
 
-`#` is the dirty sigil.  It is recognised in the key section and the locale section:
+`#` is the dirty sigil.  Three forms are available:
 
 | Filter expression | Meaning |
 |---|---|
-| `/#` | all dirty keys |
-| `/confirm#` | keys matching "confirm" AND dirty |
-| `:#` | dirty keys — locale columns unrestricted (same as `/#`) |
-| `:[de]#` | dirty keys, narrowing the visible column set to `de` |
-| `:[de?]#` | dirty keys that are also missing a `de` translation |
+| `#` | dirty keys; show only dirty locale columns |
+| `/#` | dirty keys only (row filter; all locale columns shown) |
+| `:#` | all keys; show only dirty locale columns |
+| `# :de` | dirty keys; dirty locale columns + de column |
+| `# messages` | dirty keys in messages bundle; dirty locale columns |
+| `/# :de?` | dirty keys that are also missing in de |
 
-All filter terms are ANDed together.  There is no OR support yet (`FilterExpr::Or`
-is reserved but unimplemented).  The `#` sigil is therefore useful for narrowing,
-not for "always show dirty regardless of other terms" — that is handled by the
-automatic bypass described above.
+`#` is a **reserved token** — it does not follow the no-prefix = bundle rule.
+Bare `#` is the quickest way to review all unsaved changes: it combines the
+`/#` row filter with the `:#` column narrowing in one character.
 
-Note: `#` in the bundle section (before any `/`) is treated as a bundle name
-pattern and will match nothing.  Always use `/#` or `:#`.
+Filter terms can be combined with AND (space) and OR (comma).  For example,
+`/# :de?` = dirty AND missing in de; `/#, :de?` = dirty OR missing in de.
 
 ## Relationship to pinning
 

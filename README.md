@@ -39,21 +39,24 @@ If no directory is given the current directory is used.
 
 ## Filter syntax
 
-The filter bar (press `/`) supports a three-section DSL:
-
-```
-[bundle ...] [/ key_pattern ...] [: locale[modifier] ...]
-```
+The filter bar (press `/`) accepts boolean expressions over typed terms.
+Each term is prefixed by a sigil; terms can appear in any order.
+Space = AND (higher precedence), comma = OR (lower precedence).
 
 | Example | Meaning |
 |---------|---------|
-| `messages` | Show only the `messages` bundle |
+| `messages` | Keys in the `messages` bundle |
 | `/error` | Keys containing `error` |
 | `:de` | Show only the `de` locale column |
-| `messages /error :de!` | Combined — `de` must be present |
-| `:?` | Any key with at least one missing locale |
+| `messages /error :de!` | `de` must be present, messages bundle |
+| `/?` | Keys with at least one missing translation |
+| `:de?, :si?` | Missing in de OR missing in si |
+| `messages /confirm, errors /delete` | OR across bundles and key patterns |
+| `#` | All dirty (unsaved) keys, narrow to dirty locale columns |
+| `:?` | Per row: show only the missing locale columns |
+| `:!` | Per row: show only the present locale columns |
 
-Modifiers: `!` = must be present, `?` = must be missing.
+Locale modifiers: `!` = must be present, `?` = must be missing.
 
 See [docs/filtering.md](docs/filtering.md) for the full syntax reference.
 

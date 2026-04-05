@@ -185,6 +185,19 @@ impl Workspace {
             .any(|f| f.locale == locale)
     }
 
+    /// Locale strings for a specific bundle, "default" first.
+    /// Falls back to `all_locales()` for bare (non-bundle) keys (`bundle` is `""`).
+    pub fn bundle_locales(&self, bundle: &str) -> Vec<String> {
+        if bundle.is_empty() {
+            return self.all_locales();
+        }
+        self.groups.iter()
+            .filter(|g| g.base_name == bundle)
+            .flat_map(|g| g.locales())
+            .map(|l| l.to_string())
+            .collect()
+    }
+
     /// All distinct locale strings across all groups, "default" first.
     pub fn all_locales(&self) -> Vec<String> {
         let mut seen: HashSet<&str> = HashSet::new();

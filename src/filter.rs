@@ -19,40 +19,67 @@ pub enum StatusModifier {
     Present,
 }
 
+/// Column visibility directive derived from `:?` / `:!` terms.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnDirective {
+    /// No directive — all rows visible.
+    None,
+    /// `:?` — only show rows where this locale cell is missing.
+    MissingOnly,
+    /// `:!` — only show rows where this locale cell is present.
+    PresentOnly,
+}
+
 #[derive(Debug, Clone)]
 pub enum FilterExpr {
     And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+
+    // Key terms (/ prefix)
+    /// `/pattern` — key substring or exact match.
     KeyPattern { pattern: String, mode: MatchMode },
-    LocaleStatus { locale: String, modifier: StatusModifier, mode: MatchMode },
-    /// Bare `?` shorthand: at least one locale is missing.
-    AnyMissing,
-    /// `*pattern` — key is dangling (unsaved) and matches the pattern.
-    /// Bare `*` matches all dangling keys.
+    /// `/*pattern` — key is dangling (unsaved) and matches the pattern.
+    /// Bare `/*` matches all dangling keys.
     DanglingKey { pattern: String, mode: MatchMode },
-    /// `bundle1, bundle2 /` — key must belong to one of the listed bundles.
-    /// Unquoted = prefix match on the bundle name; quoted = exact match.
-    BundleFilter(Vec<(String, MatchMode)>),
-    /// `#` — key has unsaved changes (present in `dirty_keys`).
-    /// Usable in both the key section (`/#`) and the locale section (`:#`).
+    /// `/?` — key has at least one missing translation.
+    AnyMissing,
+    /// `/#` — key has unsaved changes (present in `dirty_keys`).
     DirtyKey,
+
+    // Bundle terms (no prefix)
+    /// `messages` — key must belong to this bundle (one term per BundleFilter node).
+    /// Unquoted = prefix match on bundle name; quoted = exact match.
+    BundleFilter { pattern: String, mode: MatchMode },
+
+    // Locale terms (: prefix)
+    /// `:de`, `:de?`, `:de!` — locale selector with optional modifier.
+    LocaleStatus { locale: String, modifier: StatusModifier, mode: MatchMode },
+    /// `:?` — column directive: show only rows where a locale cell is missing.
+    /// Evaluates to true (does not filter keys by itself).
+    MissingColumns,
+    /// `:!` — column directive: show only rows where a locale cell is present.
+    /// Evaluates to true (does not filter keys by itself).
+    PresentColumns,
+    /// `:#` — show dirty locale columns; evaluates to true.
+    DirtyLocale,
+
+    // Special
+    /// Bare `#` — dirty keys AND dirty locale columns.
+    Dirty,
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 /// Parse a filter query string into a `FilterExpr`.
 ///
-/// Full format: `[bundle, ...] [/ key_pattern, ...] [: locale[modifier], ...]`
+/// New DSL: terms are typed by prefix sigil and can appear in any order.
+///   - No prefix   → bundle term: `messages`, `"messages"` (exact)
+///   - `/` prefix  → key term:    `/confirm`, `/?`, `/*pattern`, `/#`
+///   - `:` prefix  → locale term: `:de`, `:de?`, `:de!`, `:?`, `:!`, `:#`
+///   - `#` bare    → Dirty (dirty keys + dirty locale columns)
 ///
-/// Section rules (each section ends at the next separator or end of input):
-///   - From line start to the first `/` or `:` → bundle selectors
-///   - After `/` to the next `:` or end          → key patterns
-///   - After `:`  to end                          → locale selectors
-///
-/// Examples:
-///   `messages`          — bundle filter only
-///   `/error`            — key filter only
-///   `:de`               — locale filter only
-///   `messages/error:de` — all three sections
+/// Space = AND (higher precedence, within a comma-group).
+/// Comma = OR  (lower precedence, between groups).
 ///
 /// Returns `FilterExpr::And([])` (matches everything) for empty input.
 pub fn parse(input: &str) -> FilterExpr {
@@ -61,88 +88,90 @@ pub fn parse(input: &str) -> FilterExpr {
         return FilterExpr::And(vec![]);
     }
 
+    // Two-level split: commas → OR groups; whitespace → AND terms within each group.
+    let or_groups: Vec<&str> = split_on_commas(input);
+
+    if or_groups.len() == 1 {
+        // No commas — collapse to And directly (avoids unnecessary Or wrapper).
+        parse_and_group(or_groups[0])
+    } else {
+        let branches: Vec<FilterExpr> = or_groups.iter().map(|g| parse_and_group(g)).collect();
+        FilterExpr::Or(branches)
+    }
+}
+
+/// Parse a single AND group (whitespace-separated terms).
+fn parse_and_group(group: &str) -> FilterExpr {
+    let group = group.trim();
     let mut terms: Vec<FilterExpr> = Vec::new();
-
-    let slash_idx = input.find('/');
-    let colon_idx = input.find(':');
-
-    // Bundle section: from start to whichever separator comes first.
-    let bundle_end = match (slash_idx, colon_idx) {
-        (Some(s), Some(c)) => Some(s.min(c)),
-        (Some(s), None)    => Some(s),
-        (None,    Some(c)) => Some(c),
-        (None,    None)    => None,
-    };
-    let bundle_str = match bundle_end {
-        Some(idx) => input[..idx].trim(),
-        None      => input,  // entire input is the bundle section
-    };
-    let mut bundle_terms: Vec<(String, MatchMode)> = Vec::new();
-    for raw in bundle_str.split_whitespace() {
-        if let Some(inner) = strip_quotes(raw) {
-            bundle_terms.push((inner.to_string(), MatchMode::Exact));
-        } else {
-            bundle_terms.push((raw.to_string(), MatchMode::Unquoted));
-        }
+    for raw in group.split_whitespace() {
+        terms.push(parse_term(raw));
     }
-    if !bundle_terms.is_empty() {
-        terms.push(FilterExpr::BundleFilter(bundle_terms));
+    match terms.len() {
+        0 => FilterExpr::And(vec![]),
+        1 => terms.remove(0),
+        _ => FilterExpr::And(terms),
     }
-
-    // Key section: after '/' up to the next ':' (or end). Only present when '/' exists.
-    if let Some(s_idx) = slash_idx {
-        let after_slash = &input[s_idx + 1..];
-        let key_str = match after_slash.find(':') {
-            Some(c_idx) => after_slash[..c_idx].trim(),
-            None        => after_slash.trim(),
-        };
-        for raw in key_str.split_whitespace() {
-            terms.push(parse_key_term(raw));
-        }
-    }
-
-    // Locale section: after ':' to end. Only present when ':' exists.
-    if let Some(c_idx) = colon_idx {
-        let locale_str = input[c_idx + 1..].trim();
-        for raw in locale_str.split_whitespace() {
-            terms.push(parse_locale_term(raw));
-        }
-    }
-
-    FilterExpr::And(terms)
 }
 
-fn parse_key_term(raw: &str) -> FilterExpr {
+/// Parse a single term by its leading sigil.
+fn parse_term(raw: &str) -> FilterExpr {
     if raw == "#" {
-        return FilterExpr::DirtyKey;
+        return FilterExpr::Dirty;
     }
-    if let Some(rest) = raw.strip_prefix('*') {
-        // `*"pattern"` → exact dangling match; `*pattern` → substring dangling match.
-        if let Some(inner) = strip_quotes(rest) {
-            return FilterExpr::DanglingKey { pattern: inner.to_string(), mode: MatchMode::Exact };
-        }
-        return FilterExpr::DanglingKey { pattern: rest.to_string(), mode: MatchMode::Unquoted };
+    if let Some(rest) = raw.strip_prefix('/') {
+        return parse_key_term(rest);
     }
+    if let Some(rest) = raw.strip_prefix(':') {
+        return parse_locale_term(rest);
+    }
+    // No sigil → bundle term.
     if let Some(inner) = strip_quotes(raw) {
-        return FilterExpr::KeyPattern { pattern: inner.to_string(), mode: MatchMode::Exact };
+        FilterExpr::BundleFilter { pattern: inner.to_string(), mode: MatchMode::Exact }
+    } else {
+        FilterExpr::BundleFilter { pattern: raw.to_string(), mode: MatchMode::Unquoted }
     }
-    FilterExpr::KeyPattern { pattern: raw.to_string(), mode: MatchMode::Unquoted }
 }
 
-fn parse_locale_term(raw: &str) -> FilterExpr {
-    // Bare `?` → AnyMissing shorthand; bare `#` → DirtyKey.
-    if raw == "?" {
+/// Parse the part after the leading `/`.
+fn parse_key_term(rest: &str) -> FilterExpr {
+    if rest == "?" {
         return FilterExpr::AnyMissing;
     }
-    if raw == "#" {
+    if rest == "#" {
         return FilterExpr::DirtyKey;
     }
+    if let Some(pat) = rest.strip_prefix('*') {
+        // `*"pattern"` → exact dangling match; `*pattern` → substring dangling match.
+        if let Some(inner) = strip_quotes(pat) {
+            return FilterExpr::DanglingKey { pattern: inner.to_string(), mode: MatchMode::Exact };
+        }
+        return FilterExpr::DanglingKey { pattern: pat.to_string(), mode: MatchMode::Unquoted };
+    }
+    if let Some(inner) = strip_quotes(rest) {
+        FilterExpr::KeyPattern { pattern: inner.to_string(), mode: MatchMode::Exact }
+    } else {
+        FilterExpr::KeyPattern { pattern: rest.to_string(), mode: MatchMode::Unquoted }
+    }
+}
 
-    if raw.starts_with('"') {
+/// Parse the part after the leading `:`.
+fn parse_locale_term(rest: &str) -> FilterExpr {
+    if rest == "?" {
+        return FilterExpr::MissingColumns;
+    }
+    if rest == "!" {
+        return FilterExpr::PresentColumns;
+    }
+    if rest == "#" {
+        return FilterExpr::DirtyLocale;
+    }
+
+    if rest.starts_with('"') {
         // Quoted locale — modifier is the character(s) after the closing `"`.
-        if let Some(close_offset) = raw[1..].find('"') {
-            let inner = &raw[1..close_offset + 1];
-            let after = &raw[close_offset + 2..];
+        if let Some(close_offset) = rest[1..].find('"') {
+            let inner = &rest[1..close_offset + 1];
+            let after = &rest[close_offset + 2..];
             return FilterExpr::LocaleStatus {
                 locale: inner.to_string(),
                 modifier: parse_modifier_str(after),
@@ -152,12 +181,36 @@ fn parse_locale_term(raw: &str) -> FilterExpr {
     }
 
     // Unquoted — modifier is the final character.
-    let (locale, modifier) = split_modifier(raw);
+    let (locale, modifier) = split_modifier(rest);
     FilterExpr::LocaleStatus {
         locale: locale.to_string(),
         modifier,
         mode: MatchMode::Unquoted,
     }
+}
+
+/// Split `input` on commas that are not inside quotes or parentheses.
+/// (Parentheses are reserved for future use.)
+fn split_on_commas(input: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = Vec::new();
+    let mut depth: usize = 0; // paren depth
+    let mut in_quotes = false;
+    let mut start = 0;
+
+    for (i, ch) in input.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            '(' if !in_quotes => depth += 1,
+            ')' if !in_quotes => depth = depth.saturating_sub(1),
+            ',' if !in_quotes && depth == 0 => {
+                parts.push(&input[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&input[start..]);
+    parts
 }
 
 /// If `s` is wrapped in `"..."`, return the inner content; otherwise `None`.
@@ -185,12 +238,45 @@ fn split_modifier(s: &str) -> (&str, StatusModifier) {
     }
 }
 
+// ── Column directive ──────────────────────────────────────────────────────────
+
+/// Walk `expr` and return the first `ColumnDirective` found.
+/// `Dirty` implies `MissingOnly` — no, actually `Dirty` affects locale columns via
+/// dirty locale inclusion, not row filtering. Returns `None` (i.e. `ColumnDirective::None`)
+/// unless an explicit `:?` or `:!` is present.
+pub fn column_directive(expr: &FilterExpr) -> ColumnDirective {
+    match expr {
+        FilterExpr::MissingColumns => ColumnDirective::MissingOnly,
+        FilterExpr::PresentColumns => ColumnDirective::PresentOnly,
+        FilterExpr::And(terms) => {
+            for t in terms {
+                let d = column_directive(t);
+                if d != ColumnDirective::None {
+                    return d;
+                }
+            }
+            ColumnDirective::None
+        }
+        FilterExpr::Or(branches) => {
+            for b in branches {
+                let d = column_directive(b);
+                if d != ColumnDirective::None {
+                    return d;
+                }
+            }
+            ColumnDirective::None
+        }
+        _ => ColumnDirective::None,
+    }
+}
+
 // ── Evaluator ─────────────────────────────────────────────────────────────────
 
 /// Returns `true` if `key` should be visible given `expr` and the workspace.
 pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys: &HashSet<String>) -> bool {
     match expr {
         FilterExpr::And(terms) => terms.iter().all(|t| evaluate(t, key, workspace, dirty_keys)),
+        FilterExpr::Or(branches) => branches.iter().any(|t| evaluate(t, key, workspace, dirty_keys)),
 
         FilterExpr::KeyPattern { pattern, mode } => match mode {
             MatchMode::Exact => key == pattern.as_str(),
@@ -198,10 +284,12 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys:
             MatchMode::Unquoted => key.contains(pattern.as_str()),
         },
 
-        FilterExpr::AnyMissing => workspace
-            .all_locales()
-            .iter()
-            .any(|locale| !has_value(key, locale, workspace)),
+        FilterExpr::AnyMissing => {
+            let (bundle, _) = workspace::split_key(key);
+            workspace.bundle_locales(bundle)
+                .iter()
+                .any(|locale| !has_value(key, locale, workspace))
+        }
 
         FilterExpr::DanglingKey { pattern, mode } => {
             if !workspace.is_dangling(key) {
@@ -213,55 +301,63 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys:
             }
         }
 
-        FilterExpr::BundleFilter(bundles) => {
+        FilterExpr::BundleFilter { pattern, mode } => {
             let (key_bundle, _) = workspace::split_key(key);
-            bundles.iter().any(|(pattern, mode)| match mode {
+            match mode {
                 MatchMode::Exact => key_bundle == pattern.as_str(),
                 MatchMode::Unquoted => key_bundle.starts_with(pattern.as_str()),
-            })
+            }
         }
 
         FilterExpr::LocaleStatus { locale, modifier, mode } => {
+            let (bundle, _) = workspace::split_key(key);
             match modifier {
                 // Any modifier: column-visibility hint only, never filters keys.
                 StatusModifier::Any => true,
                 StatusModifier::Present => {
                     // All locales matching the selector must have this key.
-                    let matched = matching_locales(locale, mode, workspace);
+                    let matched = matching_locales(locale, mode, workspace, bundle);
                     !matched.is_empty() && matched.iter().all(|l| has_value(key, l, workspace))
                 }
                 StatusModifier::Missing => {
                     // All locales matching the selector must NOT have this key.
-                    let matched = matching_locales(locale, mode, workspace);
+                    let matched = matching_locales(locale, mode, workspace, bundle);
                     !matched.is_empty() && matched.iter().all(|l| !has_value(key, l, workspace))
                 }
             }
         }
 
-        FilterExpr::DirtyKey => dirty_keys.contains(key),
+        // These evaluate to true — they are column/row directives, not key filters.
+        FilterExpr::MissingColumns | FilterExpr::PresentColumns | FilterExpr::DirtyLocale => true,
+
+        FilterExpr::DirtyKey | FilterExpr::Dirty => dirty_keys.contains(key),
     }
 }
 
-/// All workspace locales that match `pattern` under `mode`.
-fn matching_locales(pattern: &str, mode: &MatchMode, workspace: &Workspace) -> Vec<String> {
+/// Bundle-scoped locales that match `pattern` under `mode`.
+/// Uses `bundle_locales` so that locales with no file in this bundle are excluded —
+/// consistent with the renderer which skips such locales via `bundle_has_locale`.
+fn matching_locales(pattern: &str, mode: &MatchMode, workspace: &Workspace, bundle: &str) -> Vec<String> {
     workspace
-        .all_locales()
+        .bundle_locales(bundle)
         .into_iter()
         .filter(|locale| locale_matches(locale, pattern, mode))
         .collect()
 }
 
+// ── Visible locales ───────────────────────────────────────────────────────────
+
 /// Returns the workspace locales that should be visible given `expr`.
 ///
-/// Collects every `LocaleStatus` selector in the expression and shows only the
-/// locales that match at least one of them. When the expression contains no
-/// locale selectors (e.g. a key-only filter or `AnyMissing`), all locales are
-/// returned unchanged.
-pub fn visible_locales(expr: &FilterExpr, workspace: &Workspace) -> Vec<String> {
+/// - Collects `LocaleStatus` selectors → narrows to matching locales.
+/// - If `DirtyLocale` or `Dirty` is present, also includes locales from `dirty_locales`.
+/// - If no selectors and no dirty directive → returns all locales.
+pub fn visible_locales(expr: &FilterExpr, workspace: &Workspace, dirty_locales: &HashSet<String>) -> Vec<String> {
     let mut selectors: Vec<(&str, &MatchMode)> = Vec::new();
-    collect_locale_selectors(expr, &mut selectors);
+    let mut include_dirty = false;
+    collect_locale_selectors(expr, &mut selectors, &mut include_dirty);
 
-    if selectors.is_empty() {
+    if selectors.is_empty() && !include_dirty {
         return workspace.all_locales();
     }
 
@@ -269,24 +365,38 @@ pub fn visible_locales(expr: &FilterExpr, workspace: &Workspace) -> Vec<String> 
         .all_locales()
         .into_iter()
         .filter(|locale| {
-            selectors.iter().any(|(pattern, mode)| locale_matches(locale, pattern, mode))
+            let matches_selector = selectors.iter().any(|(pattern, mode)| locale_matches(locale, pattern, mode));
+            let matches_dirty = include_dirty && dirty_locales.contains(locale.as_str());
+            matches_selector || matches_dirty
         })
         .collect()
 }
 
-fn collect_locale_selectors<'a>(expr: &'a FilterExpr, out: &mut Vec<(&'a str, &'a MatchMode)>) {
+fn collect_locale_selectors<'a>(
+    expr: &'a FilterExpr,
+    out: &mut Vec<(&'a str, &'a MatchMode)>,
+    include_dirty: &mut bool,
+) {
     match expr {
         FilterExpr::And(terms) => {
             for t in terms {
-                collect_locale_selectors(t, out);
+                collect_locale_selectors(t, out, include_dirty);
+            }
+        }
+        FilterExpr::Or(branches) => {
+            for b in branches {
+                collect_locale_selectors(b, out, include_dirty);
             }
         }
         FilterExpr::LocaleStatus { locale, mode, .. } => {
             out.push((locale.as_str(), mode));
         }
-        FilterExpr::BundleFilter(_) | FilterExpr::KeyPattern { .. }
+        FilterExpr::DirtyLocale | FilterExpr::Dirty => {
+            *include_dirty = true;
+        }
+        FilterExpr::BundleFilter { .. } | FilterExpr::KeyPattern { .. }
         | FilterExpr::AnyMissing | FilterExpr::DanglingKey { .. }
-        | FilterExpr::DirtyKey => {}
+        | FilterExpr::DirtyKey | FilterExpr::MissingColumns | FilterExpr::PresentColumns => {}
     }
 }
 
@@ -309,10 +419,17 @@ fn has_value(key: &str, locale: &str, workspace: &Workspace) -> bool {
 mod tests {
     use super::*;
 
-    fn terms(expr: &FilterExpr) -> &[FilterExpr] {
+    fn and_terms(expr: &FilterExpr) -> &[FilterExpr] {
         match expr {
             FilterExpr::And(t) => t,
-            _ => panic!("expected And"),
+            _ => panic!("expected And, got {:?}", expr),
+        }
+    }
+
+    fn or_branches(expr: &FilterExpr) -> &[FilterExpr] {
+        match expr {
+            FilterExpr::Or(b) => b,
+            _ => panic!("expected Or, got {:?}", expr),
         }
     }
 
@@ -325,28 +442,25 @@ mod tests {
     #[test]
     fn bundle_unquoted() {
         let expr = parse("messages");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
-            FilterExpr::BundleFilter(v)
-            if v.len() == 1 && v[0].0 == "messages" && v[0].1 == MatchMode::Unquoted
+        assert!(matches!(&expr,
+            FilterExpr::BundleFilter { pattern, mode }
+            if pattern == "messages" && *mode == MatchMode::Unquoted
         ));
     }
 
     #[test]
     fn bundle_exact() {
         let expr = parse("\"messages\"");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
-            FilterExpr::BundleFilter(v)
-            if v.len() == 1 && v[0].0 == "messages" && v[0].1 == MatchMode::Exact
+        assert!(matches!(&expr,
+            FilterExpr::BundleFilter { pattern, mode }
+            if pattern == "messages" && *mode == MatchMode::Exact
         ));
     }
 
     #[test]
     fn key_unquoted() {
         let expr = parse("/error");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
+        assert!(matches!(&expr,
             FilterExpr::KeyPattern { pattern, mode }
             if pattern == "error" && *mode == MatchMode::Unquoted
         ));
@@ -355,25 +469,58 @@ mod tests {
     #[test]
     fn key_exact() {
         let expr = parse("/\"app.error.notfound\"");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
+        assert!(matches!(&expr,
             FilterExpr::KeyPattern { pattern, mode }
             if pattern == "app.error.notfound" && *mode == MatchMode::Exact
         ));
     }
 
     #[test]
-    fn bare_any_missing() {
+    fn key_any_missing() {
+        // /? → AnyMissing
+        let expr = parse("/?");
+        assert!(matches!(&expr, FilterExpr::AnyMissing));
+    }
+
+    #[test]
+    fn key_dirty() {
+        // /# → DirtyKey
+        let expr = parse("/#");
+        assert!(matches!(&expr, FilterExpr::DirtyKey));
+    }
+
+    #[test]
+    fn bare_dirty() {
+        // # → Dirty
+        let expr = parse("#");
+        assert!(matches!(&expr, FilterExpr::Dirty));
+    }
+
+    #[test]
+    fn locale_missing_columns() {
+        // :? → MissingColumns (column directive, not AnyMissing)
         let expr = parse(":?");
-        let t = terms(&expr);
-        assert!(matches!(&t[0], FilterExpr::AnyMissing));
+        assert!(matches!(&expr, FilterExpr::MissingColumns));
+    }
+
+    #[test]
+    fn locale_present_columns() {
+        // :! → PresentColumns
+        let expr = parse(":!");
+        assert!(matches!(&expr, FilterExpr::PresentColumns));
+    }
+
+    #[test]
+    fn locale_dirty() {
+        // :# → DirtyLocale
+        let expr = parse(":#");
+        assert!(matches!(&expr, FilterExpr::DirtyLocale));
     }
 
     #[test]
     fn locale_present_unquoted() {
         let expr = parse(":de!");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
+        assert!(matches!(&expr,
             FilterExpr::LocaleStatus { locale, modifier, mode }
             if locale == "de" && *modifier == StatusModifier::Present && *mode == MatchMode::Unquoted
         ));
@@ -382,8 +529,7 @@ mod tests {
     #[test]
     fn locale_missing_exact() {
         let expr = parse(":\"de_AT\"?");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
+        assert!(matches!(&expr,
             FilterExpr::LocaleStatus { locale, modifier, mode }
             if locale == "de_AT" && *modifier == StatusModifier::Missing && *mode == MatchMode::Exact
         ));
@@ -392,18 +538,37 @@ mod tests {
     #[test]
     fn locale_any_no_modifier() {
         let expr = parse(":de");
-        let t = terms(&expr);
-        assert!(matches!(&t[0],
+        assert!(matches!(&expr,
             FilterExpr::LocaleStatus { locale, modifier, mode }
             if locale == "de" && *modifier == StatusModifier::Any && *mode == MatchMode::Unquoted
         ));
     }
 
     #[test]
+    fn multi_bundle_whitespace_is_and() {
+        // `messages errors` → And([BundleFilter{messages}, BundleFilter{errors}])
+        let expr = parse("messages errors");
+        let t = and_terms(&expr);
+        assert_eq!(t.len(), 2);
+        assert!(matches!(&t[0], FilterExpr::BundleFilter { pattern, .. } if pattern == "messages"));
+        assert!(matches!(&t[1], FilterExpr::BundleFilter { pattern, .. } if pattern == "errors"));
+    }
+
+    #[test]
+    fn multi_bundle_comma_is_or() {
+        // `messages,errors` → Or([BundleFilter{messages}, BundleFilter{errors}])
+        let expr = parse("messages,errors");
+        let b = or_branches(&expr);
+        assert_eq!(b.len(), 2);
+        assert!(matches!(&b[0], FilterExpr::BundleFilter { pattern, .. } if pattern == "messages"));
+        assert!(matches!(&b[1], FilterExpr::BundleFilter { pattern, .. } if pattern == "errors"));
+    }
+
+    #[test]
     fn multi_term_and() {
-        // Key patterns require '/' prefix; whitespace separates multiple terms.
-        let expr = parse("/error timeout: de?");
-        let t = terms(&expr);
+        // Space-separated terms in any order → And
+        let expr = parse("/error /timeout :de?");
+        let t = and_terms(&expr);
         assert_eq!(t.len(), 3);
         assert!(matches!(&t[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "error"));
         assert!(matches!(&t[1], FilterExpr::KeyPattern { pattern, .. } if pattern == "timeout"));
@@ -416,28 +581,83 @@ mod tests {
     #[test]
     fn all_three_sections() {
         let expr = parse("messages /error :de");
-        let t = terms(&expr);
+        let t = and_terms(&expr);
         assert_eq!(t.len(), 3);
-        assert!(matches!(&t[0], FilterExpr::BundleFilter(v) if v[0].0 == "messages"));
+        assert!(matches!(&t[0], FilterExpr::BundleFilter { pattern, .. } if pattern == "messages"));
         assert!(matches!(&t[1], FilterExpr::KeyPattern { pattern, .. } if pattern == "error"));
         assert!(matches!(&t[2], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
     }
 
     #[test]
-    fn multi_bundle_whitespace() {
-        let expr = parse("messages errors");
-        let t = terms(&expr);
-        assert_eq!(t.len(), 1);
-        assert!(matches!(&t[0], FilterExpr::BundleFilter(v) if v.len() == 2));
-    }
-
-    #[test]
-    fn multi_locale_whitespace() {
-        let expr = parse(":de fr");
-        let t = terms(&expr);
+    fn multi_locale_whitespace_is_and() {
+        let expr = parse(":de :fr");
+        let t = and_terms(&expr);
         assert_eq!(t.len(), 2);
         assert!(matches!(&t[0], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
         assert!(matches!(&t[1], FilterExpr::LocaleStatus { locale, .. } if locale == "fr"));
+    }
+
+    #[test]
+    fn or_expression() {
+        // `/confirm :de, /error :fr` → Or([And([KeyPattern{confirm}, LocaleStatus{de}]), And([...])])
+        let expr = parse("/confirm :de, /error :fr");
+        let b = or_branches(&expr);
+        assert_eq!(b.len(), 2);
+        let b0 = and_terms(&b[0]);
+        assert!(matches!(&b0[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "confirm"));
+        assert!(matches!(&b0[1], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
+        let b1 = and_terms(&b[1]);
+        assert!(matches!(&b1[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "error"));
+        assert!(matches!(&b1[1], FilterExpr::LocaleStatus { locale, .. } if locale == "fr"));
+    }
+
+    #[test]
+    fn dirty_key_with_key_pattern() {
+        // `/confirm#` is NOT valid new DSL — confirm and # are separate terms via whitespace.
+        // `/confirm /#` → And([KeyPattern{confirm}, DirtyKey])
+        let expr = parse("/confirm /#");
+        let t = and_terms(&expr);
+        assert!(matches!(&t[0], FilterExpr::KeyPattern { pattern, .. } if pattern == "confirm"));
+        assert!(matches!(&t[1], FilterExpr::DirtyKey));
+    }
+
+    #[test]
+    fn dirty_locale_columns() {
+        // `:de #` → And([LocaleStatus{de}, Dirty])  — dirty narrows locales too
+        let expr = parse(":de #");
+        let t = and_terms(&expr);
+        assert!(matches!(&t[0], FilterExpr::LocaleStatus { locale, .. } if locale == "de"));
+        assert!(matches!(&t[1], FilterExpr::Dirty));
+    }
+
+    #[test]
+    fn column_directive_missing_only() {
+        assert_eq!(column_directive(&parse(":?")), ColumnDirective::MissingOnly);
+    }
+
+    #[test]
+    fn column_directive_present_only() {
+        assert_eq!(column_directive(&parse(":!")), ColumnDirective::PresentOnly);
+    }
+
+    #[test]
+    fn column_directive_none_for_key_filter() {
+        assert_eq!(column_directive(&parse("/error")), ColumnDirective::None);
+    }
+
+    #[test]
+    fn dangling_bare() {
+        // `/*` matches all dangling keys (empty pattern, always contains "")
+        let expr = parse("/*");
+        assert!(matches!(&expr, FilterExpr::DanglingKey { pattern, .. } if pattern.is_empty()));
+    }
+
+    #[test]
+    fn dangling_pattern() {
+        let expr = parse("/*foo");
+        assert!(matches!(&expr, FilterExpr::DanglingKey { pattern, mode }
+            if pattern == "foo" && *mode == MatchMode::Unquoted
+        ));
     }
 
     #[test]

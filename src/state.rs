@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tui_textarea::TextArea;
 use crate::{
     editor::CellEdit,
-    filter,
+    filter::{self, ColumnDirective},
     render_model::{self, DisplayRow},
     workspace::{self, Workspace},
 };
@@ -140,6 +140,9 @@ pub struct AppState {
     /// manually pinned by the user (`m`).  Bypasses the filter so they stay
     /// visible until explicitly unpinned.
     pub pinned_keys: HashSet<String>,
+    /// Column visibility directive derived from `:?` / `:!` filter terms.
+    /// Applied per-row in the table renderer to hide present/missing cells.
+    pub column_directive: ColumnDirective,
 }
 
 impl AppState {
@@ -158,14 +161,40 @@ impl AppState {
         self.workspace.get_value(full_key, locale).map(|v| v.to_string())
     }
 
+    /// Derives the set of locales that have at least one pending (unsaved) write.
+    /// Used to compute which locale columns to surface when `:#` or `#` is in the filter.
+    fn compute_dirty_locales(&self) -> HashSet<String> {
+        // Build a path → locale map from the workspace.
+        let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = self
+            .workspace
+            .groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .map(|f| (f.path.as_path(), f.locale.as_str()))
+            .collect();
+
+        self.pending_writes
+            .iter()
+            .filter_map(|c| {
+                let path = match c {
+                    PendingChange::Update { path, .. } => path.as_path(),
+                    PendingChange::Insert { path, .. } => path.as_path(),
+                    PendingChange::Delete { path, .. } => path.as_path(),
+                };
+                path_to_locale.get(path).map(|locale| locale.to_string())
+            })
+            .collect()
+    }
+
     /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
     /// then clamps the cursor to the new bounds.
     pub fn apply_filter(&mut self) {
         let query = self.filter_textarea.lines()[0].clone();
-        let (filtered, visible) = if query.trim().is_empty() {
+        let (filtered, visible, directive) = if query.trim().is_empty() {
             (
                 self.workspace.merged_keys.clone(),
                 self.workspace.all_locales(),
+                ColumnDirective::None,
             )
         } else {
             let expr = filter::parse(&query);
@@ -178,11 +207,14 @@ impl AppState {
                 })
                 .cloned()
                 .collect();
-            let visible = filter::visible_locales(&expr, &self.workspace);
-            (filtered, visible)
+            let dirty_locales = self.compute_dirty_locales();
+            let visible = filter::visible_locales(&expr, &self.workspace, &dirty_locales);
+            let directive = filter::column_directive(&expr);
+            (filtered, visible, directive)
         };
         self.display_rows = render_model::build_display_rows(&filtered);
         self.visible_locales = visible;
+        self.column_directive = directive;
         self.cursor_col = self.cursor_col.min(self.visible_locales.len());
         let max_row = self.display_rows.len().saturating_sub(1);
         self.cursor_row = self.cursor_row.min(max_row);
@@ -249,6 +281,7 @@ impl AppState {
             temp_pins: Vec::new(),
             pinned_keys: HashSet::new(),
             dirty_keys: HashSet::new(),
+            column_directive: ColumnDirective::None,
         }
     }
 }

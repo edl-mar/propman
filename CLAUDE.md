@@ -80,6 +80,9 @@ pub dirty_keys: HashSet<String>,     // keys with unsaved changes; auto-set on a
 pub temp_pins: Vec<String>,          // hidden children surfaced while ChildrenAll
                                      // is active; discarded on mode exit
 pub pinned_keys: HashSet<String>,    // manual bookmarks; bypass filter until unpinned
+pub column_directive: ColumnDirective, // derived from filter expr on every apply_filter;
+                                     // MissingOnly (:?) or PresentOnly (:!) drives
+                                     // per-row locale cell skipping in the renderer
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -174,25 +177,29 @@ The filter bar is always visible. `/` focuses it. The bar is backed by a
 permanent `TextArea<'static>`; the query is `filter_textarea.lines()[0]`,
 parsed live into a `FilterExpr` AST on every keystroke.
 
+Terms are typed by sigil prefix and can appear in any order.
+Space = AND (higher precedence), comma = OR (lower precedence).
+
 ```
-Full format: [bundle, ...] [/ key_pattern, ...] [: locale[modifier], ...]
-
-Section rules — each section runs to the next separator or end of input:
-  line start → / or :   bundle selectors  (whitespace-separated; unquoted = prefix)
-  after /    → :        key patterns      (whitespace-separated; unquoted = substring)
-  after :               locale selectors  (whitespace-separated; unquoted = prefix)
-
-modifiers         — ! = must be present, ? = must be missing, none = column hint only
-:?                — AnyMissing shorthand (at least one locale missing)
-/*pattern         — DanglingKey: unsaved key matching the pattern
-/#                — DirtyKey: all keys with unsaved changes
-/confirm#         — keys matching "confirm" AND dirty (# in key section = AND term)
-:#                — dirty keys; all locale columns visible
-:[de]#            — dirty keys; narrows visible columns to de
+bundle term   messages          no prefix — bundle prefix match
+              "messages"        quoted — exact match
+key term      /confirm          / prefix — key substring match
+              /?                keys with any missing translation
+              /*pattern         dangling (unsaved) key matching pattern
+              /#                dirty keys (row filter only)
+locale term   :de               show de* columns (no row filter)
+              :de?              missing in de* + show de* columns
+              :de!              present in de* + show de* columns
+              :?                per-row column directive: show only missing columns
+              :!                per-row column directive: show only present columns
+              :#                show only dirty locale columns
+special       #                 dirty keys + dirty locale columns (reserved token)
 ```
 
-`visible_locales` is narrowed to the matched locales when any `LocaleStatus`
-selector is present; all locales are shown otherwise.
+`visible_locales` is narrowed to the named locale terms in the expression;
+all locales are shown when no locale terms are present. `:#` / `#` add dirty
+locale columns to the visible set. `:?` / `:!` are per-row directives stored
+in `AppState.column_directive` and applied in the renderer.
 
 See `docs/filtering.md` for the full syntax and AST.
 

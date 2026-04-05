@@ -1,4 +1,5 @@
 use crate::{
+    filter::ColumnDirective,
     messages::Message,
     render_model::DisplayRow,
     state::{AppState, Mode, SelectionScope},
@@ -220,7 +221,7 @@ fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
 
     // The DSL hint lives in the title so it remains visible while the user types.
     let hint = Span::styled(
-        " bundle  /key  :locale[?!]  :?  /*dangling ",
+        " bundle  /key[?#]  :locale[?!#]  :?/:!  #  ,=OR ",
         Style::default().fg(Color::DarkGray),
     );
     let block = if focused {
@@ -362,12 +363,12 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         } else if is_temp_pinned {
             // Temp-pinned = hidden child surfaced by +children all; always in scope.
             Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+        } else if in_scope {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         } else if is_perm_pinned {
             Style::default().fg(Color::Yellow)
         } else if is_dirty_row {
             Style::default().fg(Color::Yellow)
-        } else if in_scope {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         } else {
             Style::default()
         };
@@ -402,11 +403,22 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 state.workspace.get_value(full_key, locale)
             };
 
+            // Per-row column directives (:? = only missing, :! = only present)
+            if !is_header {
+                match state.column_directive {
+                    ColumnDirective::MissingOnly if value.is_some() => continue,
+                    ColumnDirective::PresentOnly if value.is_none() => continue,
+                    _ => {}
+                }
+            }
+
             let is_dirty_cell = dirty_cells.contains(&(full_key, locale.as_str()));
             let tag_style = if is_selected_row {
                 Style::default()
             } else if is_temp_pinned {
                 Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+            } else if in_scope {
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
             } else if is_perm_pinned {
                 Style::default().fg(Color::Yellow)
             } else if is_dirty_cell {
