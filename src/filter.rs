@@ -322,7 +322,19 @@ pub fn evaluate(expr: &FilterExpr, key: &str, workspace: &Workspace, dirty_keys:
     match expr {
         FilterExpr::And(terms) => terms.iter().all(|t| evaluate(t, key, workspace, dirty_keys)),
         FilterExpr::Or(branches) => branches.iter().any(|t| evaluate(t, key, workspace, dirty_keys)),
-        FilterExpr::Not(inner) => !evaluate(inner, key, workspace, dirty_keys),
+        FilterExpr::Not(inner) => {
+            // Column-only terms (LocaleStatus{Any}, MissingColumns, PresentColumns,
+            // DirtyLocale) evaluate to `true` purely as a column visibility hint.
+            // Negating them must not create a row filter — `-:"de"` means "hide the
+            // de column", not "hide all keys". Return true for these cases.
+            match inner.as_ref() {
+                FilterExpr::LocaleStatus { modifier: StatusModifier::Any, .. }
+                | FilterExpr::MissingColumns
+                | FilterExpr::PresentColumns
+                | FilterExpr::DirtyLocale => true,
+                _ => !evaluate(inner, key, workspace, dirty_keys),
+            }
+        }
 
         FilterExpr::KeyPattern { pattern, mode } => match mode {
             MatchMode::Exact => key == pattern.as_str(),
@@ -823,5 +835,24 @@ mod tests {
     fn negation_column_directive_is_none() {
         // `-:?` should not produce a column directive
         assert_eq!(column_directive(&parse("-:?")), ColumnDirective::None);
+    }
+
+    #[test]
+    fn negation_column_only_locale_does_not_filter_rows() {
+        // `-:"de"` (no modifier) is column exclusion — Not(LocaleStatus{Any}).
+        // Before the fix, Not(true) = false would hide all keys.
+        // Verify the parsed shape has Any modifier (so the guard in evaluate fires).
+        let expr = parse("-:\"de\"");
+        assert!(matches!(&expr, FilterExpr::Not(inner)
+            if matches!(inner.as_ref(), FilterExpr::LocaleStatus { modifier, .. }
+                if *modifier == StatusModifier::Any)
+        ));
+        // -:? and -:! are also column-only — must not produce row filter effects
+        assert!(matches!(parse("-:?"), FilterExpr::Not(ref inner)
+            if matches!(inner.as_ref(), FilterExpr::MissingColumns)
+        ));
+        assert!(matches!(parse("-:!"), FilterExpr::Not(ref inner)
+            if matches!(inner.as_ref(), FilterExpr::PresentColumns)
+        ));
     }
 }
