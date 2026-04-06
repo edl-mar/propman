@@ -145,31 +145,48 @@ fn walk(node: &TrieNode, seg_path: &str, depth: usize, header_prefix: Option<&st
         return;
     }
 
-    // How many immediate children are keys (leaf or key-with-children)?
-    let key_child_count = node.children.values().filter(|c| c.is_key).count();
-
-    if !node.is_key && key_child_count >= 2 {
-        // Non-key branch with ≥2 key-children → emit a Header row and recurse
-        // children at the next indent level, using this node as the new context.
-        rows.push(DisplayRow::Header {
-            display: display.clone(),
-            prefix: full_key.clone(),
-            depth,
-        });
-        for (seg, child) in &node.children {
-            walk(child, &format!("{seg_path}.{seg}"), depth + 1, Some(seg_path), key_prefix, rows);
+    if !node.is_key {
+        // Collapse single-child chains into the fewest rows possible.
+        // Walk forward through consecutive single-child nodes; stop when the node has
+        // ≥2 children (branch point). We also absorb through one trailing key node —
+        // so `http → status(key) → [200, 400, …]` becomes a single Key row
+        // `http.status:` rather than a Header `http:` with a Key `.status` underneath.
+        let mut chain_path = seg_path.to_string();
+        let mut chain_node = node;
+        while chain_node.children.len() == 1 {
+            let (seg, child) = chain_node.children.iter().next().unwrap();
+            chain_path = format!("{chain_path}.{seg}");
+            chain_node = child;
+            if chain_node.is_key { break; } // absorbed a key — stop here
         }
-    } else if node.is_key {
-        // Key that also has children: already emitted as Key above.
-        // Recurse children at depth+1, using this key as the new display context.
-        for (seg, child) in &node.children {
-            walk(child, &format!("{seg_path}.{seg}"), depth + 1, Some(seg_path), key_prefix, rows);
+        let chain_display = match header_prefix {
+            Some(hp) => format!(".{}", &chain_path[hp.len() + 1..]),
+            None => chain_path.clone(),
+        };
+        let chain_full_key = format!("{key_prefix}{chain_path}");
+        if chain_node.is_key {
+            // Chain ended at a key: emit a Key row for the full collapsed path.
+            rows.push(DisplayRow::Key {
+                display: chain_display,
+                full_key: chain_full_key,
+                depth,
+            });
+        } else {
+            // Chain ended at a branch point (≥2 children): emit a Header.
+            rows.push(DisplayRow::Header {
+                display: chain_display,
+                prefix: chain_full_key,
+                depth,
+            });
+        }
+        for (seg, child) in &chain_node.children {
+            walk(child, &format!("{chain_path}.{seg}"), depth + 1, Some(&chain_path), key_prefix, rows);
         }
     } else {
-        // Single-chain or non-qualifying branch: pass depth and context through
-        // unchanged so children display their full relative path from the outer header.
+        // Key that also has children: already emitted as Key above.
+        // Children indent one level under this key row.
         for (seg, child) in &node.children {
-            walk(child, &format!("{seg_path}.{seg}"), depth, header_prefix, key_prefix, rows);
+            walk(child, &format!("{seg_path}.{seg}"), depth + 1, Some(seg_path), key_prefix, rows);
         }
     }
 }
@@ -205,14 +222,17 @@ mod tests {
 
     #[test]
     fn siblings_get_a_header() {
+        // app → confirm (single-child non-key chain) collapses into "app.confirm" header.
         let rows = build_display_rows(&keys(&["app.confirm.delete", "app.confirm.discard"]), &[]);
-        assert!(matches!(&rows[0], DisplayRow::Header { prefix, .. } if prefix == "app.confirm"));
-        assert!(matches!(&rows[1], DisplayRow::Key { display, .. } if display == ".delete"));
-        assert!(matches!(&rows[2], DisplayRow::Key { display, .. } if display == ".discard"));
+        assert_eq!(headers(&rows), vec!["app.confirm"]);
+        assert_eq!(displays(&rows), vec!["app.confirm", ".delete", ".discard"]);
+        assert_eq!(depths(&rows),   vec![0,              1,         1]);
     }
 
     #[test]
-    fn lone_key_has_no_header() {
+    fn lone_key_chain_collapses() {
+        // app → loading(key): chain absorbs the key — emits one Key row "app.loading" at depth 0,
+        // no wrapping Header for the intermediate "app" node.
         let rows = build_display_rows(&keys(&["app.loading"]), &[]);
         assert_eq!(rows.len(), 1);
         assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
@@ -220,49 +240,62 @@ mod tests {
     }
 
     #[test]
-    fn single_child_chain_collapses() {
+    fn truly_bare_key_has_no_header() {
+        // A key with no dots has no intermediate node — no Header emitted.
+        let rows = build_display_rows(&keys(&["loading"]), &[]);
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
+            if full_key == "loading" && *depth == 0));
+    }
+
+    #[test]
+    fn single_child_non_key_chain_collapses() {
+        // com → myapp → error is a chain of single-child non-key nodes; error has ≥2 children
+        // so the chain collapses into one "com.myapp.error" header.
         let rows = build_display_rows(&keys(&[
             "com.myapp.error.notfound",
             "com.myapp.error.timeout",
         ]), &[]);
-        assert!(matches!(&rows[0], DisplayRow::Header { prefix, depth, .. }
-            if prefix == "com.myapp.error" && *depth == 0));
-        assert_eq!(rows.len(), 3);
+        assert_eq!(headers(&rows), vec!["com.myapp.error"]);
+        assert_eq!(displays(&rows), vec!["com.myapp.error", ".notfound", ".timeout"]);
+        assert_eq!(depths(&rows),   vec![0,                  1,           1]);
     }
 
     #[test]
-    fn mixed_depth_siblings_no_shared_header() {
-        // app.confirm.* gets a header; app.loading stands alone — no "app:" header.
+    fn mixed_depth_siblings_share_parent_header() {
+        // app has two children (confirm, loading) so the chain doesn't collapse —
+        // app gets its own Header. confirm → [delete, discard] is a single-child chain
+        // but confirm has 2 key-children so no further collapsing there either.
         let rows = build_display_rows(&keys(&[
             "app.confirm.delete",
             "app.confirm.discard",
             "app.loading",
         ]), &[]);
-        assert_eq!(headers(&rows), vec!["app.confirm"]);
+        assert_eq!(headers(&rows), vec!["app", "app.confirm"]);
+        assert_eq!(displays(&rows), vec!["app", ".confirm", ".delete", ".discard", ".loading"]);
+        assert_eq!(depths(&rows),   vec![0,      1,          2,         2,          1]);
     }
 
     #[test]
     fn key_parent_no_duplicate_header() {
-        // app.x is both a key and a namespace parent.
-        // It should appear as exactly one Key row (no separate Header row).
+        // app → x(key-and-parent): chain absorbs x — emits Key "app.x" at depth 0 (no Header).
+        // x's children .a and .b appear at depth 1.
         let rows = build_display_rows(&keys(&["app.x", "app.x.a", "app.x.b"]), &[]);
-        let header_prefixes = headers(&rows);
-        assert!(!header_prefixes.contains(&"app.x"), "app.x is a key — no Header row expected");
-        // Key row for app.x at depth 0, children at depth 1.
-        assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
-            if full_key == "app.x" && *depth == 0));
-        assert_eq!(depths(&rows), vec![0, 1, 1]);
+        assert!(headers(&rows).is_empty(), "app.x is a key — no Header row expected");
+        assert_eq!(displays(&rows), vec!["app.x", ".a", ".b"]);
+        assert_eq!(depths(&rows),   vec![0,        1,    1]);
     }
 
     #[test]
     fn key_parent_nested_under_header() {
-        // com.err.timeout is a key AND has a child .deeper.
-        // BTreeMap sorts alphabetically so .other comes before .timeout.
+        // com → err is a single-child non-key chain; err has 2 children → collapses to "com.err".
+        // com.err.timeout is a key AND a parent; .deeper is its child.
+        // BTreeMap order: other < timeout.
         // Expected:
-        //   com.err:          Header depth 0
-        //     .other          Key    depth 1
-        //     .timeout        Key    depth 1
-        //       .deeper       Key    depth 2
+        //   com.err:    Header depth 0
+        //     .other    Key    depth 1
+        //     .timeout  Key    depth 1  (key-and-parent)
+        //       .deeper Key    depth 2
         let rows = build_display_rows(&keys(&[
             "com.err.other",
             "com.err.timeout",
@@ -270,13 +303,13 @@ mod tests {
         ]), &[]);
         assert_eq!(headers(&rows), vec!["com.err"]);
         assert_eq!(displays(&rows), vec!["com.err", ".other", ".timeout", ".deeper"]);
-        assert_eq!(depths(&rows),   vec![0,         1,        1,          2]);
+        assert_eq!(depths(&rows),   vec![0,          1,        1,          2]);
     }
 
     #[test]
     fn nested_headers() {
-        // app.a has two key-children (.e, .f) and one non-key sub-group (.b).
-        // app.a should become a Header; app.a.b should become a nested Header.
+        // app → a is a single-child non-key chain; a has 3 children → collapses to "app.a".
+        // a.b has 2 children → gets its own ".b" header (relative to app.a context).
         let rows = build_display_rows(&keys(&[
             "app.a.b.c",
             "app.a.b.d",
@@ -284,25 +317,23 @@ mod tests {
             "app.a.f",
         ]), &[]);
         assert_eq!(headers(&rows), vec!["app.a", "app.a.b"]);
-        // app.a.b header should display as ".b" (relative to app.a)
         assert!(matches!(&rows[1], DisplayRow::Header { display, depth, .. }
             if display == ".b" && *depth == 1));
-        assert_eq!(depths(&rows), vec![0, 1, 2, 2, 1, 1]);
+        assert_eq!(displays(&rows), vec!["app.a", ".b", ".c", ".d", ".e", ".f"]);
+        assert_eq!(depths(&rows),   vec![0,         1,    2,    2,    1,    1]);
     }
 
     #[test]
-    fn non_key_single_chain_shows_full_relative_path() {
-        // com.err.timeout.deeper but timeout is NOT a key.
-        // A header forms because com.err has ≥2 key-children (other, second).
-        // timeout is a single-chain non-key pass-through, so deeper inherits the
-        // com.err header context and displays as ".timeout.deeper".
+    fn non_key_single_child_absorbed_into_key_display() {
+        // com → err collapses to Header "com.err" (err has ≥2 children).
+        // Within err, timeout is a non-key single-child node whose sole child IS a key:
+        // the chain absorbs it → Key ".timeout.deeper" (no separate ".timeout" header).
         let rows = build_display_rows(&keys(&[
             "com.err.other",
             "com.err.second",
             "com.err.timeout.deeper",
         ]), &[]);
         assert_eq!(headers(&rows), vec!["com.err"]);
-        // BTreeMap order: other, second, timeout.deeper (t > s > o alphabetically: no, o < s < t)
         assert_eq!(displays(&rows), vec!["com.err", ".other", ".second", ".timeout.deeper"]);
         assert_eq!(depths(&rows),   vec![0,          1,        1,         1]);
     }

@@ -5,6 +5,7 @@ use crate::{
     workspace,
 };
 
+
 /// Rename one exact key across all locale files that contain it.
 /// Routes to `commit_cross_bundle_rename` when the bundle prefix changes.
 /// Sets `state.status_message` and stays in KeyRenaming on conflict.
@@ -76,7 +77,7 @@ pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: 
         .cloned()
         .collect();
 
-    // Conflict check: ensure no renamed key collides with an existing unrelated key.
+    // Conflict check: block if any destination key already exists.
     for k in &keys_to_rename {
         let new_k = format!("{}{}", new_prefix, &k[old_prefix.len()..]);
         if state.workspace.merged_keys.contains(&new_k) && !keys_to_rename.contains(&new_k) {
@@ -122,18 +123,20 @@ fn snapshot_and_insert(
         .filter_map(|f| f.get(old_real).map(|v| (f.locale.clone(), v.to_string())))
         .collect();
 
+    let dest_full_key = if dest_bundle.is_empty() {
+        new_real.to_string()
+    } else {
+        format!("{dest_bundle}:{new_real}")
+    };
+
     let mut missed: Vec<String> = Vec::new();
-    for (locale, value) in &collected {
-        let target = state.workspace.groups.iter().enumerate()
-            .find(|(_, g)| g.base_name == dest_bundle)
-            .and_then(|(gi, g)| {
-                g.files.iter().enumerate()
-                    .find(|(_, f)| f.locale == *locale)
-                    .map(|(fi, _)| (gi, fi))
-            });
-        match target {
-            Some((gi, fi)) => ops::insert::insert_into_file(state, gi, fi, new_real, value),
-            None => missed.push(locale.clone()),
+    for (locale, value) in collected {
+        if state.workspace.bundle_has_locale(dest_bundle, &locale) {
+            // apply_cell_value handles update-or-insert: if (dest_key, locale)
+            // already has a value it is overwritten; otherwise a new entry is inserted.
+            ops::insert::apply_cell_value(state, &dest_full_key, &locale, value);
+        } else {
+            missed.push(locale);
         }
     }
     missed
@@ -213,10 +216,11 @@ fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new
         .cloned()
         .collect();
 
-    // Conflict check: none of the new keys may already exist.
+    // Conflict check: block if any destination key already exists.
+    let move_set: std::collections::HashSet<String> = keys_to_move.iter().cloned().collect();
     for k in &keys_to_move {
         let new_k = format!("{new_prefix}{}", &k[old_prefix.len()..]);
-        if state.workspace.merged_keys.contains(&new_k) {
+        if state.workspace.merged_keys.contains(&new_k) && !move_set.contains(&new_k) {
             state.status_message = Some(format!("'{new_k}' already exists"));
             return;
         }
@@ -323,10 +327,11 @@ pub fn commit_prefix_copy(state: &mut AppState, old_prefix: &str, new_prefix: St
         .cloned()
         .collect();
 
-    // Conflict check.
+    // Conflict check: block if any destination key already exists.
+    let copy_set: std::collections::HashSet<String> = keys_to_copy.iter().cloned().collect();
     for k in &keys_to_copy {
         let new_k = format!("{new_prefix}{}", &k[old_prefix.len()..]);
-        if state.workspace.merged_keys.contains(&new_k) {
+        if state.workspace.merged_keys.contains(&new_k) && !copy_set.contains(&new_k) {
             state.status_message = Some(format!("'{new_k}' already exists"));
             return;
         }

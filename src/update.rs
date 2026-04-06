@@ -50,6 +50,65 @@ fn refresh_temp_pins(state: &mut AppState) {
     }
 }
 
+/// Ctrl+Up / Ctrl+Down: jump to the nearest sibling at the current anchor level.
+/// If no sibling exists at that level, walk one level up (same logic as Left —
+/// jump to the visible parent row if one exists, else extend k) and retry.
+/// Keeps climbing until a sibling is found or the root is reached.
+/// Restores the original cursor state when no sibling exists anywhere.
+fn sibling_nav(state: &mut AppState, forward: bool) {
+    let orig_row = state.cursor_row;
+    let mut found: Option<(usize, String)> = None; // (row, sibling_anchor_key)
+
+    loop {
+        if let Some(result) = state.find_sibling_row(forward) {
+            found = Some(result);
+            break;
+        }
+        // No sibling at this level — try one level up.
+        let max = state.key_seg_max();
+        if state.key_segment_cursor >= max {
+            break; // already at the root of this key, give up
+        }
+        state.key_segment_cursor += 1;
+        if let Some(parent_row) = state.find_anchor_row() {
+            state.cursor_row = parent_row;
+            state.key_segment_cursor = 0;
+        }
+    }
+
+    if let Some((target, sibling_anchor)) = found {
+        state.cursor_row = target;
+        // Compute k so the anchor sits at the sibling level, not at the deepest
+        // segment of the target row.  This matters for multi-segment chain
+        // headers like `copy.target:` where the sibling was found at `copy`.
+        let target_key = match &state.display_rows[target] {
+            DisplayRow::Key    { full_key, .. } => full_key.clone(),
+            DisplayRow::Header { prefix,   .. } => prefix.clone(),
+        };
+        let t_real = target_key.find(':').map_or(target_key.as_str(), |i| &target_key[i + 1..]);
+        let a_real = sibling_anchor.find(':').map_or(sibling_anchor.as_str(), |i| &sibling_anchor[i + 1..]);
+        let target_k = t_real.split('.').count().saturating_sub(a_real.split('.').count());
+        state.clamp_cursor_col();
+        state.clamp_scroll();
+        refresh_temp_pins(state); // resets key_segment_cursor to 0 via apply_filter
+        state.key_segment_cursor = target_k; // re-apply after the reset
+    } else {
+        // No sibling exists anywhere in the tree — restore and fall back to
+        // plain row movement so the cursor never gets completely stuck.
+        state.cursor_row = orig_row;
+        state.key_segment_cursor = 0;
+        let max = state.display_rows.len().saturating_sub(1);
+        if forward {
+            if state.cursor_row < max { state.cursor_row += 1; }
+        } else {
+            state.cursor_row = state.cursor_row.saturating_sub(1);
+        }
+        state.clamp_cursor_col();
+        state.clamp_scroll();
+        refresh_temp_pins(state);
+    }
+}
+
 /// Pure state transition: (AppState, Message) → AppState.
 /// No I/O, no side effects.
 ///
@@ -66,22 +125,79 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
     match (mode, msg) {
         // ── Normal mode ──────────────────────────────────────────────────────
         (Mode::Normal, Message::MoveCursorUp) => {
+            state.key_segment_cursor = 0;
             state.cursor_row = state.cursor_row.saturating_sub(1);
             state.clamp_cursor_col();
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::MoveCursorDown) => {
+            state.key_segment_cursor = 0;
             let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max {
-                state.cursor_row += 1;
-            }
+            if state.cursor_row < max { state.cursor_row += 1; }
             state.clamp_cursor_col();
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
-        (Mode::Normal | Mode::Pasting, Message::MoveCursorLeft) => {
-            // Step left, skipping locale columns that have no file in this row's bundle.
+        (Mode::Normal, Message::SiblingUp) => {
+            sibling_nav(&mut state, false);
+        }
+        (Mode::Normal, Message::SiblingDown) => {
+            sibling_nav(&mut state, true);
+        }
+        (Mode::Normal, Message::GoToFirstChild) => {
+            if let Some(target) = state.find_first_child() {
+                state.key_segment_cursor = 0;
+                state.cursor_row = target;
+                state.clamp_cursor_col();
+                state.clamp_scroll();
+                refresh_temp_pins(&mut state);
+            }
+        }
+        (Mode::Normal, Message::MoveCursorLeft) => {
+            if state.cursor_col == 0 {
+                // On the key column: move the key-segment anchor one step toward the root.
+                // If the new anchor corresponds to a visible row, jump the cursor there
+                // (k resets to 0 since the anchor IS that row).
+                let max = state.key_seg_max();
+                if state.key_segment_cursor < max {
+                    state.key_segment_cursor += 1;
+                    if let Some(target) = state.find_anchor_row() {
+                        state.cursor_row = target;
+                        state.key_segment_cursor = 0;
+                        state.clamp_cursor_col();
+                        state.clamp_scroll();
+                        refresh_temp_pins(&mut state);
+                    }
+                }
+            } else {
+                // On a locale column: step left, skipping missing locales.
+                let bundle = state.current_row_bundle().to_string();
+                let mut col = state.cursor_col.saturating_sub(1);
+                while col > 0 && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[col - 1]) {
+                    col -= 1;
+                }
+                state.cursor_col = col;
+            }
+        }
+        (Mode::Normal, Message::MoveCursorRight) => {
+            if state.cursor_col == 0 && state.key_segment_cursor > 0 {
+                // On the key column with anchor extended: retract one step toward the leaf.
+                state.key_segment_cursor -= 1;
+            } else {
+                // Move to the next locale column, skipping missing locales.
+                let bundle = state.current_row_bundle().to_string();
+                let max = state.visible_locales.len();
+                let mut col = state.cursor_col + 1;
+                while col <= max && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[col - 1]) {
+                    col += 1;
+                }
+                if col <= max {
+                    state.cursor_col = col;
+                }
+            }
+        }
+        (Mode::Pasting, Message::MoveCursorLeft) => {
             let bundle = state.current_row_bundle().to_string();
             let mut col = state.cursor_col.saturating_sub(1);
             while col > 0 && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[col - 1]) {
@@ -89,8 +205,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
             state.cursor_col = col;
         }
-        (Mode::Normal | Mode::Pasting, Message::MoveCursorRight) => {
-            // Step right, skipping locale columns that have no file in this row's bundle.
+        (Mode::Pasting, Message::MoveCursorRight) => {
             let bundle = state.current_row_bundle().to_string();
             let max = state.visible_locales.len();
             let mut col = state.cursor_col + 1;
@@ -102,12 +217,14 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (Mode::Normal, Message::PageUp) => {
+            state.key_segment_cursor = 0;
             state.cursor_row = state.cursor_row.saturating_sub(20);
             state.clamp_cursor_col();
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::PageDown) => {
+            state.key_segment_cursor = 0;
             let max = state.display_rows.len().saturating_sub(1);
             state.cursor_row = (state.cursor_row + 20).min(max);
             state.clamp_cursor_col();
@@ -115,6 +232,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             refresh_temp_pins(&mut state);
         }
         (_, Message::JumpToPrevBundle) => {
+            state.key_segment_cursor = 0;
             // Find the nearest bundle-level header strictly above the cursor.
             let target = (0..state.cursor_row).rev().find(|&i| {
                 matches!(&state.display_rows[i],
@@ -128,6 +246,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (_, Message::JumpToNextBundle) => {
+            state.key_segment_cursor = 0;
             // Find the nearest bundle-level header strictly below the cursor.
             let target = (state.cursor_row + 1..state.display_rows.len()).find(|&i| {
                 matches!(&state.display_rows[i],
@@ -140,6 +259,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 state.clamp_scroll();
             }
         }
+
         (_, Message::CycleScope) => {
             state.selection_scope = state.selection_scope.cycle();
             // In Normal mode: refresh temp pins live (ChildrenAll gives an immediate
@@ -237,11 +357,49 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 Some(DisplayRow::Header { prefix,   .. }) => prefix.clone(),
                 None => return state,
             };
-            if state.pinned_keys.contains(&key) {
-                state.pinned_keys.remove(&key);
-            } else {
-                state.pinned_keys.insert(key);
+
+            // Decide pin (true) or unpin (false) based on cursor key's current state.
+            let pin = !state.pinned_keys.contains(&key);
+
+            // Collect all keys in scope.
+            let dot_prefix = format!("{key}.");
+            let affected: Vec<String> = match state.selection_scope {
+                SelectionScope::Exact => vec![key],
+                SelectionScope::Children => {
+                    let mut keys = vec![key.clone()];
+                    keys.extend(
+                        state.display_rows.iter().filter_map(|r| match r {
+                            DisplayRow::Key { full_key, .. }
+                                if full_key.starts_with(&dot_prefix) => Some(full_key.clone()),
+                            _ => None,
+                        })
+                    );
+                    keys
+                }
+                SelectionScope::ChildrenAll => {
+                    let mut keys = vec![key.clone()];
+                    keys.extend(
+                        state.workspace.merged_keys.iter()
+                            .filter(|k| k.starts_with(&dot_prefix))
+                            .cloned()
+                    );
+                    keys
+                }
+            };
+
+            let count = affected.len();
+            let label = affected.first().cloned().unwrap_or_default();
+            for k in affected {
+                if pin { state.pinned_keys.insert(k); } else { state.pinned_keys.remove(&k); }
             }
+
+            let action = if pin { "Pinned" } else { "Unpinned" };
+            state.status_message = Some(if count == 1 {
+                format!("{action} {label}")
+            } else {
+                format!("{action} {count} keys")
+            });
+
             state.apply_filter();
         }
         (Mode::Normal, Message::YankCell) => {

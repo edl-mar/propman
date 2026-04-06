@@ -94,6 +94,11 @@ pub clipboard: HashMap<String, Vec<String>>, // per-locale yank history; newest 
 pub clipboard_last: Option<String>,  // most recently yanked value; used for Ctrl+P quick-paste
 pub paste_locale_cursor: usize,      // focused column in the paste panel
 pub paste_history_pos: HashMap<String, usize>, // per-locale > marker position in paste panel
+// Key-segment cursor
+pub key_segment_cursor: usize,       // depth offset from cursor key toward root.
+                                     // k=0 = anchor at full key (default, last segment
+                                     // highlighted); k=1 = one level above; max = total_segs-1.
+                                     // Reset to 0 on row change or filter change.
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -196,6 +201,50 @@ navigable. `cursor_col` indexes into `visible_locales` offset by 1 (col 0 is
 the key column). `<missing>` in red marks cells where the key is absent from
 that locale file. Bundle-level Header locale cells show `[locale]` in dark
 gray (navigable, but no stored value).
+
+The logical cursor in the key column is two-dimensional:
+`(cursor_row, key_segment_cursor)`. `key_segment_cursor` (k) is a depth offset
+from the current row's full key toward the bundle root:
+
+- k=0 → anchor = full key (last/deepest segment highlighted — the default)
+- k=1 → anchor = one dot-segment above the full key
+- k=max → anchor = bundle name (top-level segment)
+
+The highlighted anchor is always visible: the segment(s) at or below the anchor
+are rendered in the selection style; segments above it are dimmed.
+
+**Key navigation (col 0 in Normal mode)**
+
+`←` (Left): walk the anchor toward root — increments k and jumps the real
+cursor to the anchor row in the table (the Header or Key whose key == anchor).
+At k=max there is no parent row to jump to (the anchor is the bundle itself).
+
+`→` (Right): when k>0, walk the anchor back toward leaf (decrements k). At k=0
+the right arrow moves `cursor_col` to the first locale column.
+
+`Ctrl+↑` / `Ctrl+↓` (SiblingUp / SiblingDown): navigate to the previous/next
+sibling at the current anchor level. If no sibling exists in the current subtree,
+the navigation auto-climbs one level (same as Left) until a sibling is found or
+the root is reached; if still none, falls back to plain row movement. Landing on
+a multi-segment header preserves the correct k so the anchor stays at the
+sibling's level, not at the header's deepest segment.
+
+`Ctrl+→` (GoToFirstChild): jump to the first row whose key starts with
+`{anchor}.`, and reset k=0.
+
+`↑` / `↓` (row movement): move one display row; reset k=0.
+
+**Key-segment helpers (state.rs)**
+
+`key_seg_max()` → `total_segs - 1` (max valid k for the current row).
+`key_seg_anchor()` → the bundle-qualified key string at depth `total - k`.
+`find_sibling_row(forward)` → `Option<(usize, String)>` — row index and sibling
+anchor key for the next/prev sibling at the current anchor level.
+`find_anchor_row()` → `Option<usize>` — row (≠ cursor_row) whose key == anchor.
+`find_first_child()` → `Option<usize>` — first row starting with `{anchor}.`.
+
+`apply_filter` resets `key_segment_cursor = 0`. `sibling_nav` works around this
+by computing `target_k` before calling `refresh_temp_pins` and re-applying it after.
 
 **Filter system**
 The filter bar is always visible. `/` focuses it. The bar is backed by a
@@ -385,7 +434,11 @@ Char keys so `\`, `@`, `[`, `]` etc. work correctly.
 ```
 Normal:       ↑↓←→ / hjkl navigate  PgUp/PgDn
               Shift+↑/↓   jump to prev/next bundle
-              Enter        edit value (locale col) or rename key (col 0)
+              ← (col 0)    walk anchor toward root (increment k, jump to anchor row)
+              → (col 0)    walk anchor toward leaf (decrement k); at k=0 move to locale col
+              Ctrl+↑/↓    sibling navigation at anchor level (auto-climbs if no sibling)
+              Ctrl+→       jump to first child of anchor
+              Enter        edit value (locale col) or open rename editor (col 0)
               n            new key / new locale (bundle header col 0) / new locale-targeted key (bundle header col>0)
               N            new bundle
               d            yank+delete locale entry (locale col) or enter Deleting (col 0)
@@ -410,7 +463,7 @@ KeyNaming:    Enter confirm  Esc cancel
               Ctrl+S save  Ctrl+C quit
               (all other keys → TextArea)
 
-KeyRenaming:  Enter confirm  Ctrl+P copy  Tab scope  Esc cancel
+KeyRenaming:  Enter move  Ctrl+Enter copy  Tab scope  Esc cancel
               Ctrl+S save  Ctrl+C quit
               (all other keys → TextArea)
 

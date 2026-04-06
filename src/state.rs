@@ -161,6 +161,10 @@ pub struct AppState {
     pub paste_locale_cursor: usize,
     /// Per-locale position in the history list (the `>` marker in paste mode).
     pub paste_history_pos: std::collections::HashMap<String, usize>,
+    /// How many dot-segments above the row's natural display the key-segment cursor
+    /// has been extended with Ctrl+Left.  0 = show only the row's own display suffix.
+    /// Resets to 0 on any row movement or filter change.
+    pub key_segment_cursor: usize,
 }
 
 impl AppState {
@@ -207,6 +211,7 @@ impl AppState {
     /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
     /// then clamps the cursor to the new bounds.
     pub fn apply_filter(&mut self) {
+        self.key_segment_cursor = 0;
         // Remember the selected key so we can restore cursor position after rebuild.
         let selected_key: Option<String> = match self.display_rows.get(self.cursor_row) {
             Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.clone()),
@@ -346,6 +351,175 @@ impl AppState {
             clipboard_last: None,
             paste_locale_cursor: 0,
             paste_history_pos: std::collections::HashMap::new(),
+            key_segment_cursor: 0,
         }
+    }
+
+    /// The maximum value `key_segment_cursor` can reach for the current cursor row.
+    /// Equal to `total_segments - 1` so the user can walk the anchor all the way
+    /// up to the first segment, regardless of how many segments are already shown
+    /// in the collapsed display.  Works for both Key and Header rows.
+    pub fn key_seg_max(&self) -> usize {
+        let full_key = match self.display_rows.get(self.cursor_row) {
+            Some(DisplayRow::Key    { full_key, .. }) => full_key.as_str(),
+            Some(DisplayRow::Header { prefix,   .. }) => prefix.as_str(),
+            _ => return 0,
+        };
+        let real = full_key.find(':').map_or(full_key, |i| &full_key[i + 1..]);
+        real.split('.').count().saturating_sub(1)
+    }
+
+    /// The "anchor" full_key the key-segment cursor points to.
+    /// With `key_segment_cursor == 0` this is the row's own full_key / prefix.
+    /// With `key_segment_cursor == k` it is the ancestor k levels above the row's key
+    /// (i.e. the first `total - k` segments).  Works for both Key and Header rows.
+    pub fn key_seg_anchor(&self) -> Option<String> {
+        let full_key = match self.display_rows.get(self.cursor_row)? {
+            DisplayRow::Key    { full_key, .. } => full_key.as_str(),
+            DisplayRow::Header { prefix,   .. } => prefix.as_str(),
+        };
+        let k = self.key_segment_cursor;
+        if k == 0 {
+            return Some(full_key.to_string());
+        }
+        let colon      = full_key.find(':');
+        let real       = colon.map_or(full_key, |i| &full_key[i + 1..]);
+        let bundle_pfx = colon.map_or("", |i| &full_key[..=i]);
+        let segs: Vec<&str> = real.split('.').collect();
+        let take = segs.len().saturating_sub(k).max(1);
+        Some(format!("{}{}", bundle_pfx, segs[..take].join(".")))
+    }
+
+    /// Return the full_key / prefix string for an arbitrary display row (not just the
+    /// cursor row).  Used by sibling-navigation helpers.
+    fn row_key_at(&self, idx: usize) -> &str {
+        match self.display_rows.get(idx) {
+            Some(DisplayRow::Key    { full_key, .. }) => full_key.as_str(),
+            Some(DisplayRow::Header { prefix,   .. }) => prefix.as_str(),
+            None => "",
+        }
+    }
+
+    /// Find the row index of the nearest previous (forward=false) or next
+    /// (forward=true) sibling at the current key-segment anchor level.
+    ///
+    /// "Sibling" means a row whose key shares the same parent prefix as the anchor
+    /// but has a different immediate child segment.  For the forward direction we
+    /// return the first such row; for the backward direction we return the topmost
+    /// row of the nearest previous sibling subtree (so Up lands on the header/first
+    /// entry of that group, not the last entry we happen to pass first).
+    ///
+    /// Returns `None` when no sibling exists in that direction.
+    pub fn find_sibling_row(&self, forward: bool) -> Option<(usize, String)> {
+        let anchor = self.key_seg_anchor()?;
+
+        let colon = anchor.find(':');
+        let real = colon.map_or(anchor.as_str(), |i| &anchor[i + 1..]);
+        let bundle_pfx = colon.map_or("", |i| &anchor[..=i]);
+
+        // Determine the sibling prefix and the anchor's own segment.
+        // When the anchor is a top-level bundle key (no dot in real), the "parent"
+        // is the bundle itself, so siblings share the bundle prefix.
+        let (sibling_prefix, anchor_seg) = if let Some(dot_pos) = real.rfind('.') {
+            let parent_real = &real[..dot_pos];
+            let seg = &real[dot_pos + 1..];
+            (format!("{bundle_pfx}{parent_real}."), seg.to_string())
+        } else if !bundle_pfx.is_empty() {
+            (bundle_pfx.to_string(), real.to_string())
+        } else {
+            return None; // no bundle and no dot — can't find siblings
+        };
+
+        let n = self.display_rows.len();
+        let start = self.cursor_row;
+
+        if forward {
+            for i in (start + 1)..n {
+                let rk = self.row_key_at(i);
+                if rk.starts_with(&sibling_prefix) {
+                    let seg = rk[sibling_prefix.len()..].split('.').next().unwrap_or("");
+                    if seg != anchor_seg {
+                        let sibling_anchor = format!("{sibling_prefix}{seg}");
+                        return Some((i, sibling_anchor));
+                    }
+                }
+            }
+        } else {
+            // Scan backward: collect the topmost row of the nearest previous sibling.
+            let mut target_seg: Option<String> = None;
+            let mut found: Option<usize> = None;
+
+            for i in (0..start).rev() {
+                let rk = self.row_key_at(i);
+                if rk.starts_with(&sibling_prefix) {
+                    let seg = rk[sibling_prefix.len()..].split('.').next().unwrap_or("").to_string();
+                    if seg == anchor_seg {
+                        continue; // still inside current sibling's subtree
+                    }
+                    match &target_seg {
+                        None => { target_seg = Some(seg); found = Some(i); }
+                        Some(ts) if *ts == seg => { found = Some(i); } // earlier row of same sibling
+                        _ => break, // entered a different sibling — stop
+                    }
+                }
+            }
+            if let (Some(i), Some(seg)) = (found, target_seg) {
+                let sibling_anchor = format!("{sibling_prefix}{seg}");
+                return Some((i, sibling_anchor));
+            }
+        }
+
+        None
+    }
+
+    /// Find the display row whose full_key / prefix exactly equals the current anchor,
+    /// excluding the cursor row itself.  Used by Left navigation to jump the cursor
+    /// to a parent row when it has a visible display entry.
+    pub fn find_anchor_row(&self) -> Option<usize> {
+        let anchor = self.key_seg_anchor()?;
+        self.display_rows.iter().enumerate().find_map(|(i, row)| {
+            if i == self.cursor_row { return None; }
+            let rk = match row {
+                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
+                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
+            };
+            if rk == anchor { Some(i) } else { None }
+        })
+    }
+
+    /// Find the first row that is a direct or indirect child of the current anchor.
+    /// Searches the entire display list so it works even when the anchor's subtree
+    /// starts before the cursor row (e.g. when k > 0).
+    pub fn find_first_child(&self) -> Option<usize> {
+        let anchor = self.key_seg_anchor()?;
+        let child_prefix = format!("{anchor}.");
+        self.display_rows.iter().position(|row| {
+            let rk = match row {
+                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
+                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
+            };
+            rk.starts_with(&child_prefix)
+        })
+    }
+
+    /// The dimmed prefix string to display before the row's natural display text
+    /// when `key_segment_cursor > 0`.  Returns `None` when there is nothing extra to show.
+    /// Works for both Key and Header rows.
+    pub fn key_seg_extended_prefix(&self) -> Option<String> {
+        let k = self.key_segment_cursor;
+        if k == 0 { return None; }
+        let (full_key, display) = match self.display_rows.get(self.cursor_row)? {
+            DisplayRow::Key    { full_key, display, .. } => (full_key.as_str(), display.as_str()),
+            DisplayRow::Header { prefix,   display, .. } => (prefix.as_str(),   display.as_str()),
+        };
+        let real = full_key.find(':').map_or(full_key, |i| &full_key[i + 1..]);
+        let segs: Vec<&str> = real.split('.').collect();
+        let total        = segs.len();
+        let shown        = display.trim_start_matches('.').split('.').count();
+        let k            = k.min(total.saturating_sub(shown));
+        if k == 0 { return None; }
+        let anchor_left  = total - shown - k;
+        let context_left = total - shown;
+        Some(segs[anchor_left..context_left].join("."))
     }
 }

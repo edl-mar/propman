@@ -173,7 +173,7 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
         format!(" new locale for [{full_key}] ")
     } else if matches!(state.mode, Mode::KeyRenaming) {
         let scope = state.selection_scope.label();
-        format!(" rename · {full_key} [{scope}] ")
+        format!(" rename · {full_key} [{scope}] · Enter=move  Ctrl+Enter=copy  Tab=scope ")
     } else if matches!(state.mode, Mode::Deleting) {
         let scope = state.selection_scope.label();
         format!(" delete · {full_key} [{scope}] ")
@@ -348,6 +348,77 @@ fn draw_filter_bar(f: &mut Frame, area: Rect, state: &AppState) {
     }
 }
 
+/// Build per-segment styled spans for the key column.
+///
+/// Each dot-segment of the display string is checked against `scope_anchor`:
+/// a segment at absolute key K is highlighted (using `select_style`) when
+/// K == anchor or K starts with `{anchor}.` (i.e. it is a descendant-or-equal).
+/// All other segments use `base_style`.
+///
+/// When `scope_anchor` is None or the row is not in the current selection,
+/// a single span is returned (fast path — avoids per-segment work).
+fn make_key_spans(
+    indent: &str,
+    flags: &str,
+    display: &str,
+    full_key: &str,   // full_key for Key rows, prefix for Header rows
+    is_header: bool,
+    scope_anchor: Option<&str>,
+    row_in_selection: bool,
+    select_style: Style,
+    base_style: Style,
+) -> Vec<Span<'static>> {
+    let trailer = if is_header { ":" } else { ": " };
+
+    // Fast path — no per-segment work needed.
+    let Some(anchor) = scope_anchor.filter(|_| row_in_selection) else {
+        let style = if row_in_selection { select_style } else { base_style };
+        return vec![
+            Span::raw(indent.to_string()),
+            Span::styled(format!("{flags}{display}{trailer}"), style),
+        ];
+    };
+
+    // Per-segment path.
+    let colon_pos = full_key.find(':');
+    let real = colon_pos.map_or(full_key, |i| &full_key[i + 1..]);
+    let bundle_prefix = colon_pos.map_or("", |i| &full_key[..=i]);
+    let all: Vec<&str> = real.split('.').collect();
+    let total = all.len();
+
+    let has_leading_dot = display.starts_with('.');
+    let clean = display.trim_start_matches('.');
+    let names: Vec<&str> = clean.split('.').collect();
+    let shown = names.len();
+    let ctx = total - shown; // index in all[] of the first displayed segment
+
+    let anchor_dot = format!("{anchor}.");
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::raw(indent.to_string()));
+
+    if !flags.is_empty() {
+        spans.push(Span::styled(flags.to_string(), base_style));
+    }
+
+    for (i, name) in names.iter().enumerate() {
+        let abs_key = format!("{}{}", bundle_prefix, all[..=ctx + i].join("."));
+        let highlighted = abs_key == anchor || abs_key.starts_with(&anchor_dot);
+        let sep = if i == 0 && !has_leading_dot { "" } else { "." };
+        let style = if highlighted { select_style } else { base_style };
+        spans.push(Span::styled(format!("{sep}{name}"), style));
+    }
+
+    // Trailer gets select_style when the row's full key is at/below the anchor.
+    let full_highlighted = full_key == anchor || full_key.starts_with(&anchor_dot);
+    spans.push(Span::styled(
+        trailer.to_string(),
+        if full_highlighted { select_style } else { base_style },
+    ));
+
+    spans
+}
+
 fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     if state.workspace.groups.is_empty() {
         f.render_widget(
@@ -378,18 +449,28 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    // Compute the scope prefix for subtree highlighting.
-    // Used for both +children (cyan) and +children all (cyan for visible, green for temp-pinned).
-    let scope_prefix: Option<String> = if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting)
-        && matches!(state.selection_scope, SelectionScope::Children | SelectionScope::ChildrenAll)
-    {
+    // scope_anchor: the tree node the key-segment cursor points to.
+    // Always computed in Normal/KeyRenaming/Deleting so that per-segment highlighting
+    // is active even at k=0 (cursor rests on the deepest/last segment by default).
+    let scope_anchor: Option<String> = if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting) {
         match state.display_rows.get(state.cursor_row) {
-            Some(DisplayRow::Key    { full_key, .. }) => Some(format!("{full_key}.")),
-            Some(DisplayRow::Header { prefix,   .. }) => Some(format!("{prefix}.")),
+            Some(DisplayRow::Key { .. } | DisplayRow::Header { .. }) => state.key_seg_anchor(),
             None => None,
         }
     } else {
         None
+    };
+    // scope_prefix ("{anchor}.") drives +children sibling/child highlighting.
+    let scope_prefix: Option<String> = if matches!(state.selection_scope, SelectionScope::Children | SelectionScope::ChildrenAll) {
+        scope_anchor.as_ref().map(|a| format!("{a}."))
+    } else {
+        None
+    };
+    // cursor_full_key_str is used in the on_path check inside the render loop.
+    let cursor_full_key_str: Option<&str> = match state.display_rows.get(state.cursor_row) {
+        Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.as_str()),
+        Some(DisplayRow::Header { prefix,   .. }) => Some(prefix.as_str()),
+        _ => None,
     };
 
     for (row_idx, display_row) in state
@@ -401,32 +482,42 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     {
         let is_selected_row = row_idx == state.cursor_row;
 
-        // A row is "in scope" when +children is active and its key is a child
-        // of the cursor row.
-        let in_scope = scope_prefix.as_ref().map_or(false, |p| {
-            let row_key = match display_row {
-                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
-                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
-            };
-            row_key.starts_with(p.as_str())
-        });
+        let row_key = match display_row {
+            DisplayRow::Key    { full_key, .. } => full_key.as_str(),
+            DisplayRow::Header { prefix,   .. } => prefix.as_str(),
+        };
 
-        // Resolve key text, full key for lookups, and indentation.
-        let (indent, key_text, full_key, is_header) = match display_row {
+        // in_scope: [+children] is active and this row is a descendant of the anchor.
+        let in_scope = scope_prefix.as_ref().map_or(false, |p| row_key.starts_with(p.as_str()));
+
+        // on_path: this row is an ancestor of the cursor that lies on the path between
+        // the cursor and the anchor (inclusive).  Naturally false when k=0 because no
+        // ancestor can equal-or-start-with the cursor's full key.
+        let on_path = !is_selected_row
+            && cursor_full_key_str.map_or(false, |ck| {
+                let anchor = match scope_anchor.as_deref() { Some(a) => a, None => return false };
+                // Row must be a proper ancestor of the cursor key.
+                ck.starts_with(&format!("{row_key}."))
+                // Row must also be at-or-below the anchor (within the selected subtree).
+                && (row_key == anchor || row_key.starts_with(&format!("{anchor}.")))
+            });
+
+        // Resolve display string, flags, full key, and indentation.
+        let (indent, flags, display_ref, full_key, is_header) = match display_row {
             DisplayRow::Header { display, prefix, depth } => {
-                (
-                    "  ".repeat(*depth),
-                    format!("{display}:"),
-                    prefix.as_str(),
-                    true,
-                )
+                ("  ".repeat(*depth), String::new(), display.as_str(), prefix.as_str(), true)
             }
             DisplayRow::Key { display, full_key, depth } => {
-                let indent = "  ".repeat(*depth);
                 let dangling = if state.workspace.is_dangling(full_key) { "*" } else { "" };
                 let dirty   = if state.dirty_keys.contains(full_key.as_str()) { "#" } else { "" };
                 let pinned  = if state.pinned_keys.contains(full_key.as_str()) { "@" } else { "" };
-                (indent, format!("{dangling}{dirty}{pinned}{display}: "), full_key.as_str(), false)
+                (
+                    "  ".repeat(*depth),
+                    format!("{dangling}{dirty}{pinned}"),
+                    display.as_str(),
+                    full_key.as_str(),
+                    false,
+                )
             }
         };
 
@@ -439,18 +530,24 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         // locale columns — the bundle name is not itself a translatable key.
         let is_bundle_header = is_header && state.workspace.is_bundle_name(full_key);
 
-        // Key / prefix column (cursor_col == 0).
-        let key_col_style = if is_selected_row && state.cursor_col == 0 {
+        // The "select" style for highlighted segments and the "base" style for
+        // everything else.  select_style varies by role (cursor vs on_path/in_scope);
+        // base_style encodes row type (header, dirty, pinned, …).
+        let select_style = if is_selected_row && state.cursor_col == 0 {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if is_header {
-            Style::default().fg(Color::DarkGray)
         } else if is_selected_row {
+            // Cursor on a locale column — key text is bold but not reversed.
             Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            // on_path or in_scope: white-background highlight without BOLD so
+            // the cursor row still stands out as the "active" entry.
+            Style::default().add_modifier(Modifier::REVERSED)
+        };
+
+        let base_style = if is_header {
+            Style::default().fg(Color::DarkGray)
         } else if is_temp_pinned {
-            // Temp-pinned = hidden child surfaced by +children all; always in scope.
             Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
-        } else if in_scope {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
         } else if is_perm_pinned {
             Style::default().fg(Color::Yellow)
         } else if is_dirty_row {
@@ -459,7 +556,19 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             Style::default()
         };
 
-        let mut spans = vec![Span::raw(indent), Span::styled(key_text, key_col_style)];
+        let row_in_selection = is_selected_row || on_path || in_scope;
+
+        let mut spans = make_key_spans(
+            &indent,
+            &flags,
+            display_ref,
+            full_key,
+            is_header,
+            scope_anchor.as_deref(),
+            row_in_selection,
+            select_style,
+            base_style,
+        );
 
         if is_bundle_header {
             // Render a [locale] tag for each locale that belongs to this bundle.
@@ -585,7 +694,7 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
             Mode::KeyNaming    => "  Enter confirm key name  Esc cancel".into(),
             Mode::BundleNaming => "  Enter create bundle  Esc cancel".into(),
             Mode::LocaleNaming => "  Enter create locale file  Esc cancel".into(),
-            Mode::KeyRenaming  => "  Enter move  Ctrl+P copy  Tab scope  Esc cancel".into(),
+            Mode::KeyRenaming  => "  Enter move  Ctrl+Enter copy  Tab scope  Esc cancel".into(),
             Mode::Deleting     => "  Enter confirm  Esc cancel".into(),
             Mode::Filter       => "  Enter/Esc/↑↓ exit filter".into(),
             Mode::Pasting      => "  Ctrl+←→ locale  Ctrl+↑↓ history  d remove  p paste last  Ctrl+P paste (stay)  Enter paste all  Ctrl+Enter paste all (stay)  Ctrl+Y yank→locale  Esc cancel".into(),

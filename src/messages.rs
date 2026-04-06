@@ -89,4 +89,17 @@ pub enum Message {
     PasteHere,
     /// Ctrl+Y in paste mode — yank the current cell's value into the panel-focused locale's history.
     YankToFocusedLocale,
+    // ── Key-segment cursor ───────────────────────────────────────────────────
+    /// Ctrl+Left in Normal mode — extend the key-segment cursor one segment to the left
+    /// (includes one more dot-segment of the key path in the visual selection anchor).
+    KeySegCursorLeft,
+    /// Ctrl+Right in Normal mode — shrink the key-segment cursor back one segment,
+    /// down to 0 (the row's own display suffix).
+    KeySegCursorRight,
+    /// Ctrl+Up — jump to the first row of the previous sibling at the anchor level.
+    SiblingUp,
+    /// Ctrl+Down — jump to the first row of the next sibling at the anchor level.
+    SiblingDown,
+    /// Ctrl+Right — jump to the first child of the current anchor.
+    GoToFirstChild,
 }

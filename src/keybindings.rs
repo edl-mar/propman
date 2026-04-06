@@ -60,6 +60,9 @@ pub fn default_keybindings() -> Keybindings {
         (KeyCode::Char('y'),      ctrl) => Message::YankAndOpenPaste,
         (KeyCode::Char('p'),      none) => Message::OpenPaste,
         (KeyCode::Char('p'),      ctrl) => Message::QuickPaste,
+        (KeyCode::Up,             ctrl) => Message::SiblingUp,
+        (KeyCode::Down,           ctrl) => Message::SiblingDown,
+        (KeyCode::Right,          ctrl) => Message::GoToFirstChild,
     ];
 
     let editing = map![
@@ -90,7 +93,7 @@ pub fn default_keybindings() -> Keybindings {
 
     let key_renaming = map![
         (KeyCode::Enter,          none) => Message::CommitKeyRename,
-        (KeyCode::Char('p'),      ctrl) => Message::CommitKeyCopy,
+        (KeyCode::Enter,          ctrl) => Message::CommitKeyCopy,
         (KeyCode::Tab,            none) => Message::CycleScope,
         (KeyCode::Up,             none) => Message::MoveCursorUp,
         (KeyCode::Down,           none) => Message::MoveCursorDown,
