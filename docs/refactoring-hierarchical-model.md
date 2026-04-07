@@ -43,12 +43,15 @@ property that makes rendering and navigation simple (see below).
 
 ```rust
 struct Entry {
-    segments: Vec<String>,          // real key split on '.', e.g. ["app","title"]
-    cells:    Vec<LocaleCell>,      // one per locale in BundleModel.locales
-    // derived / pre-computed for rendering:
+    segments:      Vec<String>,             // real key split on '.', e.g. ["app","title"]
+    cells:         Vec<LocaleCell>,         // one per locale in BundleModel.locales
+    intro_headers: Vec<MergedSegmentRef>,   // merged_segments whose first_entry == this entry,
+                                            // ordered shallowest to deepest.
+                                            // The renderer emits one header line per element,
+                                            // then the key line. See docs/group-merge.md.
     is_dirty:  bool,
     is_pinned: bool,
-    flags:     EntryFlags,          // dangling, temp-pinned, etc.
+    flags:     EntryFlags,                  // dangling, temp-pinned, etc.
 }
 
 struct LocaleCell {
@@ -57,14 +60,18 @@ struct LocaleCell {
 }
 ```
 
+`intro_headers` is the only rendering-related field on `Entry`. The entry itself
+has no concept of how many visual lines it will produce — that is entirely the
+renderer's concern. The render model carries no separate header rows.
+
 ### Cursor
 
 ```rust
 struct Cursor {
     bundle:   Option<String>,  // None = bare/legacy key space
     segments: Vec<String>,     // [] = bundle header level
-                               // ["app"] = within-bundle group/header level
-                               // ["app","title"] = specific key
+                               // ["app"] = a group/header position (may have no entry)
+                               // ["app","title"] = specific key entry
     locale:   Option<String>,  // None = key column; Some("de") = locale column
 }
 ```
@@ -74,9 +81,15 @@ The cursor IS its own identity. No separate `preferred_locale` field is needed �
 available locale but leaves `cursor.locale` unchanged so it restores automatically
 when a matching bundle is reached.
 
+The cursor can point to positions that have no corresponding entry — e.g.
+`segments = ["http","status","detail","something"]` references a group header
+even when no key `http.status.detail.something` exists in any file. This is
+the clean split: cursor on a group = navigating structure; cursor on an entry
+= operating on a value.
+
 `cursor_row: usize` is reduced to a pure rendering detail (for scroll offset and
-`draw_table`). It is derived from the cursor by finding the matching entry in the
-bundle model — never stored in `AppState`.
+`draw_table`). It is never stored in `AppState`; the renderer counts visual lines
+to find the scroll position of the cursor.
 
 ## Navigation Simplifications
 
@@ -97,23 +110,52 @@ The `segment` offset `k` in `CursorSection::Key { segment }` folds into
 `cursor.segments.len()`: walking toward root = `cursor.segments.pop()`,
 toward leaf = `cursor.segments.push(next_seg)`.
 
-## Rendering Simplifications
+## Rendering
 
-With entries sorted and segments pre-split, the trie in `render_model.rs` is not
-needed. The display structure is derived in a single linear pass:
+### No separate header rows
 
-For each entry `i`, compare `entry[i].segments` with `entry[i-1].segments`:
-- **Shared prefix length** = first index where they differ → indentation depth
-- **Visible segments** = `entry[i].segments[shared_prefix_len..]` → display text
-- **Is parent** = `entry[i+1].segments.starts_with(entry[i].segments)` → header marker
+The render model contains only actual key entries — one per translatable key.
+There are no `Header` / `Key` row variants. Visual group headers are a rendering
+detail, not a model concern.
 
-Chain collapsing (e.g. `detail.something:` as one visual node) is handled by a
-one-entry lookahead: at each new depth level being introduced, check whether all
-entries in the upcoming range share the same segment at that depth. If so, it is a
-single-child chain — merge it with the next level into one display label.
+### How the renderer produces multiple lines per entry
 
-See `docs/group-merge.md` for a more general algorithm that detects these chains
-and has additional uses (structural highlighting, cursor group identity).
+Each entry carries `intro_headers: Vec<MergedSegmentRef>` (computed by the
+group-merge scan pass, see `docs/group-merge.md`). When the renderer reaches
+an entry it emits:
+
+1. One header line per element of `intro_headers` (the merged_segment's label
+   and visual depth).
+2. One key line for the entry itself (segments, locale cells).
+
+The entry does not know how many lines it will produce. The renderer iterates
+entries 1:1 and expands them. For example, the entry
+`[http, status, detail, something, msg, firstmessage]` has
+`intro_headers = [MS_detail·something, US_msg]` and produces three lines:
+
+```
+    .detail.something:          ← intro_header line 1
+      .msg:                     ← intro_header line 2
+        .firstmessage  [de] …   ← key line
+```
+
+### Chain collapsing — why a single lookahead is not sufficient
+
+A naive "compare adjacent entries" approach determines depth and display text
+correctly but cannot detect single-child chains with only one entry of lookahead.
+The chain `detail → something` spans entries 8–10; when the renderer reaches
+entry 8, it cannot tell from entry 9 alone that `detail` will never have any
+child other than `something`. The group-merge scan, which runs before rendering,
+resolves this by tracking distinct children per open group and firing merges when
+a group closes.
+
+### Visual depth
+
+Visual depth = real segment depth minus the number of depths absorbed by merged
+chains above the current node on the path from root. Each `MergedSegment`
+carries an `absorbed` count (number of unique_segments in its chain minus 1).
+This is pre-computed during the scan pass and stored on the `MergedSegment`,
+so the renderer reads it directly.
 
 ## Refactoring Order
 
