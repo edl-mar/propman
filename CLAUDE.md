@@ -66,7 +66,10 @@ pub display_rows: Vec<DisplayRow>,   // rebuilt on every filter/edit change
 pub visible_locales: Vec<String>,    // subset of all_locales() when locale
                                      // selector is active; full list otherwise
 pub cursor_row: usize,               // index into display_rows
-pub cursor_col: usize,               // 0 = key column, 1..=n = visible_locales[n-1]
+pub cursor_section: CursorSection,   // Key { segment } | Locale(idx); replaces the old
+                                     // cursor_col + key_segment_cursor pair
+pub preferred_locale: Option<String>, // sticky locale: set on explicit navigation,
+                                     // restored by clamp_cursor_section when possible
 pub scroll_offset: usize,
 pub mode: Mode,
 pub filter_textarea: TextArea<'static>, // always present; lines()[0] is the query
@@ -94,11 +97,6 @@ pub clipboard: HashMap<String, Vec<String>>, // per-locale yank history; newest 
 pub clipboard_last: Option<String>,  // most recently yanked value; used for Ctrl+P quick-paste
 pub paste_locale_cursor: usize,      // focused column in the paste panel
 pub paste_history_pos: HashMap<String, usize>, // per-locale > marker position in paste panel
-// Key-segment cursor
-pub key_segment_cursor: usize,       // depth offset from cursor key toward root.
-                                     // k=0 = anchor at full key (default, last segment
-                                     // highlighted); k=1 = one level above; max = total_segs-1.
-                                     // Reset to 0 on row change or filter change.
 ```
 
 `AppState` does not derive `Clone` — `TextArea` is not `Clone`, and `Clone`
@@ -195,15 +193,36 @@ Trie rules (applied per bundle):
 
 Keys without `:` (legacy / test keys) take the bare path — no bundle header.
 
+**CursorSection**
+`CursorSection` is a typed enum that replaces the old `cursor_col: usize` +
+`key_segment_cursor: usize` pair:
+
+```rust
+pub enum CursorSection {
+    Key { segment: usize }, // key column; segment = k (depth offset from leaf)
+    Locale(usize),          // 0-based index into visible_locales
+}
+```
+
+Helper methods: `is_key()`, `locale_idx() -> Option<usize>`, `reset_segment()`.
+Always update `cursor_section` through `set_locale_cursor(idx)` when moving to a
+locale column — that method also writes `preferred_locale`, keeping both in sync.
+
+**Sticky locale**
+`preferred_locale: Option<String>` remembers the user's intended locale column.
+It is set exclusively by `set_locale_cursor()` (explicit user navigation), never
+by clamping. `clamp_cursor_section()` tries to restore it first when a bundle
+transition would otherwise land on a different column.
+
 **Selection model**
 `cursor_row` indexes into `display_rows`. All rows (Header and Key) are
-navigable. `cursor_col` indexes into `visible_locales` offset by 1 (col 0 is
-the key column). `<missing>` in red marks cells where the key is absent from
-that locale file. Bundle-level Header locale cells show `[locale]` in dark
-gray (navigable, but no stored value).
+navigable. `cursor_section` is either `Key { segment }` (key column) or
+`Locale(idx)` (0-based index into `visible_locales`). `<missing>` in red marks
+cells where the key is absent from that locale file. Bundle-level Header locale
+cells show `[locale]` in dark gray (navigable, but no stored value).
 
 The logical cursor in the key column is two-dimensional:
-`(cursor_row, key_segment_cursor)`. `key_segment_cursor` (k) is a depth offset
+`(cursor_row, CursorSection::Key { segment })`. `segment` (k) is a depth offset
 from the current row's full key toward the bundle root:
 
 - k=0 → anchor = full key (last/deepest segment highlighted — the default)
@@ -220,14 +239,14 @@ cursor to the anchor row in the table (the Header or Key whose key == anchor).
 At k=max there is no parent row to jump to (the anchor is the bundle itself).
 
 `→` (Right): when k>0, walk the anchor back toward leaf (decrements k). At k=0
-the right arrow moves `cursor_col` to the first locale column.
+the right arrow moves `cursor_section` to `Locale(0)` (first available locale).
 
 `Ctrl+↑` / `Ctrl+↓` (SiblingUp / SiblingDown): navigate to the previous/next
-sibling at the current anchor level. If no sibling exists in the current subtree,
-the navigation auto-climbs one level (same as Left) until a sibling is found or
-the root is reached; if still none, falls back to plain row movement. Landing on
-a multi-segment header preserves the correct k so the anchor stays at the
-sibling's level, not at the header's deepest segment.
+row at the **same absolute segment depth** as the current anchor, regardless of
+parent ancestry (cousins qualify). If no row exists at that depth in that
+direction, depth is reduced by 1 and the search retries. Falls back to plain row
+movement when nothing is found at any depth. The `segment` offset (k) is set so
+the anchor highlights the correct depth level on the target row.
 
 `Ctrl+→` (GoToFirstChild): jump to the first row whose key starts with
 `{anchor}.`, and reset k=0.
@@ -238,13 +257,13 @@ sibling's level, not at the header's deepest segment.
 
 `key_seg_max()` → `total_segs - 1` (max valid k for the current row).
 `key_seg_anchor()` → the bundle-qualified key string at depth `total - k`.
-`find_sibling_row(forward)` → `Option<(usize, String)>` — row index and sibling
-anchor key for the next/prev sibling at the current anchor level.
+`find_depth_neighbor(forward)` → `Option<(usize, usize)>` — row index and new k
+for depth-based Ctrl+↑/↓ navigation (same absolute depth, reduces depth when stuck).
 `find_anchor_row()` → `Option<usize>` — row (≠ cursor_row) whose key == anchor.
 `find_first_child()` → `Option<usize>` — first row starting with `{anchor}.`.
 
-`apply_filter` resets `key_segment_cursor = 0`. `sibling_nav` works around this
-by computing `target_k` before calling `refresh_temp_pins` and re-applying it after.
+`apply_filter` resets `cursor_section` segment to 0. `sibling_nav` re-applies the
+computed k after calling `refresh_temp_pins` (which would otherwise reset it).
 
 **Filter system**
 The filter bar is always visible. `/` focuses it. The bar is backed by a
@@ -436,7 +455,7 @@ Normal:       ↑↓←→ / hjkl navigate  PgUp/PgDn
               Shift+↑/↓   jump to prev/next bundle
               ← (col 0)    walk anchor toward root (increment k, jump to anchor row)
               → (col 0)    walk anchor toward leaf (decrement k); at k=0 move to locale col
-              Ctrl+↑/↓    sibling navigation at anchor level (auto-climbs if no sibling)
+              Ctrl+↑/↓    depth-based navigation: same absolute segment depth, reduces depth if stuck
               Ctrl+→       jump to first child of anchor
               Enter        edit value (locale col) or open rename editor (col 0)
               n            new key / new locale (bundle header col 0) / new locale-targeted key (bundle header col>0)

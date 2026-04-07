@@ -2,7 +2,7 @@ use crate::{
     filter::ColumnDirective,
     messages::Message,
     render_model::DisplayRow,
-    state::{AppState, Mode, SelectionScope},
+    state::{AppState, CursorSection, Mode, SelectionScope},
     update::update,
 };
 use anyhow::Result;
@@ -161,7 +161,7 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
         _ => "",
     };
     let locale = state.visible_locales
-        .get(state.cursor_col.saturating_sub(1))
+        .get(state.cursor_section.locale_idx().unwrap_or(0))
         .map(|s| s.as_str())
         .unwrap_or("");
 
@@ -196,7 +196,7 @@ fn preview_content(state: &AppState) -> Option<(String, String)> {
         DisplayRow::Header { prefix, .. } => prefix.as_str(),
     };
 
-    if state.cursor_col == 0 {
+    if state.cursor_section.is_key() {
         // Key column: show the full bundle-qualified key path.
         Some((format!(" {full_key} "), full_key.to_string()))
     } else {
@@ -205,7 +205,7 @@ fn preview_content(state: &AppState) -> Option<(String, String)> {
         if matches!(state.display_rows.get(state.cursor_row), Some(DisplayRow::Header { .. })) {
             return None;
         }
-        let locale = state.visible_locales.get(state.cursor_col - 1)?;
+        let locale = state.visible_locales.get(state.cursor_section.locale_idx()?)?;
         let value = state.workspace.get_value(full_key, locale);
         // Convert physical continuation markers (\+newline) to display newlines.
         let content = match value {
@@ -533,7 +533,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         // The "select" style for highlighted segments and the "base" style for
         // everything else.  select_style varies by role (cursor vs on_path/in_scope);
         // base_style encodes row type (header, dirty, pinned, …).
-        let select_style = if is_selected_row && state.cursor_col == 0 {
+        let select_style = if is_selected_row && state.cursor_section.is_key() {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else if is_selected_row {
             // Cursor on a locale column — key text is bold but not reversed.
@@ -574,11 +574,11 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             // Render a [locale] tag for each locale that belongs to this bundle.
             // These cells are navigable (cursor can land on them via ←→).
             for (col_idx, locale) in locales.iter().enumerate() {
-                let locale_col = col_idx + 1;
                 if !state.workspace.bundle_has_locale(full_key, locale) {
                     continue;
                 }
-                let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
+                let is_cursor_cell = is_selected_row
+                    && state.cursor_section == CursorSection::Locale(col_idx);
                 let style = if is_cursor_cell {
                     Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
                 } else {
@@ -593,17 +593,16 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         // The bundle this row belongs to (used to skip locales with no file).
         let (row_bundle, _) = crate::workspace::split_key(full_key);
 
-        // Locale columns (cursor_col == locale_idx + 1).
+        // Locale columns — each col_idx maps to CursorSection::Locale(col_idx).
         for (col_idx, locale) in locales.iter().enumerate() {
-            let locale_col = col_idx + 1;
-
             // Skip locales that have no backing file in this row's bundle.
             // Those cells can never hold a value and are confusing to show.
             if !state.workspace.bundle_has_locale(row_bundle, locale) {
                 continue;
             }
 
-            let is_cursor_cell = is_selected_row && state.cursor_col == locale_col;
+            let is_cursor_cell = is_selected_row
+                && state.cursor_section == CursorSection::Locale(col_idx);
 
             // Headers have no stored values — their cells are empty/creatable.
             // Bundle headers (prefix == bundle name) are also always empty.

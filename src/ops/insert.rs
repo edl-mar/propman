@@ -126,10 +126,10 @@ pub fn apply_cell_value(state: &mut AppState, full_key: &str, locale: &str, valu
 /// Only updates existing keys. Editing a `<missing>` cell (key not in the
 /// locale file) is a no-op — handled by `commit_cell_insert` instead.
 pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
-    if state.cursor_col == 0 {
-        return;
-    }
-    let locale_idx = state.cursor_col - 1;
+    let locale_idx = match state.cursor_section.locale_idx() {
+        Some(i) => i,
+        None => return,
+    };
     let locale = match state.visible_locales.get(locale_idx) {
         Some(l) => l.clone(),
         None => return,
@@ -200,10 +200,10 @@ pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
 /// Inserts a new key-value entry into the appropriate locale file and queues
 /// a disk write. Called when the user commits an edit on a `<missing>` cell.
 pub fn commit_cell_insert(state: &mut AppState, new_value: String) {
-    if state.cursor_col == 0 {
-        return;
-    }
-    let locale_idx = state.cursor_col - 1;
+    let locale_idx = match state.cursor_section.locale_idx() {
+        Some(i) => i,
+        None => return,
+    };
     let locale = match state.visible_locales.get(locale_idx) {
         Some(l) => l.clone(),
         None => return,
