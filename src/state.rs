@@ -313,9 +313,8 @@ impl AppState {
             (filtered, visible, directive)
         };
         let bundle_names = self.workspace.bundle_names();
-        self.display_rows = render_model::build_display_rows(&filtered, &bundle_names);
         let dirty_cells = self.compute_dirty_cells();
-        self.render_model = render_model::build_render_model(
+        let new_rm = render_model::build_render_model(
             &self.workspace,
             &filtered,
             &bundle_names,
@@ -325,6 +324,8 @@ impl AppState {
             &self.pinned_keys,
             &self.temp_pins,
         );
+        self.display_rows = render_model::display_rows_from_render_model(&new_rm);
+        self.render_model = new_rm;
         self.visible_locales = visible;
         self.column_directive = directive;
         let max_row = self.display_rows.len().saturating_sub(1);
@@ -437,7 +438,6 @@ impl AppState {
 
     pub fn new(workspace: Workspace) -> Self {
         let bundle_names = workspace.bundle_names();
-        let display_rows = render_model::build_display_rows(&workspace.merged_keys, &bundle_names);
         let visible_locales = workspace.all_locales();
         let empty_keys: HashSet<String> = HashSet::new();
         let empty_cells: HashSet<(String, String)> = HashSet::new();
@@ -451,6 +451,7 @@ impl AppState {
             &empty_keys,
             &[],
         );
+        let display_rows = render_model::display_rows_from_render_model(&hier_model);
         let cursor_row = 0;
         Self {
             workspace,

@@ -1,7 +1,11 @@
 use crate::{
     filter::ColumnDirective,
     messages::Message,
-    render_model::DisplayRow,
+    render_model::{
+        DisplayRow, Group,
+        entry_visual_depth, group_effective_path, group_visual_depth,
+        qualify, relative_display, trim_ctx_to_ancestor,
+    },
     state::{AppState, CursorSection, Mode, SelectionScope},
     update::update,
 };
@@ -432,8 +436,9 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     let viewport = area.height as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(viewport);
 
-    // Build a (full_key, locale) set of cells with pending writes for dirty cell indicators.
-    let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = state.workspace.groups.iter()
+    // ── Dirty-cell set: (full_key, locale) pairs with pending writes ──────────
+    let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = state
+        .workspace.groups.iter()
         .flat_map(|g| g.files.iter())
         .map(|f| (f.path.as_path(), f.locale.as_str()))
         .collect();
@@ -449,224 +454,307 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    // scope_anchor: the tree node the key-segment cursor points to.
-    // Always computed in Normal/KeyRenaming/Deleting so that per-segment highlighting
-    // is active even at k=0 (cursor rests on the deepest/last segment by default).
-    let scope_anchor: Option<String> = if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting) {
-        match state.display_rows.get(state.cursor_row) {
-            Some(DisplayRow::Key { .. } | DisplayRow::Header { .. }) => state.key_seg_anchor(),
-            None => None,
-        }
-    } else {
-        None
-    };
-    // scope_prefix ("{anchor}.") drives +children sibling/child highlighting.
-    let scope_prefix: Option<String> = if matches!(state.selection_scope, SelectionScope::Children | SelectionScope::ChildrenAll) {
-        scope_anchor.as_ref().map(|a| format!("{a}."))
-    } else {
-        None
-    };
-    // cursor_full_key_str is used in the on_path check inside the render loop.
+    // ── Cursor / selection state (still derived from display_rows + cursor_row) ─
+    let scope_anchor: Option<String> =
+        if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting) {
+            match state.display_rows.get(state.cursor_row) {
+                Some(DisplayRow::Key { .. } | DisplayRow::Header { .. }) => state.key_seg_anchor(),
+                None => None,
+            }
+        } else {
+            None
+        };
+    let scope_prefix: Option<String> =
+        if matches!(state.selection_scope, SelectionScope::Children | SelectionScope::ChildrenAll) {
+            scope_anchor.as_ref().map(|a| format!("{a}."))
+        } else {
+            None
+        };
     let cursor_full_key_str: Option<&str> = match state.display_rows.get(state.cursor_row) {
         Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.as_str()),
         Some(DisplayRow::Header { prefix,   .. }) => Some(prefix.as_str()),
         _ => None,
     };
 
-    for (row_idx, display_row) in state
-        .display_rows
-        .iter()
-        .enumerate()
-        .skip(state.scroll_offset)
-        .take(viewport)
-    {
-        let is_selected_row = row_idx == state.cursor_row;
+    // ── Iterate the hierarchical render model ─────────────────────────────────
+    // `visual_row` counts every emitted row; compared against `cursor_row` to
+    // determine which row is selected.
+    let mut visual_row: usize = 0;
 
-        let row_key = match display_row {
-            DisplayRow::Key    { full_key, .. } => full_key.as_str(),
-            DisplayRow::Header { prefix,   .. } => prefix.as_str(),
-        };
+    'outer: for bundle in &state.render_model.bundles {
+        let bundle_offset = if bundle.name.is_empty() { 0usize } else { 1 };
 
-        // in_scope: [+children] is active and this row is a descendant of the anchor.
-        let in_scope = scope_prefix.as_ref().map_or(false, |p| row_key.starts_with(p.as_str()));
-
-        // on_path: this row is an ancestor of the cursor that lies on the path between
-        // the cursor and the anchor (inclusive).  Naturally false when k=0 because no
-        // ancestor can equal-or-start-with the cursor's full key.
-        let on_path = !is_selected_row
-            && cursor_full_key_str.map_or(false, |ck| {
-                let anchor = match scope_anchor.as_deref() { Some(a) => a, None => return false };
-                // Row must be a proper ancestor of the cursor key.
-                ck.starts_with(&format!("{row_key}."))
-                // Row must also be at-or-below the anchor (within the selected subtree).
-                && (row_key == anchor || row_key.starts_with(&format!("{anchor}.")))
-            });
-
-        // Resolve display string, flags, full key, and indentation.
-        let (indent, flags, display_ref, full_key, is_header) = match display_row {
-            DisplayRow::Header { display, prefix, depth } => {
-                ("  ".repeat(*depth), String::new(), display.as_str(), prefix.as_str(), true)
-            }
-            DisplayRow::Key { display, full_key, depth } => {
-                let dangling = if state.workspace.is_dangling(full_key) { "*" } else { "" };
-                let dirty   = if state.dirty_keys.contains(full_key.as_str()) { "#" } else { "" };
-                let pinned  = if state.pinned_keys.contains(full_key.as_str()) { "@" } else { "" };
-                (
-                    "  ".repeat(*depth),
-                    format!("{dangling}{dirty}{pinned}"),
-                    display.as_str(),
-                    full_key.as_str(),
-                    false,
-                )
-            }
-        };
-
-        // Pin/dirty flags used for cell styling below.
-        let is_temp_pinned = state.temp_pins.iter().any(|k| k == full_key);
-        let is_perm_pinned = !is_header && state.pinned_keys.contains(full_key);
-        let is_dirty_row   = !is_header && state.dirty_keys.contains(full_key);
-
-        // Bundle-level headers (depth 0, prefix == bundle name) never have
-        // locale columns — the bundle name is not itself a translatable key.
-        let is_bundle_header = is_header && state.workspace.is_bundle_name(full_key);
-
-        // The "select" style for highlighted segments and the "base" style for
-        // everything else.  select_style varies by role (cursor vs on_path/in_scope);
-        // base_style encodes row type (header, dirty, pinned, …).
-        let select_style = if is_selected_row && state.cursor_section.is_key() {
-            Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if is_selected_row {
-            // Cursor on a locale column — key text is bold but not reversed.
-            Style::default().add_modifier(Modifier::BOLD)
-        } else {
-            // on_path or in_scope: white-background highlight without BOLD so
-            // the cursor row still stands out as the "active" entry.
-            Style::default().add_modifier(Modifier::REVERSED)
-        };
-
-        let base_style = if is_header {
-            Style::default().fg(Color::DarkGray)
-        } else if is_temp_pinned {
-            Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
-        } else if is_perm_pinned {
-            Style::default().fg(Color::Yellow)
-        } else if is_dirty_row {
-            Style::default().fg(Color::Yellow)
-        } else {
-            Style::default()
-        };
-
-        let row_in_selection = is_selected_row || on_path || in_scope;
-
-        let mut spans = make_key_spans(
-            &indent,
-            &flags,
-            display_ref,
-            full_key,
-            is_header,
-            scope_anchor.as_deref(),
-            row_in_selection,
-            select_style,
-            base_style,
-        );
-
-        if is_bundle_header {
-            // Render a [locale] tag for each locale that belongs to this bundle.
-            // These cells are navigable (cursor can land on them via ←→).
-            for (col_idx, locale) in locales.iter().enumerate() {
-                if !state.workspace.bundle_has_locale(full_key, locale) {
-                    continue;
+        // ── Bundle-level header ───────────────────────────────────────────────
+        if !bundle.name.is_empty() {
+            let is_selected = visual_row == state.cursor_row;
+            if visual_row >= state.scroll_offset {
+                let row_key = bundle.name.as_str();
+                let in_scope = scope_prefix.as_ref().map_or(false, |p| row_key.starts_with(p.as_str()));
+                let on_path  = false; // bundle headers can never be on-path
+                let row_in_selection = is_selected || on_path || in_scope;
+                let select_style = bundle_header_select_style(is_selected, &state.cursor_section);
+                let base_style   = Style::default().fg(Color::DarkGray);
+                let indent = String::new();
+                let mut spans = make_key_spans(
+                    &indent, "", &bundle.name, row_key, true,
+                    scope_anchor.as_deref(), row_in_selection, select_style, base_style,
+                );
+                // Locale tags: one per locale in this bundle.
+                for (col_idx, locale) in locales.iter().enumerate() {
+                    if !state.workspace.bundle_has_locale(&bundle.name, locale) { continue; }
+                    let is_cursor_cell = is_selected && state.cursor_section == CursorSection::Locale(col_idx);
+                    let style = if is_cursor_cell {
+                        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    spans.push(Span::styled(format!("[{locale}] "), style));
                 }
-                let is_cursor_cell = is_selected_row
-                    && state.cursor_section == CursorSection::Locale(col_idx);
-                let style = if is_cursor_cell {
-                    Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                lines.push(Line::from(spans));
+                if lines.len() >= viewport { break 'outer; }
+            }
+            visual_row += 1;
+        }
+
+        // ── Entries within this bundle ────────────────────────────────────────
+        let mut ctx_stack: Vec<String> = Vec::new(); // context for display strings
+
+        for (i, entry) in bundle.entries.iter().enumerate() {
+            let rk = entry.real_key();
+            let full_key_owned = qualify(&bundle.name, &rk);
+            let full_key: &str = &full_key_owned;
+
+            // ── Headers for branch groups starting at this entry ──────────────
+            let mut header_groups: Vec<(&str, &Group)> = bundle.groups.iter()
+                .filter(|(prefix, g)| {
+                    g.first_entry == i
+                        && g.is_branch
+                        && prefix.split('.').count() == g.depth + 1
+                        && prefix.as_str() != rk
+                        && g.label != rk
+                })
+                .map(|(p, g)| (p.as_str(), g))
+                .collect();
+            header_groups.sort_by_key(|(_, g)| g.depth);
+
+            for (prefix, group) in &header_groups {
+                let ep = group_effective_path(prefix, &group.label);
+                trim_ctx_to_ancestor(&mut ctx_stack, &ep);
+
+                let is_selected = visual_row == state.cursor_row;
+                if visual_row >= state.scroll_offset {
+                    let qualified_prefix = qualify(&bundle.name, &ep);
+                    let row_key = qualified_prefix.as_str();
+                    let display = relative_display(&ep, ctx_stack.last().map(|s| s.as_str()));
+                    let depth   = group_visual_depth(prefix, &bundle.groups) + bundle_offset;
+                    let indent  = "  ".repeat(depth);
+
+                    let in_scope = scope_prefix.as_ref().map_or(false, |p| row_key.starts_with(p.as_str()));
+                    let on_path  = on_path_check(is_selected, row_key, cursor_full_key_str, &scope_anchor);
+                    let row_in_selection = is_selected || on_path || in_scope;
+
+                    let select_style = non_bundle_select_style(is_selected, &state.cursor_section);
+                    let base_style   = Style::default().fg(Color::DarkGray);
+
+                    let mut spans = make_key_spans(
+                        &indent, "", &display, row_key, true,
+                        scope_anchor.as_deref(), row_in_selection, select_style, base_style,
+                    );
+                    // Within-bundle headers: render locale cells (they have no value but
+                    // can be committed-to via Header insert).
+                    render_locale_cells(
+                        &mut spans, locales, row_key, true, false,
+                        is_selected, in_scope, false, false,
+                        &state.cursor_section, &state.mode, &state.column_directive,
+                        &dirty_cells, &bundle.name, &bundle.locales,
+                        None, // no Entry (header row)
+                    );
+                    lines.push(Line::from(spans));
+                    if lines.len() >= viewport { break 'outer; }
+                }
+                visual_row += 1;
+                ctx_stack.push(ep);
+            }
+
+            // ── Entry (key) row ───────────────────────────────────────────────
+            trim_ctx_to_ancestor(&mut ctx_stack, &rk);
+
+            let is_selected = visual_row == state.cursor_row;
+            if visual_row >= state.scroll_offset {
+                let display = relative_display(&rk, ctx_stack.last().map(|s| s.as_str()));
+                let depth   = entry_visual_depth(&entry.segments, &bundle.groups) + bundle_offset;
+                let indent  = "  ".repeat(depth);
+
+                let dangling = if entry.cells.iter().all(|c| c.value.is_none()) && !entry.is_dirty {
+                    if state.workspace.is_dangling(full_key) { "*" } else { "" }
+                } else { "" };
+                let dirty_flag  = if entry.is_dirty  { "#" } else { "" };
+                let pinned_flag = if entry.is_pinned  { "@" } else { "" };
+                let flags = format!("{dangling}{dirty_flag}{pinned_flag}");
+
+                let in_scope = scope_prefix.as_ref().map_or(false, |p| full_key.starts_with(p.as_str()));
+                let on_path  = on_path_check(is_selected, full_key, cursor_full_key_str, &scope_anchor);
+                let row_in_selection = is_selected || on_path || in_scope;
+
+                let select_style = non_bundle_select_style(is_selected, &state.cursor_section);
+                let base_style = if entry.is_temp_pinned {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+                } else if entry.is_pinned || entry.is_dirty {
+                    Style::default().fg(Color::Yellow)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default()
                 };
-                spans.push(Span::styled(format!("[{locale}] "), style));
+
+                let mut spans = make_key_spans(
+                    &indent, &flags, &display, full_key, false,
+                    scope_anchor.as_deref(), row_in_selection, select_style, base_style,
+                );
+                render_locale_cells(
+                    &mut spans, locales, full_key, false, entry.is_temp_pinned,
+                    is_selected, in_scope, entry.is_pinned, entry.is_dirty,
+                    &state.cursor_section, &state.mode, &state.column_directive,
+                    &dirty_cells, &bundle.name, &bundle.locales,
+                    Some(entry),
+                );
+                lines.push(Line::from(spans));
+                if lines.len() >= viewport { break 'outer; }
             }
-            lines.push(Line::from(spans));
-            continue;
+            visual_row += 1;
+
+            // Push this entry as context if it has children.
+            if bundle.entries.get(i + 1)
+                .map_or(false, |next| next.real_key().starts_with(&format!("{rk}.")))
+            {
+                ctx_stack.push(rk);
+            }
         }
-
-        // The bundle this row belongs to (used to skip locales with no file).
-        let (row_bundle, _) = crate::workspace::split_key(full_key);
-
-        // Locale columns — each col_idx maps to CursorSection::Locale(col_idx).
-        for (col_idx, locale) in locales.iter().enumerate() {
-            // Skip locales that have no backing file in this row's bundle.
-            // Those cells can never hold a value and are confusing to show.
-            if !state.workspace.bundle_has_locale(row_bundle, locale) {
-                continue;
-            }
-
-            let is_cursor_cell = is_selected_row
-                && state.cursor_section == CursorSection::Locale(col_idx);
-
-            // Headers have no stored values — their cells are empty/creatable.
-            // Bundle headers (prefix == bundle name) are also always empty.
-            let value = if is_header {
-                None
-            } else {
-                state.workspace.get_value(full_key, locale)
-            };
-
-            // Per-row column directives (:? = only missing, :! = only present)
-            if !is_header {
-                match state.column_directive {
-                    ColumnDirective::MissingOnly if value.is_some() => continue,
-                    ColumnDirective::PresentOnly if value.is_none() => continue,
-                    _ => {}
-                }
-            }
-
-            let is_dirty_cell = dirty_cells.contains(&(full_key, locale.as_str()));
-            let tag_style = if is_selected_row {
-                Style::default()
-            } else if is_temp_pinned {
-                Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
-            } else if in_scope {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
-            } else if is_perm_pinned {
-                Style::default().fg(Color::Yellow)
-            } else if is_dirty_cell {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            };
-            let locale_tag = if is_dirty_cell { format!("#[{locale}] ") } else { format!("[{locale}] ") };
-            spans.push(Span::styled(locale_tag, tag_style));
-
-            // Strip `\`+newline continuation markers — they're an on-disk format
-            // detail. The logical value (without them) is what the cell should show.
-            let display = value.map(|v| v.replace("\\\n", ""));
-            let display_str = display.as_deref().unwrap_or("");
-
-            let (text, style) = match (is_cursor_cell, &state.mode, &state.edit_buffer) {
-                // Cell is being edited in the bottom pane — show the workspace value
-                // reversed so the user can see which cell is active.
-                (true, Mode::Editing, _) => (
-                    display_str.to_string(),
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ),
-                (true, _, _) => (
-                    display_str.to_string(),
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ),
-                // Key row: value missing in this locale but present in others.
-                (false, _, _) if value.is_none() && !is_header => {
-                    ("<missing>".to_string(), Style::default().fg(Color::Red))
-                }
-                _ => (display_str.to_string(), Style::default()),
-            };
-            spans.push(Span::styled(format!("{text}  "), style));
-        }
-
-        lines.push(Line::from(spans));
     }
 
     f.render_widget(Paragraph::new(lines), area);
+}
+
+// ── draw_table helpers ────────────────────────────────────────────────────────
+
+fn bundle_header_select_style(is_selected: bool, section: &CursorSection) -> Style {
+    if is_selected && section.is_key() {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else if is_selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+}
+
+fn non_bundle_select_style(is_selected: bool, section: &CursorSection) -> Style {
+    if is_selected && section.is_key() {
+        Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else if is_selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+}
+
+fn on_path_check(
+    is_selected: bool,
+    row_key: &str,
+    cursor_full_key_str: Option<&str>,
+    scope_anchor: &Option<String>,
+) -> bool {
+    if is_selected { return false; }
+    let Some(ck) = cursor_full_key_str else { return false; };
+    let Some(anchor) = scope_anchor.as_deref() else { return false; };
+    ck.starts_with(&format!("{row_key}."))
+        && (row_key == anchor || row_key.starts_with(&format!("{anchor}.")))
+}
+
+/// Appends locale cell spans to `spans` for a single row.
+#[allow(clippy::too_many_arguments)]
+fn render_locale_cells(
+    spans: &mut Vec<Span<'static>>,
+    locales: &[String],
+    full_key: &str,
+    is_header: bool,
+    is_temp_pinned: bool,
+    is_selected: bool,
+    in_scope: bool,
+    is_perm_pinned: bool,
+    is_dirty_row: bool,
+    cursor_section: &CursorSection,
+    mode: &Mode,
+    column_directive: &ColumnDirective,
+    dirty_cells: &std::collections::HashSet<(&str, &str)>,
+    bundle_name: &str,
+    bundle_locales: &[String],
+    entry: Option<&crate::render_model::Entry>,
+) {
+    for (col_idx, locale) in locales.iter().enumerate() {
+        // Skip locales not present in this bundle.
+        if !bundle_locales.contains(locale) { continue; }
+
+        let is_cursor_cell = is_selected && *cursor_section == CursorSection::Locale(col_idx);
+
+        // Look up the value: from Entry cells for key rows, None for headers.
+        let value: Option<&str> = if is_header {
+            None
+        } else if let Some(e) = entry {
+            let cell_idx = bundle_locales.iter().position(|l| l == locale);
+            cell_idx.and_then(|idx| e.cells.get(idx)).and_then(|c| c.value.as_deref())
+        } else {
+            None
+        };
+
+        // Per-row column directives.
+        if !is_header {
+            match column_directive {
+                ColumnDirective::MissingOnly if value.is_some() => continue,
+                ColumnDirective::PresentOnly if value.is_none() => continue,
+                _ => {}
+            }
+        }
+
+        let is_dirty_cell = if let Some(e) = entry {
+            let cell_idx = bundle_locales.iter().position(|l| l == locale);
+            cell_idx.and_then(|idx| e.cells.get(idx)).map_or(false, |c| c.is_dirty)
+        } else {
+            dirty_cells.contains(&(full_key, locale.as_str()))
+        };
+
+        let tag_style = if is_selected {
+            Style::default()
+        } else if is_temp_pinned {
+            Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
+        } else if in_scope {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+        } else if is_perm_pinned {
+            Style::default().fg(Color::Yellow)
+        } else if is_dirty_cell {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let locale_tag = if is_dirty_cell { format!("#[{locale}] ") } else { format!("[{locale}] ") };
+        spans.push(Span::styled(locale_tag, tag_style));
+
+        // Strip `\`+newline continuation markers for display.
+        let owned;
+        let display_str: &str = if let Some(v) = value {
+            owned = v.replace("\\\n", "");
+            &owned
+        } else {
+            ""
+        };
+
+        let (text, style) = if is_cursor_cell {
+            (display_str.to_string(), Style::default().add_modifier(Modifier::REVERSED))
+        } else if value.is_none() && !is_header {
+            ("<missing>".to_string(), Style::default().fg(Color::Red))
+        } else {
+            (display_str.to_string(), Style::default())
+        };
+        let _ = mode; // mode was used in old code for Editing detection; no longer needed here
+        spans.push(Span::styled(format!("{text}  "), style));
+    }
 }
 
 fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
