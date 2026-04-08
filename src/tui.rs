@@ -2,11 +2,11 @@ use crate::{
     filter::ColumnDirective,
     messages::Message,
     render_model::{
-        DisplayRow, Group,
+        Group,
         entry_visual_depth, group_effective_path, group_visual_depth,
         qualify, relative_display, trim_ctx_to_ancestor,
     },
-    state::{AppState, CursorSection, Mode, SelectionScope},
+    state::{AppState, Mode, SelectionScope},
     update::update,
 };
 use anyhow::Result;
@@ -159,13 +159,10 @@ fn draw(f: &mut Frame, state: &AppState) {
 fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
     let Some(edit) = &state.edit_buffer else { return };
 
-    let full_key = match state.display_rows.get(state.cursor_row) {
-        Some(DisplayRow::Key { full_key, .. }) => full_key.as_str(),
-        Some(DisplayRow::Header { prefix, .. }) => prefix.as_str(),
-        _ => "",
-    };
-    let locale = state.visible_locales
-        .get(state.cursor_section.locale_idx().unwrap_or(0))
+    let full_key_owned = state.cursor.full_key().unwrap_or_default();
+    let full_key = full_key_owned.as_str();
+    let locale = state.effective_locale_idx()
+        .and_then(|i| state.visible_locales.get(i))
         .map(|s| s.as_str())
         .unwrap_or("");
 
@@ -195,21 +192,20 @@ fn draw_edit_pane(f: &mut Frame, area: Rect, state: &AppState) {
 /// Returns `(title, content)` for the preview pane at the current cursor position,
 /// or `None` when there is nothing to preview (e.g. a header locale cell).
 fn preview_content(state: &AppState) -> Option<(String, String)> {
-    let full_key = match state.display_rows.get(state.cursor_row)? {
-        DisplayRow::Key { full_key, .. } => full_key.as_str(),
-        DisplayRow::Header { prefix, .. } => prefix.as_str(),
-    };
+    let full_key_owned = state.cursor.full_key()?;
+    let full_key = full_key_owned.as_str();
 
-    if state.cursor_section.is_key() {
+    if state.cursor.is_key_col() {
         // Key column: show the full bundle-qualified key path.
         Some((format!(" {full_key} "), full_key.to_string()))
     } else {
         // Locale column: show the full value for this (key, locale) pair.
-        // Header locale cells have no value and produce no preview.
-        if matches!(state.display_rows.get(state.cursor_row), Some(DisplayRow::Header { .. })) {
+        // Bundle header locale cells have no stored value.
+        if state.cursor.segments.is_empty() {
             return None;
         }
-        let locale = state.visible_locales.get(state.cursor_section.locale_idx()?)?;
+        let locale_idx = state.effective_locale_idx()?;
+        let locale = state.visible_locales.get(locale_idx)?;
         let value = state.workspace.get_value(full_key, locale);
         // Convert physical continuation markers (\+newline) to display newlines.
         let content = match value {
@@ -454,12 +450,14 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         })
         .collect();
 
-    // ── Cursor / selection state (still derived from display_rows + cursor_row) ─
+    // ── Cursor / selection state ──────────────────────────────────────────────
+    // scope_anchor = the cursor's bundle-qualified key (or bundle name for headers).
     let scope_anchor: Option<String> =
         if matches!(state.mode, Mode::Normal | Mode::KeyRenaming | Mode::Deleting) {
-            match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key { .. } | DisplayRow::Header { .. }) => state.key_seg_anchor(),
-                None => None,
+            if state.cursor.segments.is_empty() {
+                state.cursor.bundle.clone()
+            } else {
+                state.cursor.full_key()
             }
         } else {
             None
@@ -470,29 +468,28 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
         } else {
             None
         };
-    let cursor_full_key_str: Option<&str> = match state.display_rows.get(state.cursor_row) {
-        Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.as_str()),
-        Some(DisplayRow::Header { prefix,   .. }) => Some(prefix.as_str()),
-        _ => None,
-    };
+    // cursor_full_key_str is the same as scope_anchor in the new cursor model.
+    let cursor_full_key_owned: Option<String> = scope_anchor.clone();
+    let cursor_full_key_str: Option<&str> = cursor_full_key_owned.as_deref();
 
     // ── Iterate the hierarchical render model ─────────────────────────────────
-    // `visual_row` counts every emitted row; compared against `cursor_row` to
-    // determine which row is selected.
+    // `visual_row` counts every emitted row; used only for scroll offset comparison.
     let mut visual_row: usize = 0;
 
     'outer: for bundle in &state.render_model.bundles {
         let bundle_offset = if bundle.name.is_empty() { 0usize } else { 1 };
+        // bundle_opt: None for the bundle-less group, Some(name) for named bundles.
+        let bundle_opt: Option<&str> = if bundle.name.is_empty() { None } else { Some(bundle.name.as_str()) };
+        let cursor_bundle = state.cursor.bundle.as_deref();
 
         // ── Bundle-level header ───────────────────────────────────────────────
         if !bundle.name.is_empty() {
-            let is_selected = visual_row == state.cursor_row;
+            let is_selected = cursor_bundle == bundle_opt && state.cursor.segments.is_empty();
             if visual_row >= state.scroll_offset {
                 let row_key = bundle.name.as_str();
                 let in_scope = scope_prefix.as_ref().map_or(false, |p| row_key.starts_with(p.as_str()));
-                let on_path  = false; // bundle headers can never be on-path
-                let row_in_selection = is_selected || on_path || in_scope;
-                let select_style = bundle_header_select_style(is_selected, &state.cursor_section);
+                let row_in_selection = is_selected || in_scope;
+                let select_style = bundle_header_select_style(is_selected, state.cursor.is_key_col());
                 let base_style   = Style::default().fg(Color::DarkGray);
                 let indent = String::new();
                 let mut spans = make_key_spans(
@@ -500,9 +497,10 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                     scope_anchor.as_deref(), row_in_selection, select_style, base_style,
                 );
                 // Locale tags: one per locale in this bundle.
-                for (col_idx, locale) in locales.iter().enumerate() {
+                for locale in locales.iter() {
                     if !state.workspace.bundle_has_locale(&bundle.name, locale) { continue; }
-                    let is_cursor_cell = is_selected && state.cursor_section == CursorSection::Locale(col_idx);
+                    let is_cursor_cell = is_selected
+                        && state.cursor.locale.as_deref() == Some(locale.as_str());
                     let style = if is_cursor_cell {
                         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
                     } else {
@@ -541,7 +539,8 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 let ep = group_effective_path(prefix, &group.label);
                 trim_ctx_to_ancestor(&mut ctx_stack, &ep);
 
-                let is_selected = visual_row == state.cursor_row;
+                let header_segs: Vec<String> = ep.split('.').map(|s| s.to_string()).collect();
+                let is_selected = cursor_bundle == bundle_opt && state.cursor.segments == header_segs;
                 if visual_row >= state.scroll_offset {
                     let qualified_prefix = qualify(&bundle.name, &ep);
                     let row_key = qualified_prefix.as_str();
@@ -553,7 +552,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                     let on_path  = on_path_check(is_selected, row_key, cursor_full_key_str, &scope_anchor);
                     let row_in_selection = is_selected || on_path || in_scope;
 
-                    let select_style = non_bundle_select_style(is_selected, &state.cursor_section);
+                    let select_style = non_bundle_select_style(is_selected, state.cursor.is_key_col());
                     let base_style   = Style::default().fg(Color::DarkGray);
 
                     let mut spans = make_key_spans(
@@ -565,7 +564,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                     render_locale_cells(
                         &mut spans, locales, row_key, true, false,
                         is_selected, in_scope, false, false,
-                        &state.cursor_section, &state.mode, &state.column_directive,
+                        state.cursor.locale.as_deref(), &state.mode, &state.column_directive,
                         &dirty_cells, &bundle.name, &bundle.locales,
                         None, // no Entry (header row)
                     );
@@ -579,7 +578,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             // ── Entry (key) row ───────────────────────────────────────────────
             trim_ctx_to_ancestor(&mut ctx_stack, &rk);
 
-            let is_selected = visual_row == state.cursor_row;
+            let is_selected = cursor_bundle == bundle_opt && state.cursor.segments == entry.segments;
             if visual_row >= state.scroll_offset {
                 let display = relative_display(&rk, ctx_stack.last().map(|s| s.as_str()));
                 let depth   = entry_visual_depth(&entry.segments, &bundle.groups) + bundle_offset;
@@ -596,7 +595,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 let on_path  = on_path_check(is_selected, full_key, cursor_full_key_str, &scope_anchor);
                 let row_in_selection = is_selected || on_path || in_scope;
 
-                let select_style = non_bundle_select_style(is_selected, &state.cursor_section);
+                let select_style = non_bundle_select_style(is_selected, state.cursor.is_key_col());
                 let base_style = if entry.is_temp_pinned {
                     Style::default().fg(Color::Green).add_modifier(Modifier::DIM)
                 } else if entry.is_pinned || entry.is_dirty {
@@ -612,7 +611,7 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 render_locale_cells(
                     &mut spans, locales, full_key, false, entry.is_temp_pinned,
                     is_selected, in_scope, entry.is_pinned, entry.is_dirty,
-                    &state.cursor_section, &state.mode, &state.column_directive,
+                    state.cursor.locale.as_deref(), &state.mode, &state.column_directive,
                     &dirty_cells, &bundle.name, &bundle.locales,
                     Some(entry),
                 );
@@ -635,8 +634,8 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
 
 // ── draw_table helpers ────────────────────────────────────────────────────────
 
-fn bundle_header_select_style(is_selected: bool, section: &CursorSection) -> Style {
-    if is_selected && section.is_key() {
+fn bundle_header_select_style(is_selected: bool, is_key_col: bool) -> Style {
+    if is_selected && is_key_col {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else if is_selected {
         Style::default().add_modifier(Modifier::BOLD)
@@ -645,8 +644,8 @@ fn bundle_header_select_style(is_selected: bool, section: &CursorSection) -> Sty
     }
 }
 
-fn non_bundle_select_style(is_selected: bool, section: &CursorSection) -> Style {
-    if is_selected && section.is_key() {
+fn non_bundle_select_style(is_selected: bool, is_key_col: bool) -> Style {
+    if is_selected && is_key_col {
         Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
     } else if is_selected {
         Style::default().add_modifier(Modifier::BOLD)
@@ -680,7 +679,7 @@ fn render_locale_cells(
     in_scope: bool,
     is_perm_pinned: bool,
     is_dirty_row: bool,
-    cursor_section: &CursorSection,
+    cursor_locale: Option<&str>,
     mode: &Mode,
     column_directive: &ColumnDirective,
     dirty_cells: &std::collections::HashSet<(&str, &str)>,
@@ -688,11 +687,11 @@ fn render_locale_cells(
     bundle_locales: &[String],
     entry: Option<&crate::render_model::Entry>,
 ) {
-    for (col_idx, locale) in locales.iter().enumerate() {
+    for locale in locales.iter() {
         // Skip locales not present in this bundle.
         if !bundle_locales.contains(locale) { continue; }
 
-        let is_cursor_cell = is_selected && *cursor_section == CursorSection::Locale(col_idx);
+        let is_cursor_cell = is_selected && cursor_locale == Some(locale.as_str());
 
         // Look up the value: from Entry cells for key rows, None for headers.
         let value: Option<&str> = if is_header {

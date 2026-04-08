@@ -1,35 +1,63 @@
-messages:[default]   [de]   [si]
-  app: [default] Application  [de] <missing>  [si] <missing>
-    .completely.seminew: [default] New  [de] <missing>  [si] <missing>
-      .identifier: [default] Name  [de] <missing>  [si] <missing>
-      .key: [default] new translation  [de] <missing>  [si] <missing>
-    .confirm: [default] test  [de] <missing>  [si] <missing>
-      .delete: [default] Are you sure you want to delete this item? This action cannot be undone and all a
-      .discard: [default] You have unsaved changes. Discard them?  [de] <missing>  [si] <missing>
-    .loading: [default] Loading…  [de] <missing>  [si] <missing>
-    .status: [default] Status  [de] <missing>  [si] <missing>
-      .error: [default] Could not save: {0}  [de] <missing>  [si] <missing>
-      .saved: [default] Changes saved  [de] <missing>  [si] <missing>
-    .testing: [default] test  [de] <missing>  [si] <missing>
-    .title: [default] Property Manager  [de] <missing>  [si] <missing>
-    .version: [default] Version {0}  [de] <missing>  [si] <missing>
-translations:[default]   [de]   [si]
-  com.myapp.error: [default] Error  [de] Fehler  [si] <missing>
-    .notfound: [default] Not found  [de] Nicht gefunden  [si] Ni najdeno
-    .servererror: [default] Server error  [de] <missing>  [si] <missing>
-    .timeout: [default] Timeout  [de] Zeitüberschreitung  [si] Prekoračitev časa
-      .deeper: [default] Deeper  [de] <missing>  [si] <missing>
-    .unauthorized: [default] Unauthorized  [de] Sie sind nicht berechtigt, diese Aktion durchzuführen..  [
-    .unexpected: [default] An unexpected error occurred. Please try again, or contact support if the probl
-  com.myapp.ui.button: [default] Button  [de] <missing>  [si] <missing>
-    .abort: [default] Abort  [de] Abbrechen  [si] <missing>
-    .confirm: [default] Confirm  [de] first test  [si] <missing>
-    .delete: [default] Delete  [de] Löschen  [si] <missing>
-    .save: [default] Save  [de] Speichern  [si] Shrani
-  com.myapp.ui.label:[default]   [de]   [si]
-    .created: [default] Created  [de] Erstellt  [si] <missing>
-    .email: [default] Email address  [de] E-Mail-Adresse  [si] E-poštni naslov
-    .name: [default] Name  [de] Name  [si] Ime
-  com.myapp.ui.placeholder:[default]   [de]   [si]
-    .name: [default] Enter your name  [de] <missing>  [si] <missing>
-    .search: [default] Search…  [de] Suchen…  [si] <missing>
+stripping:[default]
+  action:[default]
+    .delete: [default] Delete
+    .save: [default] Save
+    .toolbar:[default]
+      .export: [default] Export
+      .save: [default] Save Document
+      .saveAs: [default] Save As…
+  app.settings.locale:[default]
+    .calendar: [default] gregorian
+    .language: [default] en
+    .region: [default] AT
+  app.settings.notifications.email:[default]
+    .digest: [default] daily
+    .unsubscribe: [default] Unsubscribe
+  app.settings.notifications.push:[default]
+    .enabled: [default] true
+    .sound: [default] chime
+  app.settings.theme: [default] dark
+  app.ui.layout.main.content.empty:[default]
+    .hint: [default] Add an item to get started
+    .title: [default] Nothing here yet
+  app.ui.layout.main.content.placeholder: [default] Start typing…
+  app.ui.layout.main.toolbar:[default]
+    .cancel: [default] Cancel
+    .save: [default] Save
+    .undo: [default] Undo
+  app.ui.layout.sidebar.footer:[default]
+    .copyright: [default] © 2024 Acme
+    .version: [default] v1.0.0
+  app.ui.layout.sidebar.header:[default]
+    .subtitle: [default] Sidebar Subtitle
+    .title: [default] Sidebar Title
+  common:[default]
+    .no: [default] no
+    .responses:[default]
+      .maybe: [default] Perhaps
+      .no: [default] Denied
+      .yes: [default] Confirmed
+    .yes: [default] yes
+  copy.target.button:[default]
+    .icon: [default] clipboard
+    .label: [default] Copy
+  copy.target.tooltip:[default]
+    .duration: [default] 2000
+    .text: [default] Copied!
+  http.status:[default]
+    .200: [default] OK
+    .400: [default] Bad Request
+    .401: [default] Unauthorized
+    .403: [default] Forbidden
+    .404: [default] Not Found
+    .500: [default] Internal Server Error
+  report.detail.chart:[default]
+    .label: [default] Chart
+    .noData: [default] No data available
+  report.detail.table.footer: [default] End of report
+  report.detail.table.header:[default]
+    .amount: [default] Amount
+    .date: [default] Date
+  report.summary: [default] Executive Summary
+    .author: [default] Author Name
+    .title: [default] Report Title

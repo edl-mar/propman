@@ -58,12 +58,12 @@ pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: 
     }
     let dot_prefix = format!("{old_prefix}.");
 
-    let visible: std::collections::HashSet<&str> = if !all_children {
-        state.display_rows.iter()
-            .filter_map(|r| match r {
-                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
-                _ => None,
-            })
+    let visible: std::collections::HashSet<String> = if !all_children {
+        state.render_model.bundles.iter()
+            .flat_map(|b| b.entries.iter().map(move |e| {
+                let key = e.segments.join(".");
+                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
+            }))
             .collect()
     } else {
         std::collections::HashSet::new()
@@ -197,12 +197,12 @@ fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new
 
     let dot_prefix = format!("{old_prefix}.");
 
-    let visible: std::collections::HashSet<&str> = if !all_children {
-        state.display_rows.iter()
-            .filter_map(|r| match r {
-                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
-                _ => None,
-            })
+    let visible: std::collections::HashSet<String> = if !all_children {
+        state.render_model.bundles.iter()
+            .flat_map(|b| b.entries.iter().map(move |e| {
+                let key = e.segments.join(".");
+                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
+            }))
             .collect()
     } else {
         std::collections::HashSet::new()
@@ -308,12 +308,12 @@ pub fn commit_prefix_copy(state: &mut AppState, old_prefix: &str, new_prefix: St
     }
 
     let dot_prefix = format!("{old_prefix}.");
-    let visible: std::collections::HashSet<&str> = if !all_children {
-        state.display_rows.iter()
-            .filter_map(|r| match r {
-                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
-                _ => None,
-            })
+    let visible: std::collections::HashSet<String> = if !all_children {
+        state.render_model.bundles.iter()
+            .flat_map(|b| b.entries.iter().map(move |e| {
+                let key = e.segments.join(".");
+                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
+            }))
             .collect()
     } else {
         std::collections::HashSet::new()

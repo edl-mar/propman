@@ -2,22 +2,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::workspace;
 // BTreeMap is used only in build_render_model (to keep bundles in alphabetical order).
 
-#[derive(Debug, Clone)]
-pub enum DisplayRow {
-    /// A non-key branch point that acts as a visual group header.
-    /// `display` is the text shown (relative suffix under any enclosing header).
-    /// `prefix`  is the full key prefix — used for workspace lookups and edits.
-    ///           For bundle headers this is just the bundle name (e.g. `"messages"`).
-    ///           For within-bundle headers it is bundle-qualified (e.g. `"messages:app.confirm"`).
-    /// `depth`   drives indentation.
-    Header { display: String, prefix: String, depth: usize },
-    /// A selectable translation row.
-    /// `display` is the text shown (".suffix" when under a header/key-parent, full key otherwise).
-    /// `full_key` is the complete key — bundle-qualified when bundles are present
-    ///            (e.g. `"messages:app.title"`), bare otherwise (e.g. `"app.title"`).
-    /// `depth`    drives indentation.
-    Key { display: String, full_key: String, depth: usize },
-}
 
 
 // ── Hierarchical Render Model ─────────────────────────────────────────────────
@@ -96,6 +80,55 @@ pub struct BundleModel {
 #[derive(Debug, Clone)]
 pub struct RenderModel {
     pub bundles: Vec<BundleModel>,
+}
+
+/// A single visual row's identity, used for cursor navigation.
+///
+/// `bundle`   — `None` for bare/legacy keys, `Some(name)` for a named bundle.
+/// `segments` — empty vec = bundle header row; non-empty = group header or entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisualPosition {
+    pub bundle:   Option<String>,
+    pub segments: Vec<String>,
+}
+
+/// Enumerate every visual row produced by `rm` and return its identity.
+///
+/// The order and count matches exactly what `draw_table` emits: bundle header,
+/// then for each entry any branch-group header rows, then the entry row itself.
+/// This is the canonical source for cursor↔visual-row conversion.
+pub fn all_visual_positions(rm: &RenderModel) -> Vec<VisualPosition> {
+    let mut out = Vec::new();
+    for bundle in &rm.bundles {
+        let bname: Option<String> = if bundle.name.is_empty() { None } else { Some(bundle.name.clone()) };
+        if !bundle.name.is_empty() {
+            out.push(VisualPosition { bundle: bname.clone(), segments: vec![] });
+        }
+        for (i, entry) in bundle.entries.iter().enumerate() {
+            let rk = entry.real_key();
+            let mut header_groups: Vec<(&str, &Group)> = bundle.groups.iter()
+                .filter(|(prefix, g)| {
+                    g.first_entry == i
+                        && g.is_branch
+                        && prefix.split('.').count() == g.depth + 1
+                        && prefix.as_str() != rk
+                        && g.label != rk
+                })
+                .map(|(p, g)| (p.as_str(), g))
+                .collect();
+            header_groups.sort_by_key(|(_, g)| g.depth);
+            for (prefix, group) in &header_groups {
+                let ep = group_effective_path(prefix, &group.label);
+                let segs: Vec<String> = ep.split('.').map(|s| s.to_string()).collect();
+                out.push(VisualPosition { bundle: bname.clone(), segments: segs });
+            }
+            out.push(VisualPosition {
+                bundle:   bname.clone(),
+                segments: entry.segments.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Build a `RenderModel` from the workspace and the current filter/display state.
@@ -320,91 +353,6 @@ fn common_prefix_len(a: &[String], b: &[String]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
-// ── Display row derivation ────────────────────────────────────────────────────
-//
-// These functions replace the trie-based `build_display_rows` approach.
-// They produce an identical `Vec<DisplayRow>` from the hierarchical `RenderModel`.
-
-/// Derives the flat `Vec<DisplayRow>` from the hierarchical render model.
-/// Produces the same row ordering and display strings as the old trie-based
-/// `build_display_rows`, driven by the group-merge data instead of a trie walk.
-pub fn display_rows_from_render_model(rm: &RenderModel) -> Vec<DisplayRow> {
-    let mut rows = Vec::new();
-    for bundle in &rm.bundles {
-        rows_for_bundle(bundle, &mut rows);
-    }
-    rows
-}
-
-fn rows_for_bundle(bundle: &BundleModel, rows: &mut Vec<DisplayRow>) {
-    let bundle_offset: usize;
-    if bundle.name.is_empty() {
-        bundle_offset = 0;
-    } else {
-        rows.push(DisplayRow::Header {
-            display: bundle.name.clone(),
-            prefix:  bundle.name.clone(),
-            depth:   0,
-        });
-        bundle_offset = 1;
-    }
-
-    // Context stack: effective paths (bare, within-bundle) of the most recently
-    // emitted headers/key-parents.  The top is the nearest enclosing context.
-    let mut ctx_stack: Vec<String> = Vec::new();
-
-    for (i, entry) in bundle.entries.iter().enumerate() {
-        let rk = entry.real_key();
-
-        // ── Branch group headers for this entry ──────────────────────────────
-        let mut header_groups: Vec<(&str, &Group)> = bundle
-            .groups
-            .iter()
-            .filter(|(prefix, g)| {
-                g.first_entry == i
-                    && g.is_branch
-                    // Use only the canonical prefix (depth of prefix == group.depth).
-                    && prefix.split('.').count() == g.depth + 1
-                    // Skip when this group IS the entry's own position (key-parent).
-                    && prefix.as_str() != rk
-                    // Skip when the merged label terminates at the entry's key.
-                    && g.label != rk
-            })
-            .map(|(p, g)| (p.as_str(), g))
-            .collect();
-
-        // Shallowest groups first (top-down visual order).
-        header_groups.sort_by_key(|(_, g)| g.depth);
-
-        for (prefix, group) in &header_groups {
-            let ep = group_effective_path(prefix, &group.label);
-            trim_ctx_to_ancestor(&mut ctx_stack, &ep);
-
-            let display = relative_display(&ep, ctx_stack.last().map(|s| s.as_str()));
-            let depth   = group_visual_depth(prefix, &bundle.groups) + bundle_offset;
-            let qualified = qualify(&bundle.name, &ep);
-
-            rows.push(DisplayRow::Header { display, prefix: qualified, depth });
-            ctx_stack.push(ep);
-        }
-
-        // ── Entry (key) row ───────────────────────────────────────────────────
-        trim_ctx_to_ancestor(&mut ctx_stack, &rk);
-        let display  = relative_display(&rk, ctx_stack.last().map(|s| s.as_str()));
-        let depth    = entry_visual_depth(&entry.segments, &bundle.groups) + bundle_offset;
-        let full_key = qualify(&bundle.name, &rk);
-
-        rows.push(DisplayRow::Key { display, full_key, depth });
-
-        // If this entry has children, push it as context so the children render
-        // as ".suffix" relative to it.
-        if bundle.entries.get(i + 1)
-            .map_or(false, |next| next.real_key().starts_with(&format!("{rk}.")))
-        {
-            ctx_stack.push(rk);
-        }
-    }
-}
 
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
@@ -497,9 +445,14 @@ mod tests {
         ks.iter().map(|s| s.to_string()).collect()
     }
 
+    // ── Test-only display row type ──────────────────────────────────────────────
+    enum TestRow {
+        Header { display: String, prefix: String, depth: usize },
+        Key    { display: String, full_key: String, depth: usize },
+    }
+
     /// Build display rows from a list of bare keys (no bundle prefix).
-    /// Replaces the old `build_display_rows(&keys, &[])` call in tests.
-    fn rows_from_bare_keys(ks: &[&str]) -> Vec<DisplayRow> {
+    fn rows_from_bare_keys(ks: &[&str]) -> Vec<TestRow> {
         let mut sorted: Vec<String> = ks.iter().map(|s| s.to_string()).collect();
         sorted.sort();
         let entries: Vec<Entry> = sorted.iter().map(|k| Entry {
@@ -510,31 +463,65 @@ mod tests {
             is_temp_pinned: false,
         }).collect();
         let groups = build_groups(&entries);
-        let rm = RenderModel { bundles: vec![BundleModel {
-            name: String::new(),
-            locales: vec![],
-            entries,
-            groups,
-        }]};
-        display_rows_from_render_model(&rm)
+        let bundle = BundleModel { name: String::new(), locales: vec![], entries, groups };
+
+        let mut rows: Vec<TestRow> = Vec::new();
+        let mut ctx_stack: Vec<String> = Vec::new();
+
+        for (i, entry) in bundle.entries.iter().enumerate() {
+            let rk = entry.real_key();
+
+            let mut header_groups: Vec<(&str, &Group)> = bundle.groups.iter()
+                .filter(|(prefix, g)| {
+                    g.first_entry == i
+                        && g.is_branch
+                        && prefix.split('.').count() == g.depth + 1
+                        && prefix.as_str() != rk
+                        && g.label != rk
+                })
+                .map(|(p, g)| (p.as_str(), g))
+                .collect();
+            header_groups.sort_by_key(|(_, g)| g.depth);
+
+            for (prefix, group) in &header_groups {
+                let ep = group_effective_path(prefix, &group.label);
+                trim_ctx_to_ancestor(&mut ctx_stack, &ep);
+                let display = relative_display(&ep, ctx_stack.last().map(|s| s.as_str()));
+                let depth   = group_visual_depth(prefix, &bundle.groups);
+                rows.push(TestRow::Header { display, prefix: ep.clone(), depth });
+                ctx_stack.push(ep);
+            }
+
+            trim_ctx_to_ancestor(&mut ctx_stack, &rk);
+            let display  = relative_display(&rk, ctx_stack.last().map(|s| s.as_str()));
+            let depth    = entry_visual_depth(&entry.segments, &bundle.groups);
+            rows.push(TestRow::Key { display, full_key: rk.clone(), depth });
+
+            if bundle.entries.get(i + 1)
+                .map_or(false, |next| next.real_key().starts_with(&format!("{rk}.")))
+            {
+                ctx_stack.push(rk);
+            }
+        }
+        rows
     }
 
-    fn headers(rows: &[DisplayRow]) -> Vec<&str> {
+    fn headers(rows: &[TestRow]) -> Vec<&str> {
         rows.iter().filter_map(|r| match r {
-            DisplayRow::Header { prefix, .. } => Some(prefix.as_str()),
+            TestRow::Header { prefix, .. } => Some(prefix.as_str()),
             _ => None,
         }).collect()
     }
 
-    fn displays(rows: &[DisplayRow]) -> Vec<&str> {
+    fn displays(rows: &[TestRow]) -> Vec<&str> {
         rows.iter().map(|r| match r {
-            DisplayRow::Header { display, .. } | DisplayRow::Key { display, .. } => display.as_str(),
+            TestRow::Header { display, .. } | TestRow::Key { display, .. } => display.as_str(),
         }).collect()
     }
 
-    fn depths(rows: &[DisplayRow]) -> Vec<usize> {
+    fn depths(rows: &[TestRow]) -> Vec<usize> {
         rows.iter().map(|r| match r {
-            DisplayRow::Header { depth, .. } | DisplayRow::Key { depth, .. } => *depth,
+            TestRow::Header { depth, .. } | TestRow::Key { depth, .. } => *depth,
         }).collect()
     }
 
@@ -553,7 +540,7 @@ mod tests {
         // no wrapping Header for the intermediate "app" node.
         let rows = rows_from_bare_keys(&["app.loading"]);
         assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
+        assert!(matches!(&rows[0], TestRow::Key { full_key, depth, .. }
             if full_key == "app.loading" && *depth == 0));
     }
 
@@ -562,7 +549,7 @@ mod tests {
         // A key with no dots has no intermediate node — no Header emitted.
         let rows = rows_from_bare_keys(&["loading"]);
         assert_eq!(rows.len(), 1);
-        assert!(matches!(&rows[0], DisplayRow::Key { full_key, depth, .. }
+        assert!(matches!(&rows[0], TestRow::Key { full_key, depth, .. }
             if full_key == "loading" && *depth == 0));
     }
 
@@ -635,7 +622,7 @@ mod tests {
             "app.a.f",
         ]);
         assert_eq!(headers(&rows), vec!["app.a", "app.a.b"]);
-        assert!(matches!(&rows[1], DisplayRow::Header { display, depth, .. }
+        assert!(matches!(&rows[1], TestRow::Header { display, depth, .. }
             if display == ".b" && *depth == 1));
         assert_eq!(displays(&rows), vec!["app.a", ".b", ".c", ".d", ".e", ".f"]);
         assert_eq!(depths(&rows),   vec![0,         1,    2,    2,    1,    1]);

@@ -4,7 +4,7 @@ use tui_textarea::TextArea;
 use crate::{
     editor::CellEdit,
     filter::{self, ColumnDirective},
-    render_model::{self, DisplayRow, RenderModel},
+    render_model::{self, RenderModel, VisualPosition},
     workspace::{self, Workspace},
 };
 
@@ -38,39 +38,36 @@ pub enum PendingChange {
     },
 }
 
-/// Which column region the cursor is in.
+/// The structured cursor.  Replaces the old `cursor_row + CursorSection + preferred_locale`.
 ///
-/// Replaces the old `(cursor_col: usize, key_segment_cursor: usize)` pair.
-/// `cursor_col == 0` → `Key { segment: 0 }`; `cursor_col == n+1` → `Locale(n)`.
-/// The `segment` field tracks how many dot-segments above the row's leaf the
-/// key-segment anchor has been extended (0 = anchor at the full key / leaf).
+/// `bundle`   — bundle name; `None` for bare/legacy keys.
+/// `segments` — key path within the bundle.  Empty = bundle header row.
+///              Non-empty = group header row or specific entry row.
+/// `locale`   — locale column; `None` = key column.
+///              Stored as the "preferred" locale — may not exist in the current
+///              bundle; `effective_locale_idx()` resolves the actual visible column.
 #[derive(Debug, Clone, PartialEq)]
-pub enum CursorSection {
-    Key { segment: usize },
-    Locale(usize),
+pub struct Cursor {
+    pub bundle:   Option<String>,
+    pub segments: Vec<String>,
+    pub locale:   Option<String>,
 }
 
-impl CursorSection {
-    /// Returns `true` when the cursor is in the key column.
-    pub fn is_key(&self) -> bool {
-        matches!(self, Self::Key { .. })
-    }
+impl Cursor {
+    /// True when the cursor is in the key column.
+    pub fn is_key_col(&self) -> bool { self.locale.is_none() }
 
-    /// Returns the 0-based locale index, or `None` when on the key column.
-    pub fn locale_idx(&self) -> Option<usize> {
-        match self {
-            Self::Locale(idx) => Some(*idx),
-            Self::Key { .. } => None,
-        }
-    }
+    /// True when the cursor is on a bundle header row.
+    pub fn is_bundle_header(&self) -> bool { self.segments.is_empty() }
 
-    /// Resets the key-segment anchor to the leaf position (segment = 0).
-    /// A no-op when the cursor is already on a locale column.
-    pub fn reset_segment(self) -> Self {
-        match self {
-            Self::Key { .. } => Self::Key { segment: 0 },
-            other => other,
-        }
+    /// Bundle-qualified full key string, or `None` when on a bundle header.
+    pub fn full_key(&self) -> Option<String> {
+        if self.is_bundle_header() { return None; }
+        let key = self.segments.join(".");
+        Some(match &self.bundle {
+            Some(b) => format!("{b}:{key}"),
+            None    => key,
+        })
     }
 }
 
@@ -141,25 +138,13 @@ pub enum Mode {
 #[derive(Debug)]
 pub struct AppState {
     pub workspace: Workspace,
-    /// Flat list of header + key rows derived from `workspace.merged_keys`.
-    /// `cursor_row` indexes into this vec; `Header` rows are skipped during navigation.
-    pub display_rows: Vec<DisplayRow>,
-    /// Hierarchical render model built in parallel with `display_rows`.
-    /// The renderer will switch to consuming this once Step 2 of the refactoring lands.
+    /// Hierarchical render model: single source of truth for rendered rows.
     pub render_model: RenderModel,
     /// Locale columns currently visible; a subset of `workspace.all_locales()`
     /// when a locale selector is active, otherwise the full list.
     pub visible_locales: Vec<String>,
-    /// Index into `display_rows`. Always points at a `Key` variant.
-    pub cursor_row: usize,
-    /// Which column region the cursor occupies.
-    pub cursor_section: CursorSection,
-    /// The locale the user last explicitly navigated to.  `clamp_cursor_section`
-    /// will restore this locale whenever the bundle at the new row has it,
-    /// giving a "sticky column" effect across bundles that lack some locales.
-    /// Set on every explicit Left/Right navigation that lands on a locale.
-    /// Never set by clamping — only by intentional user movement.
-    pub preferred_locale: Option<String>,
+    /// Structured cursor: replaces the old `cursor_row + CursorSection + preferred_locale`.
+    pub cursor: Cursor,
     pub scroll_offset: usize,
     pub mode: Mode,
     /// Always-present single-line TextArea backing the filter bar.
@@ -209,32 +194,222 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Returns the current value at the active locale cell, or `None` when on the
-    /// key column or the key is absent from that locale file.
-    pub fn current_cell_value(&self) -> Option<String> {
-        let locale_idx = self.cursor_section.locale_idx()?;
-        let full_key = match self.display_rows.get(self.cursor_row)? {
-            DisplayRow::Key { full_key, .. } => full_key.as_str(),
-            DisplayRow::Header { prefix, .. } => prefix.as_str(),
-        };
-        let locale = self.visible_locales.get(locale_idx)?;
-        self.workspace.get_value(full_key, locale).map(|v| v.to_string())
+    // ── Cursor helpers ────────────────────────────────────────────────────────
+
+    /// The 0-based index in `visible_locales` that the cursor is effectively on.
+    ///
+    /// `cursor.locale` stores the *preferred* locale and may not exist in the
+    /// current bundle.  This method snaps left to the nearest available column,
+    /// returning `None` when no locale column is reachable (key column active).
+    pub fn effective_locale_idx(&self) -> Option<usize> {
+        let locale = self.cursor.locale.as_ref()?;
+        let bundle = self.cursor.bundle.as_deref().unwrap_or("");
+        let pref_idx = self.visible_locales.iter().position(|l| l == locale)?;
+        // Preferred locale is valid for this bundle → use it directly.
+        if bundle.is_empty() || self.workspace.bundle_has_locale(bundle, locale) {
+            return Some(pref_idx);
+        }
+        // Snap left to the nearest locale this bundle has.
+        let mut i = pref_idx;
+        loop {
+            if bundle.is_empty() || self.workspace.bundle_has_locale(bundle, &self.visible_locales[i]) {
+                return Some(i);
+            }
+            if i == 0 { break; }
+            i -= 1;
+        }
+        None
     }
 
-    /// Derives the set of locales that have at least one pending (unsaved) write.
-    /// Used to compute which locale columns to surface when `:#` or `#` is in the filter.
-    fn compute_dirty_locales(&self) -> HashSet<String> {
-        // Build a path → locale map from the workspace.
-        let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = self
-            .workspace
-            .groups
+    /// Move to a locale column by index. Updates `cursor.locale` to the locale name.
+    /// Always call this for explicit user-initiated locale navigation.
+    pub fn set_locale_cursor(&mut self, idx: usize) {
+        self.cursor.locale = self.visible_locales.get(idx).cloned();
+    }
+
+    /// Returns the current value at the cursor's effective locale cell.
+    pub fn current_cell_value(&self) -> Option<String> {
+        let locale_idx = self.effective_locale_idx()?;
+        let locale = self.visible_locales.get(locale_idx)?;
+        let full_key = self.cursor.full_key()?;
+        self.workspace.get_value(&full_key, locale).map(|v| v.to_string())
+    }
+
+    /// Returns the bundle name for the current cursor row, or `""` for bare keys.
+    pub fn current_row_bundle(&self) -> &str {
+        self.cursor.bundle.as_deref().unwrap_or("")
+    }
+
+    // ── Visual-row navigation ─────────────────────────────────────────────────
+
+    /// Enumerate all visual row positions in the render model.
+    /// Cached as a local Vec; called at most a few times per keypress.
+    pub fn visual_positions(&self) -> Vec<VisualPosition> {
+        render_model::all_visual_positions(&self.render_model)
+    }
+
+    /// Flat visual row index for the current cursor position.
+    pub fn cursor_visual_row(&self) -> usize {
+        self.visual_positions()
             .iter()
+            .position(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments)
+            .unwrap_or(0)
+    }
+
+    /// Total number of visual rows.
+    pub fn total_visual_rows(&self) -> usize {
+        self.visual_positions().len()
+    }
+
+    /// Navigate to visual row `row`, preserving `cursor.locale`.
+    /// Does nothing when `row` is out of range.
+    pub fn set_visual_row(&mut self, row: usize) {
+        let positions = self.visual_positions();
+        if let Some(pos) = positions.get(row) {
+            self.cursor.bundle   = pos.bundle.clone();
+            self.cursor.segments = pos.segments.clone();
+        }
+    }
+
+    /// Clamps the cursor to a valid position in the current render model.
+    ///
+    /// Called after `apply_filter` rebuilds the model: if the cursor's key was
+    /// filtered out, climb to the nearest visible ancestor (or bundle header).
+    fn clamp_cursor_to_model(&mut self) {
+        let positions = self.visual_positions();
+        if positions.is_empty() { return; }
+        // Cursor already valid?
+        if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments) {
+            return;
+        }
+        // Walk up the segment stack until we find a visible ancestor.
+        let mut segs = self.cursor.segments.clone();
+        while !segs.is_empty() {
+            segs.pop();
+            if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments == segs) {
+                self.cursor.segments = segs;
+                return;
+            }
+        }
+        // Try bundle header.
+        if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments.is_empty()) {
+            self.cursor.segments = vec![];
+            return;
+        }
+        // Fall back to row 0 (first visible row).
+        let first = &positions[0];
+        self.cursor.bundle   = first.bundle.clone();
+        self.cursor.segments = first.segments.clone();
+    }
+
+    /// Keeps `scroll_offset` in sync so the cursor stays visible.
+    pub fn clamp_scroll(&mut self) {
+        const VIEWPORT: usize = 20;
+        let row = self.cursor_visual_row();
+        if row < self.scroll_offset {
+            self.scroll_offset = row;
+        } else if row >= self.scroll_offset + VIEWPORT {
+            self.scroll_offset = row - VIEWPORT + 1;
+        }
+    }
+
+    // ── Key-segment navigation helpers ────────────────────────────────────────
+
+    /// Find the nearest visual position in direction `forward` at the same segment
+    /// depth as the cursor, within the same bundle.
+    ///
+    /// If no row exists at the current depth in that direction, reduces depth by
+    /// 1 and retries.  For backward direction returns the topmost row of the
+    /// nearest previous group at that depth.
+    ///
+    /// Returns `(bundle, segments)` of the target row, or `None`.
+    pub fn find_depth_neighbor(&self, forward: bool) -> Option<(Option<String>, Vec<String>)> {
+        let target_depth = self.cursor.segments.len();
+        if target_depth == 0 { return None; }
+
+        let positions = self.visual_positions();
+        let current_row = positions.iter()
+            .position(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments)
+            .unwrap_or(0);
+
+        for depth in (1..=target_depth).rev() {
+            // The anchor prefix at this depth (first `depth` segments of cursor).
+            let anchor_at_depth: &[String] = &self.cursor.segments[..depth];
+
+            if forward {
+                for pos in positions[current_row + 1..].iter() {
+                    if pos.bundle != self.cursor.bundle { continue; }
+                    if pos.segments.len() < depth { continue; }
+                    if pos.segments[..depth] != *anchor_at_depth {
+                        return Some((pos.bundle.clone(), pos.segments.clone()));
+                    }
+                }
+            } else {
+                let mut found_prefix: Option<Vec<String>> = None;
+                let mut topmost_idx: Option<usize> = None;
+                for i in (0..current_row).rev() {
+                    let pos = &positions[i];
+                    if pos.bundle != self.cursor.bundle { continue; }
+                    if pos.segments.len() < depth { continue; }
+                    let pos_pfx = pos.segments[..depth].to_vec();
+                    match &found_prefix {
+                        None => {
+                            if pos_pfx != anchor_at_depth {
+                                found_prefix = Some(pos_pfx);
+                                topmost_idx  = Some(i);
+                            }
+                        }
+                        Some(fp) if *fp == pos_pfx => {
+                            topmost_idx = Some(i); // keep climbing
+                        }
+                        _ => break,
+                    }
+                }
+                if let Some(idx) = topmost_idx {
+                    let pos = &positions[idx];
+                    return Some((pos.bundle.clone(), pos.segments.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the visual position of the parent row (one segment above cursor).
+    /// Used by Left navigation to jump to a visible ancestor.
+    pub fn find_parent_position(&self) -> Option<(Option<String>, Vec<String>)> {
+        if self.cursor.segments.is_empty() { return None; }
+        let parent_segs = &self.cursor.segments[..self.cursor.segments.len() - 1];
+        let positions = self.visual_positions();
+        positions.iter().find(|p| {
+            p.bundle == self.cursor.bundle && p.segments.as_slice() == parent_segs
+        }).map(|p| (p.bundle.clone(), p.segments.clone()))
+    }
+
+    /// Find the first visual position that is a (direct or indirect) child of the cursor.
+    /// Used by Ctrl+Right (GoToFirstChild).
+    pub fn find_first_child_position(&self) -> Option<(Option<String>, Vec<String>)> {
+        let positions = self.visual_positions();
+        let current_row = positions.iter()
+            .position(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments)
+            .unwrap_or(0);
+        let parent_segs = &self.cursor.segments;
+        positions[current_row + 1..].iter().find(|p| {
+            p.bundle == self.cursor.bundle
+                && p.segments.len() > parent_segs.len()
+                && p.segments[..parent_segs.len()] == *parent_segs
+        }).map(|p| (p.bundle.clone(), p.segments.clone()))
+    }
+
+    // ── Filter ────────────────────────────────────────────────────────────────
+
+    /// Derives the set of locales that have at least one pending (unsaved) write.
+    fn compute_dirty_locales(&self) -> HashSet<String> {
+        let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = self
+            .workspace.groups.iter()
             .flat_map(|g| g.files.iter())
             .map(|f| (f.path.as_path(), f.locale.as_str()))
             .collect();
-
-        self.pending_writes
-            .iter()
+        self.pending_writes.iter()
             .filter_map(|c| {
                 let path = match c {
                     PendingChange::Update { path, .. } => path.as_path(),
@@ -246,49 +421,29 @@ impl AppState {
             .collect()
     }
 
-    /// Derives the set of `(full_key, locale)` pairs that have at least one pending
-    /// (unsaved) write.  Used to compute `LocaleCell.is_dirty` in the render model.
+    /// Derives `(full_key, locale)` pairs that have at least one pending write.
     fn compute_dirty_cells(&self) -> HashSet<(String, String)> {
         let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = self
-            .workspace
-            .groups
-            .iter()
+            .workspace.groups.iter()
             .flat_map(|g| g.files.iter())
             .map(|f| (f.path.as_path(), f.locale.as_str()))
             .collect();
-
-        self.pending_writes
-            .iter()
+        self.pending_writes.iter()
             .filter_map(|c| {
                 let (path, full_key) = match c {
-                    PendingChange::Update { path, full_key, .. } => {
-                        (path.as_path(), full_key.as_str())
-                    }
-                    PendingChange::Insert { path, full_key, .. } => {
-                        (path.as_path(), full_key.as_str())
-                    }
-                    PendingChange::Delete { path, full_key, .. } => {
-                        (path.as_path(), full_key.as_str())
-                    }
+                    PendingChange::Update { path, full_key, .. } => (path.as_path(), full_key.as_str()),
+                    PendingChange::Insert { path, full_key, .. } => (path.as_path(), full_key.as_str()),
+                    PendingChange::Delete { path, full_key, .. } => (path.as_path(), full_key.as_str()),
                 };
-                path_to_locale
-                    .get(path)
+                path_to_locale.get(path)
                     .map(|locale| (full_key.to_string(), locale.to_string()))
             })
             .collect()
     }
 
-    /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
-    /// then clamps the cursor to the new bounds.
+    /// Re-evaluates the filter query, rebuilds `render_model` and `visible_locales`,
+    /// then clamps the cursor.
     pub fn apply_filter(&mut self) {
-        self.cursor_section = self.cursor_section.clone().reset_segment();
-        // Remember the selected key so we can restore cursor position after rebuild.
-        let selected_key: Option<String> = match self.display_rows.get(self.cursor_row) {
-            Some(DisplayRow::Key    { full_key, .. }) => Some(full_key.clone()),
-            Some(DisplayRow::Header { prefix,   .. }) => Some(prefix.clone()),
-            None => None,
-        };
-
         let query = self.filter_textarea.lines()[0].clone();
         let (filtered, visible, directive) = if query.trim().is_empty() {
             (
@@ -313,8 +468,8 @@ impl AppState {
             (filtered, visible, directive)
         };
         let bundle_names = self.workspace.bundle_names();
-        let dirty_cells = self.compute_dirty_cells();
-        let new_rm = render_model::build_render_model(
+        let dirty_cells  = self.compute_dirty_cells();
+        self.render_model = render_model::build_render_model(
             &self.workspace,
             &filtered,
             &bundle_names,
@@ -324,21 +479,14 @@ impl AppState {
             &self.pinned_keys,
             &self.temp_pins,
         );
-        self.display_rows = render_model::display_rows_from_render_model(&new_rm);
-        self.render_model = new_rm;
         self.visible_locales = visible;
         self.column_directive = directive;
-        let max_row = self.display_rows.len().saturating_sub(1);
-        // Restore cursor to the same key if still visible; otherwise clamp.
-        self.cursor_row = selected_key
-            .and_then(|key| self.display_rows.iter().position(|r| match r {
-                DisplayRow::Key    { full_key, .. } => *full_key == key,
-                DisplayRow::Header { prefix,   .. } => *prefix   == key,
-            }))
-            .unwrap_or_else(|| self.cursor_row.min(max_row));
-        self.clamp_cursor_section();
+        // Cursor is its own identity — just clamp it to the new model.
+        self.clamp_cursor_to_model();
         self.clamp_scroll();
     }
+
+    // ── Clipboard ─────────────────────────────────────────────────────────────
 
     /// Returns clipboard locales in table column order (`visible_locales` first,
     /// then any clipboard locales not currently visible, alphabetically).
@@ -358,90 +506,14 @@ impl AppState {
         keys
     }
 
-    /// Returns the bundle name for the current cursor row, or `""` for bare keys.
-    pub fn current_row_bundle(&self) -> &str {
-        match self.display_rows.get(self.cursor_row) {
-            Some(DisplayRow::Key { full_key, .. }) => workspace::split_key(full_key).0,
-            Some(DisplayRow::Header { prefix, .. }) => {
-                // Bundle-level headers have no colon — the prefix IS the bundle name.
-                if self.workspace.is_bundle_name(prefix) {
-                    prefix.as_str()
-                } else {
-                    workspace::split_key(prefix).0
-                }
-            }
-            None => "",
-        }
-    }
-
-    /// Move the cursor to a locale column and record it as the preferred locale.
-    /// Always call this for explicit user-initiated locale navigation so that
-    /// `clamp_cursor_section` can restore the preference on rows that lack the
-    /// current locale.  Do NOT call it from clamping code — only intentional
-    /// movement should update the preference.
-    pub fn set_locale_cursor(&mut self, idx: usize) {
-        self.cursor_section = CursorSection::Locale(idx);
-        self.preferred_locale = self.visible_locales.get(idx).cloned();
-    }
-
-    /// Snaps `cursor_section` to the best available locale column for the current
-    /// row's bundle, or falls back to `Key { segment: 0 }`.
-    ///
-    /// Priority: preferred locale > nearest locale to the left > key column.
-    /// Never modifies `preferred_locale` — only explicit user navigation does that.
-    pub fn clamp_cursor_section(&mut self) {
-        let idx = match self.cursor_section {
-            CursorSection::Locale(idx) => idx,
-            CursorSection::Key { .. } => return,
-        };
-        if self.visible_locales.is_empty() {
-            self.cursor_section = CursorSection::Key { segment: 0 };
-            return;
-        }
-        let bundle = self.current_row_bundle().to_string();
-
-        // First priority: restore the preferred locale if this bundle has it.
-        if let Some(ref preferred) = self.preferred_locale.clone() {
-            if let Some(pref_idx) = self.visible_locales.iter().position(|l| l == preferred) {
-                if self.workspace.bundle_has_locale(&bundle, &self.visible_locales[pref_idx]) {
-                    self.cursor_section = CursorSection::Locale(pref_idx);
-                    return;
-                }
-            }
-        }
-
-        // Fall back: snap left to the nearest available locale.
-        let mut i = idx.min(self.visible_locales.len() - 1);
-        loop {
-            if self.workspace.bundle_has_locale(&bundle, &self.visible_locales[i]) {
-                self.cursor_section = CursorSection::Locale(i);
-                return;
-            }
-            if i == 0 {
-                break;
-            }
-            i -= 1;
-        }
-        self.cursor_section = CursorSection::Key { segment: 0 };
-    }
-
-    /// Keeps `scroll_offset` in sync so the cursor stays visible.
-    /// Uses a hardcoded viewport estimate; the renderer will clip naturally anyway.
-    pub fn clamp_scroll(&mut self) {
-        const VIEWPORT: usize = 20;
-        if self.cursor_row < self.scroll_offset {
-            self.scroll_offset = self.cursor_row;
-        } else if self.cursor_row >= self.scroll_offset + VIEWPORT {
-            self.scroll_offset = self.cursor_row - VIEWPORT + 1;
-        }
-    }
+    // ── Constructor ───────────────────────────────────────────────────────────
 
     pub fn new(workspace: Workspace) -> Self {
-        let bundle_names = workspace.bundle_names();
+        let bundle_names  = workspace.bundle_names();
         let visible_locales = workspace.all_locales();
         let empty_keys: HashSet<String> = HashSet::new();
         let empty_cells: HashSet<(String, String)> = HashSet::new();
-        let hier_model = render_model::build_render_model(
+        let rm = render_model::build_render_model(
             &workspace,
             &workspace.merged_keys,
             &bundle_names,
@@ -451,16 +523,18 @@ impl AppState {
             &empty_keys,
             &[],
         );
-        let display_rows = render_model::display_rows_from_render_model(&hier_model);
-        let cursor_row = 0;
+        // Start at row 0.
+        let first_pos = render_model::all_visual_positions(&rm).into_iter().next();
+        let cursor = if let Some(pos) = first_pos {
+            Cursor { bundle: pos.bundle, segments: pos.segments, locale: None }
+        } else {
+            Cursor { bundle: None, segments: vec![], locale: None }
+        };
         Self {
             workspace,
-            display_rows,
-            render_model: hier_model,
+            render_model: rm,
             visible_locales,
-            cursor_row,
-            cursor_section: CursorSection::Key { segment: 0 },
-            preferred_locale: None,
+            cursor,
             scroll_offset: 0,
             mode: Mode::Normal,
             filter_textarea: TextArea::default(),
@@ -480,197 +554,5 @@ impl AppState {
             paste_locale_cursor: 0,
             paste_history_pos: std::collections::HashMap::new(),
         }
-    }
-
-    /// The maximum value `key_segment_cursor` can reach for the current cursor row.
-    /// Equal to `total_segments - 1` so the user can walk the anchor all the way
-    /// up to the first segment, regardless of how many segments are already shown
-    /// in the collapsed display.  Works for both Key and Header rows.
-    pub fn key_seg_max(&self) -> usize {
-        let full_key = match self.display_rows.get(self.cursor_row) {
-            Some(DisplayRow::Key    { full_key, .. }) => full_key.as_str(),
-            Some(DisplayRow::Header { prefix,   .. }) => prefix.as_str(),
-            _ => return 0,
-        };
-        let real = full_key.find(':').map_or(full_key, |i| &full_key[i + 1..]);
-        real.split('.').count().saturating_sub(1)
-    }
-
-    /// The "anchor" full_key the key-segment cursor points to.
-    /// With `key_segment_cursor == 0` this is the row's own full_key / prefix.
-    /// With `key_segment_cursor == k` it is the ancestor k levels above the row's key
-    /// (i.e. the first `total - k` segments).  Works for both Key and Header rows.
-    pub fn key_seg_anchor(&self) -> Option<String> {
-        let full_key = match self.display_rows.get(self.cursor_row)? {
-            DisplayRow::Key    { full_key, .. } => full_key.as_str(),
-            DisplayRow::Header { prefix,   .. } => prefix.as_str(),
-        };
-        let k = match self.cursor_section {
-            CursorSection::Key { segment } => segment,
-            CursorSection::Locale(_) => 0,
-        };
-        if k == 0 {
-            return Some(full_key.to_string());
-        }
-        let colon      = full_key.find(':');
-        let real       = colon.map_or(full_key, |i| &full_key[i + 1..]);
-        let bundle_pfx = colon.map_or("", |i| &full_key[..=i]);
-        let segs: Vec<&str> = real.split('.').collect();
-        let take = segs.len().saturating_sub(k).max(1);
-        Some(format!("{}{}", bundle_pfx, segs[..take].join(".")))
-    }
-
-    /// Return the full_key / prefix string for an arbitrary display row (not just the
-    /// cursor row).  Used by sibling-navigation helpers.
-    fn row_key_at(&self, idx: usize) -> &str {
-        match self.display_rows.get(idx) {
-            Some(DisplayRow::Key    { full_key, .. }) => full_key.as_str(),
-            Some(DisplayRow::Header { prefix,   .. }) => prefix.as_str(),
-            None => "",
-        }
-    }
-
-    /// Find the nearest row in direction `forward` at the same absolute segment
-    /// depth as the current anchor.  "Absolute depth" is the number of dot-segments
-    /// in the bundle-qualified key counted from the left (after the `:`), so
-    /// `messages:app.title` has depth 2.  The row just has to share that depth —
-    /// it doesn't need to share a parent prefix (cousins qualify).
-    ///
-    /// If no row exists at the current depth in that direction, we reduce depth by
-    /// 1 and retry, continuing until depth 1 is exhausted.
-    ///
-    /// For the backward direction the topmost row of the nearest same-depth group
-    /// is returned (landing on the header/first entry, not the last one passed).
-    ///
-    /// Returns `(row_index, k)` where `k` is the new `segment` offset to set so the
-    /// anchor highlights the correct depth level on the target row.  Returns `None`
-    /// when nothing navigable is found at any depth.
-    pub fn find_depth_neighbor(&self, forward: bool) -> Option<(usize, usize)> {
-        let anchor = self.key_seg_anchor()?;
-        let colon = anchor.find(':');
-        let bundle_pfx = colon.map_or("", |i| &anchor[..=i]);
-        let anchor_real = colon.map_or(anchor.as_str(), |i| &anchor[i + 1..]);
-        let anchor_segs: Vec<&str> = anchor_real.split('.').collect();
-        let max_depth = anchor_segs.len();
-        let n = self.display_rows.len();
-        let start = self.cursor_row;
-
-        // The d-depth prefix of the anchor (first d segments joined with '.').
-        // Used to skip rows that are inside the same subtree.
-        let anchor_prefix = |d: usize| -> String { anchor_segs[..d].join(".") };
-
-        // Given a row index, return `Some((d-depth prefix string, total_segs))` if the
-        // row belongs to the same bundle and has at least d segments, else `None`.
-        let row_info_at = |idx: usize, d: usize| -> Option<(String, usize)> {
-            let rk = self.row_key_at(idx);
-            let rk_colon = rk.find(':');
-            if rk_colon.map_or("", |j| &rk[..=j]) != bundle_pfx {
-                return None;
-            }
-            let rk_real = rk_colon.map_or(rk, |j| &rk[j + 1..]);
-            let segs: Vec<&str> = rk_real.split('.').collect();
-            if segs.len() < d {
-                return None;
-            }
-            Some((segs[..d].join("."), segs.len()))
-        };
-
-        for depth in (1..=max_depth).rev() {
-            let ap = anchor_prefix(depth);
-
-            if forward {
-                for i in (start + 1)..n {
-                    if let Some((prefix_d, total_segs)) = row_info_at(i, depth) {
-                        if prefix_d != ap {
-                            // k = how many segments below the depth-anchor the target row goes
-                            let k = total_segs.saturating_sub(depth);
-                            return Some((i, k));
-                        }
-                    }
-                }
-            } else {
-                // Backward: we want the topmost row of the nearest previous group at
-                // this depth that has a different d-prefix than the anchor.
-                let mut found_prefix: Option<String> = None;
-                let mut topmost: Option<(usize, usize)> = None;
-
-                for i in (0..start).rev() {
-                    if let Some((prefix_d, total_segs)) = row_info_at(i, depth) {
-                        match &found_prefix {
-                            None => {
-                                if prefix_d != ap {
-                                    found_prefix = Some(prefix_d);
-                                    topmost = Some((i, total_segs));
-                                }
-                            }
-                            Some(fp) if *fp == prefix_d => {
-                                // Earlier row of the same neighbor group — keep going up.
-                                topmost = Some((i, total_segs));
-                            }
-                            _ => break, // crossed into yet another group — stop
-                        }
-                    }
-                }
-                if let Some((row, total_segs)) = topmost {
-                    let k = total_segs.saturating_sub(depth);
-                    return Some((row, k));
-                }
-            }
-        }
-        None
-    }
-
-    /// Find the display row whose full_key / prefix exactly equals the current anchor,
-    /// excluding the cursor row itself.  Used by Left navigation to jump the cursor
-    /// to a parent row when it has a visible display entry.
-    pub fn find_anchor_row(&self) -> Option<usize> {
-        let anchor = self.key_seg_anchor()?;
-        self.display_rows.iter().enumerate().find_map(|(i, row)| {
-            if i == self.cursor_row { return None; }
-            let rk = match row {
-                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
-                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
-            };
-            if rk == anchor { Some(i) } else { None }
-        })
-    }
-
-    /// Find the first row that is a direct or indirect child of the current anchor.
-    /// Searches the entire display list so it works even when the anchor's subtree
-    /// starts before the cursor row (e.g. when k > 0).
-    pub fn find_first_child(&self) -> Option<usize> {
-        let anchor = self.key_seg_anchor()?;
-        let child_prefix = format!("{anchor}.");
-        self.display_rows.iter().position(|row| {
-            let rk = match row {
-                DisplayRow::Key    { full_key, .. } => full_key.as_str(),
-                DisplayRow::Header { prefix,   .. } => prefix.as_str(),
-            };
-            rk.starts_with(&child_prefix)
-        })
-    }
-
-    /// The dimmed prefix string to display before the row's natural display text
-    /// when `key_segment_cursor > 0`.  Returns `None` when there is nothing extra to show.
-    /// Works for both Key and Header rows.
-    pub fn key_seg_extended_prefix(&self) -> Option<String> {
-        let k = match self.cursor_section {
-            CursorSection::Key { segment } => segment,
-            CursorSection::Locale(_) => return None,
-        };
-        if k == 0 { return None; }
-        let (full_key, display) = match self.display_rows.get(self.cursor_row)? {
-            DisplayRow::Key    { full_key, display, .. } => (full_key.as_str(), display.as_str()),
-            DisplayRow::Header { prefix,   display, .. } => (prefix.as_str(),   display.as_str()),
-        };
-        let real = full_key.find(':').map_or(full_key, |i| &full_key[i + 1..]);
-        let segs: Vec<&str> = real.split('.').collect();
-        let total        = segs.len();
-        let shown        = display.trim_start_matches('.').split('.').count();
-        let k            = k.min(total.saturating_sub(shown));
-        if k == 0 { return None; }
-        let anchor_left  = total - shown - k;
-        let context_left = total - shown;
-        Some(segs[anchor_left..context_left].join("."))
     }
 }

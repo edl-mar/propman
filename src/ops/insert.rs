@@ -1,6 +1,5 @@
 use crate::{
     parser::FileEntry,
-    render_model::DisplayRow,
     state::{AppState, PendingChange},
     workspace,
 };
@@ -126,17 +125,15 @@ pub fn apply_cell_value(state: &mut AppState, full_key: &str, locale: &str, valu
 /// Only updates existing keys. Editing a `<missing>` cell (key not in the
 /// locale file) is a no-op — handled by `commit_cell_insert` instead.
 pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
-    let locale_idx = match state.cursor_section.locale_idx() {
-        Some(i) => i,
+    let locale = match state.effective_locale_idx()
+        .and_then(|i| state.visible_locales.get(i)).cloned()
+    {
+        Some(l) => l,
         None => return,
     };
-    let locale = match state.visible_locales.get(locale_idx) {
-        Some(l) => l.clone(),
-        None => return,
-    };
-    let full_key = match state.display_rows.get(state.cursor_row) {
-        Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
-        _ => return, // Header row — no-op.
+    let full_key = match state.cursor.full_key() {
+        Some(k) if !state.cursor.is_bundle_header() => k,
+        _ => return, // Bundle header or key column — no-op.
     };
 
     // Split bundle qualifier: files store the real key without bundle prefix.
@@ -200,19 +197,15 @@ pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
 /// Inserts a new key-value entry into the appropriate locale file and queues
 /// a disk write. Called when the user commits an edit on a `<missing>` cell.
 pub fn commit_cell_insert(state: &mut AppState, new_value: String) {
-    let locale_idx = match state.cursor_section.locale_idx() {
-        Some(i) => i,
+    let locale = match state.effective_locale_idx()
+        .and_then(|i| state.visible_locales.get(i)).cloned()
+    {
+        Some(l) => l,
         None => return,
     };
-    let locale = match state.visible_locales.get(locale_idx) {
-        Some(l) => l.clone(),
-        None => return,
-    };
-    let full_key = match state.display_rows.get(state.cursor_row) {
-        Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
-        // Header rows: insert a translation for the prefix key itself.
-        Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
-        _ => return,
+    let full_key = match state.cursor.full_key() {
+        Some(k) => k,
+        None => return, // Bundle header — no-op.
     };
 
     // If this key isn't in merged_keys yet (e.g. translating a Header row whose

@@ -90,12 +90,12 @@ pub fn delete_key(state: &mut AppState, full_key: &str) {
 pub fn delete_key_prefix(state: &mut AppState, prefix: &str, all_children: bool) {
     let dot_prefix = format!("{prefix}.");
 
-    let visible: std::collections::HashSet<&str> = if !all_children {
-        state.display_rows.iter()
-            .filter_map(|r| match r {
-                crate::render_model::DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
-                _ => None,
-            })
+    let visible: std::collections::HashSet<String> = if !all_children {
+        state.render_model.bundles.iter()
+            .flat_map(|b| b.entries.iter().map(move |e| {
+                let key = e.segments.join(".");
+                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
+            }))
             .collect()
     } else {
         std::collections::HashSet::new()

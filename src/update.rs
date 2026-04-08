@@ -2,8 +2,7 @@ use crate::{
     editor::CellEdit,
     messages::Message,
     ops,
-    render_model::DisplayRow,
-    state::{AppState, CursorSection, Mode, PendingChange, SelectionScope},
+    state::{AppState, Mode, PendingChange, SelectionScope},
     workspace,
     writer,
 };
@@ -23,24 +22,23 @@ fn refresh_temp_pins(state: &mut AppState) {
         return;
     }
 
-    let key = match state.display_rows.get(state.cursor_row) {
-        Some(DisplayRow::Key    { full_key, .. }) => full_key.clone(),
-        Some(DisplayRow::Header { prefix,   .. }) => prefix.clone(),
-        None => return,
+    let key = match state.cursor.full_key() {
+        Some(k) => k,
+        None => return, // Bundle header — no children to pin.
     };
 
     let dot_key = format!("{key}.");
-    let currently_visible: std::collections::HashSet<&str> = state.display_rows.iter()
-        .filter_map(|r| match r {
-            DisplayRow::Key { full_key, .. } => Some(full_key.as_str()),
-            _ => None,
-        })
+    let currently_visible: std::collections::HashSet<String> = state.render_model.bundles.iter()
+        .flat_map(|b| b.entries.iter().map(move |e| {
+            let pfx = if b.name.is_empty() { String::new() } else { format!("{}:", b.name) };
+            format!("{pfx}{}", e.segments.join("."))
+        }))
         .collect();
 
     state.temp_pins = state.workspace.merged_keys.iter()
         .filter(|k| {
             (*k == &key || k.starts_with(&dot_key))
-                && !currently_visible.contains(k.as_str())
+                && !currently_visible.contains(*k)
         })
         .cloned()
         .collect();
@@ -56,21 +54,18 @@ fn refresh_temp_pins(state: &mut AppState) {
 /// current anchor, regardless of parent ancestry ("cousin" navigation).
 /// Falls back to plain row movement when nothing is found at any depth.
 fn sibling_nav(state: &mut AppState, forward: bool) {
-    if let Some((target, k)) = state.find_depth_neighbor(forward) {
-        state.cursor_row = target;
-        state.clamp_cursor_section();
+    if let Some((bundle, segs)) = state.find_depth_neighbor(forward) {
+        state.cursor.bundle   = bundle;
+        state.cursor.segments = segs;
+        state.cursor.locale   = None; // sibling nav resets to key column
         state.clamp_scroll();
-        refresh_temp_pins(state); // resets segment to 0
-        state.cursor_section = CursorSection::Key { segment: k }; // re-apply after reset
+        refresh_temp_pins(state);
     } else {
-        state.cursor_section = CursorSection::Key { segment: 0 };
-        let max = state.display_rows.len().saturating_sub(1);
-        if forward {
-            if state.cursor_row < max { state.cursor_row += 1; }
-        } else {
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-        }
-        state.clamp_cursor_section();
+        state.cursor.locale = None;
+        let cur = state.cursor_visual_row();
+        let max = state.total_visual_rows().saturating_sub(1);
+        let new_row = if forward { (cur + 1).min(max) } else { cur.saturating_sub(1) };
+        state.set_visual_row(new_row);
         state.clamp_scroll();
         refresh_temp_pins(state);
     }
@@ -88,17 +83,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
     match (mode, msg) {
         // ── Normal mode ──────────────────────────────────────────────────────
         (Mode::Normal, Message::MoveCursorUp) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
+            state.cursor.locale = None; // reset to key column on row movement
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::MoveCursorDown) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max { state.cursor_row += 1; }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
@@ -109,98 +104,90 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             sibling_nav(&mut state, true);
         }
         (Mode::Normal, Message::GoToFirstChild) => {
-            if let Some(target) = state.find_first_child() {
-                state.cursor_section = CursorSection::Key { segment: 0 };
-                state.cursor_row = target;
-                state.clamp_cursor_section();
+            if let Some((bundle, segs)) = state.find_first_child_position() {
+                state.cursor.bundle   = bundle;
+                state.cursor.segments = segs;
+                state.cursor.locale   = None;
                 state.clamp_scroll();
                 refresh_temp_pins(&mut state);
             }
         }
         (Mode::Normal, Message::MoveCursorLeft) => {
-            match state.cursor_section {
-                CursorSection::Key { segment } => {
-                    // Key column: move the anchor one step toward the root.
-                    // If the new anchor corresponds to a visible row, jump there
-                    // (segment resets to 0 since the anchor IS that row).
-                    let max = state.key_seg_max();
-                    if segment < max {
-                        state.cursor_section = CursorSection::Key { segment: segment + 1 };
-                        if let Some(target) = state.find_anchor_row() {
-                            state.cursor_row = target;
-                            state.cursor_section = CursorSection::Key { segment: 0 };
-                            state.clamp_cursor_section();
-                            state.clamp_scroll();
-                            refresh_temp_pins(&mut state);
+            if state.cursor.locale.is_some() {
+                // Locale column → step left, skipping missing locales.
+                // Moving left from the first locale lands on the key column.
+                let bundle = state.current_row_bundle().to_string();
+                let cur_idx = state.effective_locale_idx().unwrap_or(0);
+                let mut found = false;
+                if cur_idx > 0 {
+                    let mut i = cur_idx - 1;
+                    loop {
+                        if bundle.is_empty() || state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+                            state.set_locale_cursor(i);
+                            found = true;
+                            break;
                         }
+                        if i == 0 { break; }
+                        i -= 1;
                     }
                 }
-                CursorSection::Locale(idx) => {
-                    // Locale column: step left, skipping missing locales.
-                    // Moving left from the first locale lands on the key column.
-                    let bundle = state.current_row_bundle().to_string();
-                    let mut found = false;
-                    if idx > 0 {
-                        let mut i = idx - 1;
-                        loop {
-                            if state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
-                                state.set_locale_cursor(i);
-                                found = true;
-                                break;
-                            }
-                            if i == 0 { break; }
-                            i -= 1;
-                        }
-                    }
-                    if !found {
-                        state.cursor_section = CursorSection::Key { segment: 0 };
-                    }
+                if !found {
+                    state.cursor.locale = None;
+                }
+            } else {
+                // Key column: walk anchor one level toward root.
+                // If a parent row exists in the model, jump to it.
+                if let Some((bundle, segs)) = state.find_parent_position() {
+                    state.cursor.bundle   = bundle;
+                    state.cursor.segments = segs;
+                    state.cursor.locale   = None;
+                    state.clamp_scroll();
+                    refresh_temp_pins(&mut state);
+                } else if state.cursor.segments.len() > 1 {
+                    // Parent has no visual row — pop the segment anyway (anchor
+                    // moves to the parent prefix without jumping rows).
+                    state.cursor.segments.pop();
                 }
             }
         }
         (Mode::Normal, Message::MoveCursorRight) => {
-            match state.cursor_section {
-                CursorSection::Key { segment } if segment > 0 => {
-                    // Anchor extended: retract one step toward the leaf.
-                    state.cursor_section = CursorSection::Key { segment: segment - 1 };
+            if state.cursor.locale.is_none() {
+                // Key column: move to first available locale column
+                // (or into first child if on a group header with no locale).
+                let bundle = state.current_row_bundle().to_string();
+                let max = state.visible_locales.len();
+                let mut i = 0;
+                while i < max && !bundle.is_empty() && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+                    i += 1;
                 }
-                CursorSection::Key { .. } => {
-                    // Move to the first available locale column.
-                    let bundle = state.current_row_bundle().to_string();
-                    let max = state.visible_locales.len();
-                    let mut i = 0;
-                    while i < max && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
-                        i += 1;
-                    }
-                    if i < max {
-                        state.set_locale_cursor(i);
-                    }
+                if i < max {
+                    state.set_locale_cursor(i);
                 }
-                CursorSection::Locale(idx) => {
-                    // Move to the next locale column, skipping missing locales.
-                    let bundle = state.current_row_bundle().to_string();
-                    let max = state.visible_locales.len();
-                    let mut i = idx + 1;
-                    while i < max && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
-                        i += 1;
-                    }
-                    if i < max {
-                        state.set_locale_cursor(i);
-                    }
+            } else {
+                // Locale column: step right, skipping missing locales.
+                let bundle = state.current_row_bundle().to_string();
+                let cur_idx = state.effective_locale_idx().unwrap_or(0);
+                let max = state.visible_locales.len();
+                let mut i = cur_idx + 1;
+                while i < max && !bundle.is_empty() && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+                    i += 1;
+                }
+                if i < max {
+                    state.set_locale_cursor(i);
                 }
             }
         }
         (Mode::Pasting, Message::MoveCursorLeft) => {
             let bundle = state.current_row_bundle().to_string();
-            let idx = match state.cursor_section {
-                CursorSection::Locale(idx) => idx,
-                CursorSection::Key { .. } => return state,
+            let cur_idx = match state.effective_locale_idx() {
+                Some(i) => i,
+                None => return state,
             };
             let mut found = false;
-            if idx > 0 {
-                let mut i = idx - 1;
+            if cur_idx > 0 {
+                let mut i = cur_idx - 1;
                 loop {
-                    if state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+                    if bundle.is_empty() || state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
                         state.set_locale_cursor(i);
                         found = true;
                         break;
@@ -210,18 +197,18 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
             }
             if !found {
-                state.cursor_section = CursorSection::Key { segment: 0 };
+                state.cursor.locale = None;
             }
         }
         (Mode::Pasting, Message::MoveCursorRight) => {
             let bundle = state.current_row_bundle().to_string();
             let max = state.visible_locales.len();
-            let start = match state.cursor_section {
-                CursorSection::Key { .. } => 0,
-                CursorSection::Locale(idx) => idx + 1,
+            let start = match state.effective_locale_idx() {
+                None => 0,
+                Some(idx) => idx + 1,
             };
             let mut i = start;
-            while i < max && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+            while i < max && !bundle.is_empty() && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
                 i += 1;
             }
             if i < max {
@@ -229,117 +216,92 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (Mode::Normal, Message::PageUp) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            state.cursor_row = state.cursor_row.saturating_sub(20);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(20));
+            state.cursor.locale = None;
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::PageDown) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            let max = state.display_rows.len().saturating_sub(1);
-            state.cursor_row = (state.cursor_row + 20).min(max);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 20).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
             refresh_temp_pins(&mut state);
         }
         (_, Message::JumpToPrevBundle) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            // Find the nearest bundle-level header strictly above the cursor.
-            let target = (0..state.cursor_row).rev().find(|&i| {
-                matches!(&state.display_rows[i],
-                    DisplayRow::Header { prefix, .. }
-                    if state.workspace.is_bundle_name(prefix))
-            });
+            let positions = state.visual_positions();
+            let cur = state.cursor_visual_row();
+            let target = (0..cur).rev()
+                .find(|&i| positions[i].segments.is_empty() && positions[i].bundle.is_some());
             if let Some(row) = target {
-                state.cursor_row = row;
-                state.clamp_cursor_section();
+                state.set_visual_row(row);
+                state.cursor.locale = None;
                 state.clamp_scroll();
             }
         }
         (_, Message::JumpToNextBundle) => {
-            state.cursor_section = state.cursor_section.reset_segment();
-            // Find the nearest bundle-level header strictly below the cursor.
-            let target = (state.cursor_row + 1..state.display_rows.len()).find(|&i| {
-                matches!(&state.display_rows[i],
-                    DisplayRow::Header { prefix, .. }
-                    if state.workspace.is_bundle_name(prefix))
-            });
+            let positions = state.visual_positions();
+            let cur = state.cursor_visual_row();
+            let target = (cur + 1..positions.len())
+                .find(|&i| positions[i].segments.is_empty() && positions[i].bundle.is_some());
             if let Some(row) = target {
-                state.cursor_row = row;
-                state.clamp_cursor_section();
+                state.set_visual_row(row);
+                state.cursor.locale = None;
                 state.clamp_scroll();
             }
         }
 
         (_, Message::CycleScope) => {
             state.selection_scope = state.selection_scope.cycle();
-            // In Normal mode: refresh temp pins live (ChildrenAll gives an immediate
-            // preview; other scopes clear the pins).
-            // In KeyRenaming/Deleting: same — the active operation's visible set updates.
             refresh_temp_pins(&mut state);
         }
         (Mode::Normal, Message::StartEdit) => {
-            if state.cursor_section.is_key() {
-                // Key column: open the rename editor pre-filled with the current key.
-                let row = match state.display_rows.get(state.cursor_row) {
-                    Some(r) => r,
+            if state.cursor.is_key_col() {
+                // Block rename of bundle-level header rows.
+                if state.cursor.is_bundle_header() {
+                    return state;
+                }
+                let old_key = match state.cursor.full_key() {
+                    Some(k) => k,
                     None => return state,
                 };
-                // Block rename of bundle-level Header rows (renaming a bundle would
-                // require renaming the file on disk, which we don't support yet).
-                if let DisplayRow::Header { prefix, .. } = row {
-                    if state.workspace.is_bundle_name(prefix) {
-                        return state;
-                    }
-                }
-                let old_key = match row {
-                    DisplayRow::Key { full_key, .. } => full_key.clone(),
-                    DisplayRow::Header { prefix, .. } => prefix.clone(),
-                };
-                // Header rows have no exact key — force Children scope for them.
-                let is_header = matches!(
-                    state.display_rows.get(state.cursor_row),
-                    Some(DisplayRow::Header { .. })
-                );
-                if is_header {
+                // Group header rows have no exact key — force Children scope.
+                let is_group_header = !state.render_model.bundles.iter()
+                    .flat_map(|b| b.entries.iter())
+                    .any(|e| e.segments == state.cursor.segments);
+                if is_group_header {
                     state.selection_scope = SelectionScope::Children;
                 }
                 state.edit_buffer = Some(CellEdit::new(old_key));
                 state.mode = Mode::KeyRenaming;
                 refresh_temp_pins(&mut state);
             } else {
-                // Block value editing on bundle-level Header rows (they have no key).
-                if let Some(DisplayRow::Header { prefix, .. }) = state.display_rows.get(state.cursor_row) {
-                    if state.workspace.is_bundle_name(prefix) {
-                        return state;
-                    }
+                // Block value editing on bundle-level headers.
+                if state.cursor.is_bundle_header() {
+                    return state;
                 }
-                // Both Key and within-bundle Header rows open a value editor.
                 let current_value = state.current_cell_value().unwrap_or_default();
                 state.edit_buffer = Some(CellEdit::new(current_value));
                 state.mode = Mode::Editing;
             }
         }
         (Mode::Normal, Message::DeleteKey) => {
-            if state.cursor_section.is_key() {
-                // Key column: enter Deleting mode for confirmation (with optional Tab toggle).
-                let row = match state.display_rows.get(state.cursor_row) {
-                    Some(r) => r,
+            if state.cursor.is_key_col() {
+                // Block bundle-level headers.
+                if state.cursor.is_bundle_header() {
+                    return state;
+                }
+                let key = match state.cursor.full_key() {
+                    Some(k) => k,
                     None => return state,
                 };
-                // Block bundle-level headers (the bundle name is not a key).
-                if let DisplayRow::Header { prefix, .. } = row {
-                    if state.workspace.is_bundle_name(prefix) {
-                        return state;
-                    }
-                }
-                let (key, is_header) = match row {
-                    DisplayRow::Key { full_key, .. } => (full_key.clone(), false),
-                    DisplayRow::Header { prefix, .. } => (prefix.clone(), true),
-                };
-                // Within-bundle Header rows have no exact key — force Children scope.
-                if is_header {
+                // Group header rows have no exact key — force Children scope.
+                let is_group_header = !state.render_model.bundles.iter()
+                    .flat_map(|b| b.entries.iter())
+                    .any(|e| e.segments == state.cursor.segments);
+                if is_group_header {
                     state.selection_scope = SelectionScope::Children;
                 }
                 state.edit_buffer = Some(CellEdit::new(key));
@@ -347,15 +309,15 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 refresh_temp_pins(&mut state);
             } else {
                 // Locale cell: yank then immediately delete (vim-style).
-                if let Some(DisplayRow::Key { full_key, .. }) = state.display_rows.get(state.cursor_row) {
-                    let full_key = full_key.clone();
-                    if let Some(locale_idx) = state.cursor_section.locale_idx() {
-                        if let Some(locale) = state.visible_locales.get(locale_idx).cloned() {
-                            if state.workspace.get_value(&full_key, &locale).is_some() {
-                                yank_cell(&mut state);
-                                ops::delete::delete_locale_entry(&mut state, &full_key, &locale);
-                                state.apply_filter();
-                            }
+                if let (Some(full_key), Some(locale_idx)) = (
+                    state.cursor.full_key(),
+                    state.effective_locale_idx(),
+                ) {
+                    if let Some(locale) = state.visible_locales.get(locale_idx).cloned() {
+                        if state.workspace.get_value(&full_key, &locale).is_some() {
+                            yank_cell(&mut state);
+                            ops::delete::delete_locale_entry(&mut state, &full_key, &locale);
+                            state.apply_filter();
                         }
                     }
                 }
@@ -365,27 +327,27 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.show_preview = !state.show_preview;
         }
         (Mode::Normal, Message::TogglePin) => {
-            let key = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key    { full_key, .. }) => full_key.clone(),
-                Some(DisplayRow::Header { prefix,   .. }) => prefix.clone(),
-                None => return state,
+            let key = match state.cursor.full_key() {
+                Some(k) => k,
+                None => {
+                    // Bundle header — pin by bundle name (not a key operation).
+                    return state;
+                }
             };
 
-            // Decide pin (true) or unpin (false) based on cursor key's current state.
             let pin = !state.pinned_keys.contains(&key);
-
-            // Collect all keys in scope.
             let dot_prefix = format!("{key}.");
             let affected: Vec<String> = match state.selection_scope {
                 SelectionScope::Exact => vec![key],
                 SelectionScope::Children => {
                     let mut keys = vec![key.clone()];
                     keys.extend(
-                        state.display_rows.iter().filter_map(|r| match r {
-                            DisplayRow::Key { full_key, .. }
-                                if full_key.starts_with(&dot_prefix) => Some(full_key.clone()),
-                            _ => None,
-                        })
+                        state.render_model.bundles.iter()
+                            .flat_map(|b| b.entries.iter().map(move |e| {
+                                let pfx = if b.name.is_empty() { String::new() } else { format!("{}:", b.name) };
+                                format!("{pfx}{}", e.segments.join("."))
+                            }))
+                            .filter(|k| k.starts_with(&dot_prefix))
                     );
                     keys
                 }
@@ -450,14 +412,14 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (Mode::Pasting, Message::PageUp) => {
-            state.cursor_row = state.cursor_row.saturating_sub(20);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(20));
             state.clamp_scroll();
         }
         (Mode::Pasting, Message::PageDown) => {
-            let max = state.display_rows.len().saturating_sub(1);
-            state.cursor_row = (state.cursor_row + 20).min(max);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 20).min(max));
             state.clamp_scroll();
         }
         (Mode::Pasting, Message::YankCell) => {
@@ -485,7 +447,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (Mode::Pasting, Message::YankToFocusedLocale) => {
-            let locale_idx = match state.cursor_section.locale_idx() {
+            let locale_idx = match state.effective_locale_idx() {
                 Some(i) => i,
                 None => {
                     state.status_message = Some("Nothing to yank".to_string());
@@ -523,14 +485,11 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             if state.clipboard.is_empty() {
                 state.status_message = Some("Clipboard is empty".to_string());
             } else {
-                // Pre-select the focused locale column when possible.
                 let locale_keys = state.paste_locales();
                 let n = locale_keys.len();
-                if let Some(idx) = state.cursor_section.locale_idx() {
-                    if let Some(current_locale) = state.visible_locales.get(idx) {
-                        if let Some(pos) = locale_keys.iter().position(|l| l == current_locale) {
-                            state.paste_locale_cursor = pos;
-                        }
+                if let Some(locale) = state.cursor.locale.as_ref() {
+                    if let Some(pos) = locale_keys.iter().position(|l| l == locale) {
+                        state.paste_locale_cursor = pos;
                     }
                 }
                 state.paste_locale_cursor = state.paste_locale_cursor.min(n.saturating_sub(1));
@@ -543,7 +502,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     state.status_message = Some("Clipboard is empty".to_string());
                 }
                 Some(value) => {
-                    if state.cursor_section.is_key() {
+                    if state.cursor.is_key_col() {
                         state.status_message = Some("Select a locale cell to quick-paste".to_string());
                     } else if state.current_cell_value().is_some() {
                         ops::insert::commit_cell_edit(&mut state, value);
@@ -563,7 +522,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     state.status_message = Some("Clipboard is empty".to_string());
                 }
                 Some(value) => {
-                    if state.cursor_section.is_key() {
+                    if state.cursor.is_key_col() {
                         state.status_message = Some("Select a locale cell to paste".to_string());
                     } else {
                         if state.current_cell_value().is_some() {
@@ -584,7 +543,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     state.status_message = Some("Clipboard is empty".to_string());
                 }
                 Some(value) => {
-                    if state.cursor_section.is_key() {
+                    if state.cursor.is_key_col() {
                         state.status_message = Some("Select a locale cell to paste".to_string());
                     } else {
                         if state.current_cell_value().is_some() {
@@ -601,16 +560,14 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.mode = Mode::Normal;
         }
         (Mode::Pasting, Message::MoveCursorUp) => {
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
             state.clamp_scroll();
         }
         (Mode::Pasting, Message::MoveCursorDown) => {
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max {
-                state.cursor_row += 1;
-            }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
             state.clamp_scroll();
         }
         (Mode::Pasting, Message::PasteNavLeft) => {
@@ -674,8 +631,8 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Pasting, Message::CommitPasteCell) => {
             // Paste focused locale's selected history entry into (cursor row, focused locale).
             // Stays in paste mode so the user can continue pasting.
-            let full_key = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
+            let full_key = match state.cursor.full_key() {
+                Some(k) if !state.cursor.is_bundle_header() => k,
                 _ => {
                     state.status_message = Some("Select a key row to paste".to_string());
                     return state;
@@ -704,8 +661,8 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Pasting, Message::CommitPasteStay) |
         (Mode::Pasting, Message::CommitPaste) => {
             // Paste all locales' selected history entries into the cursor row's key.
-            let full_key = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
+            let full_key = match state.cursor.full_key() {
+                Some(k) if !state.cursor.is_bundle_header() => k,
                 _ => {
                     state.status_message = Some("Select a key row to paste".to_string());
                     return state;
@@ -863,12 +820,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.apply_filter();
 
             // Navigate to the new bundle header.
-            if let Some(row) = state.display_rows.iter().position(|r| matches!(r,
-                DisplayRow::Header { prefix, .. } if *prefix == bundle_name))
-            {
-                state.cursor_row = row;
-                state.clamp_scroll();
-            }
+            state.cursor.bundle   = Some(bundle_name.clone());
+            state.cursor.segments = vec![];
+            state.cursor.locale   = None;
+            state.clamp_scroll();
 
             state.status_message = Some(format!("Created bundle '{bundle_name}' ({filename})"));
         }
@@ -884,76 +839,57 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::BundleNaming, Message::MoveCursorUp) => {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
         (Mode::BundleNaming, Message::MoveCursorDown) => {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max { state.cursor_row += 1; }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
 
         (Mode::Normal, Message::NewKey) => {
-            let locale_idx = state.cursor_section.locale_idx();
+            let locale = state.cursor.locale.clone();
 
             // Bundle-level header, key column: open locale-naming to add a new locale file.
-            if let Some(DisplayRow::Header { prefix, .. }) = state.display_rows.get(state.cursor_row) {
-                if state.workspace.is_bundle_name(prefix) && locale_idx.is_none() {
-                    state.edit_buffer = Some(CellEdit::new(String::new()));
-                    state.mode = Mode::LocaleNaming;
-                    return state;
-                }
+            if state.cursor.is_bundle_header() && locale.is_none() {
+                state.edit_buffer = Some(CellEdit::new(String::new()));
+                state.mode = Mode::LocaleNaming;
+                return state;
             }
 
-            // Build the pre-fill. When the cursor is on a locale column the locale is
-            // embedded: "bundle:locale:key_prefix." so the user only types the suffix.
-            // The 3-segment format is understood by CommitKeyName.
-            let pre = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Header { prefix, .. }) => {
-                    if state.workspace.is_bundle_name(prefix) {
-                        // Bundle header, locale column: pre-fill "bundle:locale:"
-                        let locale = locale_idx
-                            .and_then(|i| state.visible_locales.get(i))
-                            .map(|l| l.as_str())
-                            .unwrap_or("default");
-                        format!("{prefix}:{locale}:")
-                    } else {
-                        // Within-bundle header: insert locale segment when on a locale column.
-                        // "messages:app.confirm" → key col:    "messages:app.confirm."
-                        //                       → locale col:  "messages:de:app.confirm."
-                        let (bundle, header_key) = workspace::split_key(prefix);
-                        if let Some(i) = locale_idx {
-                            let locale = state.visible_locales.get(i).map(|l| l.as_str()).unwrap_or("");
-                            format!("{bundle}:{locale}:{header_key}.")
-                        } else {
-                            format!("{prefix}.")
-                        }
-                    }
-                }
-                Some(DisplayRow::Key { full_key, .. }) => {
-                    let (bundle, real_key) = workspace::split_key(full_key);
-                    let key_prefix = match real_key.rfind('.') {
-                        Some(i) => format!("{}.", &real_key[..i]),
-                        None    => String::new(),
-                    };
-                    if let Some(i) = locale_idx {
-                        if !bundle.is_empty() {
-                            let locale = state.visible_locales.get(i).map(|l| l.as_str()).unwrap_or("");
-                            format!("{bundle}:{locale}:{key_prefix}")
-                        } else {
-                            key_prefix
-                        }
-                    } else if !bundle.is_empty() {
-                        format!("{bundle}:{key_prefix}")
+            // Build the pre-fill.  Locale-targeted: "bundle:locale:prefix." form.
+            let bundle_str = state.cursor.bundle.as_deref().unwrap_or("").to_string();
+            let segs = &state.cursor.segments;
+            let pre = if state.cursor.is_bundle_header() {
+                // Bundle header, locale column
+                let locale_str = locale.as_deref().unwrap_or("default");
+                format!("{bundle_str}:{locale_str}:")
+            } else {
+                // Entry or group-header row
+                let real_key = segs.join(".");
+                // Remove the last segment to get the key prefix ("parent.")
+                let key_prefix = match real_key.rfind('.') {
+                    Some(i) => format!("{}.", &real_key[..i]),
+                    None    => String::new(),
+                };
+                if let Some(ref loc) = locale {
+                    if !bundle_str.is_empty() {
+                        format!("{bundle_str}:{loc}:{key_prefix}")
                     } else {
                         key_prefix
                     }
+                } else if !bundle_str.is_empty() {
+                    format!("{bundle_str}:{key_prefix}")
+                } else {
+                    key_prefix
                 }
-                _ => String::new(),
             };
             state.edit_buffer = Some(CellEdit::new(pre));
             state.mode = Mode::KeyNaming;
@@ -1032,23 +968,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
                 state.apply_filter();
 
-                // Navigate to the new row if it is visible under the current filter.
-                if let Some(row_idx) = state.display_rows.iter().position(|r| {
-                    matches!(r, DisplayRow::Key { full_key, .. } if *full_key == new_key)
-                }) {
-                    state.cursor_row = row_idx;
-                    // Place cursor on the target locale column (3-segment) or first locale.
-                    let locale_idx = target_locale
-                        .as_deref()
-                        .and_then(|loc| state.visible_locales.iter().position(|l| l == loc))
-                        .or_else(|| if state.visible_locales.is_empty() { None } else { Some(0) });
-                    if let Some(i) = locale_idx {
-                        state.set_locale_cursor(i);
-                    } else {
-                        state.cursor_section = CursorSection::Key { segment: 0 };
-                    }
-                    state.clamp_scroll();
-                }
+                // Navigate to the new key.
+                let (new_bundle, new_real) = workspace::split_key(&new_key);
+                let new_bundle_opt = if new_bundle.is_empty() { None } else { Some(new_bundle.to_string()) };
+                let new_segs: Vec<String> = new_real.split('.').map(|s| s.to_string()).collect();
+                state.cursor.bundle   = new_bundle_opt;
+                state.cursor.segments = new_segs;
+                // Place cursor on the target locale column (3-segment) or first locale.
+                let locale = target_locale.clone()
+                    .or_else(|| state.visible_locales.first().cloned());
+                state.cursor.locale = locale;
+                state.clamp_scroll();
 
                 if let Some(value) = inline_value {
                     // Inline value supplied: write it directly into the target locale.
@@ -1090,13 +1020,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
 
             // Cursor must still be on the bundle header.
-            let bundle = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Header { prefix, .. })
-                    if state.workspace.is_bundle_name(prefix) => prefix.clone(),
-                _ => {
-                    state.status_message = Some("No bundle selected".to_string());
-                    return state;
+            let bundle = if state.cursor.is_bundle_header() {
+                match &state.cursor.bundle {
+                    Some(b) => b.clone(),
+                    None => {
+                        state.status_message = Some("No bundle selected".to_string());
+                        return state;
+                    }
                 }
+            } else {
+                state.status_message = Some("No bundle selected".to_string());
+                return state;
             };
 
             // Reject if the locale already exists in this bundle.
@@ -1173,16 +1107,18 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::LocaleNaming, Message::MoveCursorUp) => {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
         (Mode::LocaleNaming, Message::MoveCursorDown) => {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max { state.cursor_row += 1; }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
 
@@ -1192,10 +1128,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 .map(|e| e.current_value().trim().to_string())
                 .unwrap_or_default();
 
-            let old_key = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
-                Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
-                _ => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
+            let old_key = match state.cursor.full_key() {
+                Some(k) => k,
+                None => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
             };
 
             // Validate: non-empty, has a dot or colon, not the same as before.
@@ -1235,10 +1170,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 .map(|e| e.current_value().trim().to_string())
                 .unwrap_or_default();
 
-            let old_key = match state.display_rows.get(state.cursor_row) {
-                Some(DisplayRow::Key { full_key, .. }) => full_key.clone(),
-                Some(DisplayRow::Header { prefix, .. }) => prefix.clone(),
-                _ => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
+            let old_key = match state.cursor.full_key() {
+                Some(k) => k,
+                None => { state.edit_buffer = None; state.mode = Mode::Normal; return state; }
             };
 
             if new_key.is_empty() || (!new_key.contains('.') && !new_key.contains(':')) {
@@ -1307,8 +1241,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
         (
@@ -1319,11 +1254,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max {
-                state.cursor_row += 1;
-            }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
 
@@ -1346,17 +1280,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         // Up/Down exit filter mode and immediately move the cursor.
         (Mode::Filter, Message::MoveCursorUp) => {
             state.mode = Mode::Normal;
-            state.cursor_row = state.cursor_row.saturating_sub(1);
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            state.set_visual_row(cur.saturating_sub(1));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
         (Mode::Filter, Message::MoveCursorDown) => {
             state.mode = Mode::Normal;
-            let max = state.display_rows.len().saturating_sub(1);
-            if state.cursor_row < max {
-                state.cursor_row += 1;
-            }
-            state.clamp_cursor_section();
+            let cur = state.cursor_visual_row();
+            let max = state.total_visual_rows().saturating_sub(1);
+            state.set_visual_row((cur + 1).min(max));
+            state.cursor.locale = None;
             state.clamp_scroll();
         }
 
@@ -1457,7 +1391,7 @@ fn ensure_locale_file(state: &mut AppState, bundle: &str, locale: &str) -> Resul
 /// Returns `Some(locale)` on success, `None` when on the key column or the cell is empty.
 /// Updates `clipboard_last` and clamps `paste_history_pos` on success.
 fn yank_cell(state: &mut AppState) -> Option<String> {
-    let locale_idx = state.cursor_section.locale_idx()?;
+    let locale_idx = state.effective_locale_idx()?;
     let locale = state.visible_locales.get(locale_idx).cloned()?;
     let value  = state.current_cell_value()?;
 
