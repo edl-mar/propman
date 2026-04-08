@@ -135,18 +135,15 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     state.cursor.locale = None;
                 }
             } else {
-                // Key column: walk anchor one level toward root.
-                // If a parent row exists in the model, jump to it.
-                if let Some((bundle, segs)) = state.find_parent_position() {
+                // Key column: jump to the nearest visible ancestor row.
+                // Single-child chain collapsing can make intermediate nodes
+                // invisible, so we walk up until we find a rendered row.
+                if let Some((bundle, segs)) = state.find_nearest_visible_ancestor() {
                     state.cursor.bundle   = bundle;
                     state.cursor.segments = segs;
                     state.cursor.locale   = None;
                     state.clamp_scroll();
                     refresh_temp_pins(&mut state);
-                } else if state.cursor.segments.len() > 1 {
-                    // Parent has no visual row — pop the segment anyway (anchor
-                    // moves to the parent prefix without jumping rows).
-                    state.cursor.segments.pop();
                 }
             }
         }

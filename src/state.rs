@@ -385,15 +385,24 @@ impl AppState {
         None
     }
 
-    /// Find the visual position of the parent row (one segment above cursor).
-    /// Used by Left navigation to jump to a visible ancestor.
-    pub fn find_parent_position(&self) -> Option<(Option<String>, Vec<String>)> {
+    /// Find the nearest visible ancestor row, walking up the segment stack.
+    ///
+    /// Checks the direct parent first, then grandparent, and so on.  This is
+    /// needed because single-child chain collapsing can make intermediate nodes
+    /// (e.g. `["app","confirm2"]`) invisible even though `["app"]` is visible.
+    /// Used by Left navigation so the cursor always lands on a rendered row.
+    pub fn find_nearest_visible_ancestor(&self) -> Option<(Option<String>, Vec<String>)> {
         if self.cursor.segments.is_empty() { return None; }
-        let parent_segs = &self.cursor.segments[..self.cursor.segments.len() - 1];
         let positions = self.visual_positions();
-        positions.iter().find(|p| {
-            p.bundle == self.cursor.bundle && p.segments.as_slice() == parent_segs
-        }).map(|p| (p.bundle.clone(), p.segments.clone()))
+        for len in (0..self.cursor.segments.len()).rev() {
+            let ancestor_segs = &self.cursor.segments[..len];
+            if let Some(pos) = positions.iter().find(|p| {
+                p.bundle == self.cursor.bundle && p.segments.as_slice() == ancestor_segs
+            }) {
+                return Some((pos.bundle.clone(), pos.segments.clone()));
+            }
+        }
+        None
     }
 
     /// Find the first visual position that is a (direct or indirect) child of the cursor.
