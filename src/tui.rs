@@ -472,6 +472,13 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
     let cursor_full_key_owned: Option<String> = scope_anchor.clone();
     let cursor_full_key_str: Option<&str> = cursor_full_key_owned.as_deref();
 
+    // True when cursor.segments exactly matches a visual row.
+    // False = cursor is a prefix anchor (chain-collapsed intermediate node);
+    // in that case the effective entry row is the first descendant of cursor.segments.
+    let cursor_has_exact_row = state.visual_positions().iter().any(|p|
+        p.bundle == state.cursor.bundle && p.segments == state.cursor.segments
+    );
+
     // ── Iterate the hierarchical render model ─────────────────────────────────
     // `visual_row` counts every emitted row; used only for scroll offset comparison.
     let mut visual_row: usize = 0;
@@ -578,7 +585,15 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
             // ── Entry (key) row ───────────────────────────────────────────────
             trim_ctx_to_ancestor(&mut ctx_stack, &rk);
 
-            let is_selected = cursor_bundle == bundle_opt && state.cursor.segments == entry.segments;
+            // Entry is selected when cursor.segments exactly matches, OR when the
+            // cursor is a prefix anchor (no visual row of its own) and this entry
+            // is a descendant — making it the effective displayed row for the anchor.
+            let is_selected = cursor_bundle == bundle_opt && (
+                entry.segments == state.cursor.segments
+                || (!cursor_has_exact_row
+                    && !state.cursor.segments.is_empty()
+                    && entry.segments.starts_with(state.cursor.segments.as_slice()))
+            );
             if visual_row >= state.scroll_offset {
                 let display = relative_display(&rk, ctx_stack.last().map(|s| s.as_str()));
                 let depth   = entry_visual_depth(&entry.segments, &bundle.groups) + bundle_offset;

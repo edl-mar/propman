@@ -135,13 +135,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     state.cursor.locale = None;
                 }
             } else {
-                // Key column: jump to the nearest visible ancestor row.
-                // Single-child chain collapsing can make intermediate nodes
-                // invisible, so we walk up until we find a rendered row.
-                if let Some((bundle, segs)) = state.find_nearest_visible_ancestor() {
-                    state.cursor.bundle   = bundle;
-                    state.cursor.segments = segs;
-                    state.cursor.locale   = None;
+                // Key column: pop one segment toward root.
+                //
+                // When the parent is an exact visual row (e.g. a group header),
+                // the cursor lands on it.  When the parent is a chain-collapsed
+                // intermediate node with no visual row, the cursor becomes a
+                // "prefix anchor": cursor_visual_row() and the renderer both
+                // handle this case by showing the effective descendant entry
+                // with the anchor segment highlighted.
+                if !state.cursor.segments.is_empty() {
+                    state.cursor.segments.pop();
+                    state.cursor.locale = None;
                     state.clamp_scroll();
                     refresh_temp_pins(&mut state);
                 }
@@ -149,16 +153,33 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         }
         (Mode::Normal, Message::MoveCursorRight) => {
             if state.cursor.locale.is_none() {
-                // Key column: move to first available locale column
-                // (or into first child if on a group header with no locale).
-                let bundle = state.current_row_bundle().to_string();
-                let max = state.visible_locales.len();
-                let mut i = 0;
-                while i < max && !bundle.is_empty() && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
-                    i += 1;
-                }
-                if i < max {
-                    state.set_locale_cursor(i);
+                if state.cursor_is_prefix_anchor() {
+                    // Prefix-anchor mode: push one segment toward the leaf.
+                    // This is the inverse of Left (pop toward root).
+                    let cur_segs = state.cursor.segments.clone();
+                    let positions = state.visual_positions();
+                    if let Some(pos) = positions.iter().find(|p| {
+                        p.bundle == state.cursor.bundle
+                            && p.segments.starts_with(cur_segs.as_slice())
+                            && p.segments.len() > cur_segs.len()
+                    }) {
+                        // Push exactly the next segment of the effective entry.
+                        let next = pos.segments[cur_segs.len()].clone();
+                        state.cursor.segments.push(next);
+                        state.clamp_scroll();
+                        refresh_temp_pins(&mut state);
+                    }
+                } else {
+                    // Exact row: move to first available locale column.
+                    let bundle = state.current_row_bundle().to_string();
+                    let max = state.visible_locales.len();
+                    let mut i = 0;
+                    while i < max && !bundle.is_empty() && !state.workspace.bundle_has_locale(&bundle, &state.visible_locales[i]) {
+                        i += 1;
+                    }
+                    if i < max {
+                        state.set_locale_cursor(i);
+                    }
                 }
             } else {
                 // Locale column: step right, skipping missing locales.

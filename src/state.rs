@@ -260,11 +260,30 @@ impl AppState {
     }
 
     /// Flat visual row index for the current cursor position.
+    ///
+    /// When `cursor.segments` exactly matches a visual row, returns that row.
+    /// When it is a prefix anchor (chain-collapsed intermediate node with no
+    /// visual row of its own), returns the first visual row whose segments
+    /// start with `cursor.segments` — that is the "effective entry" shown for
+    /// the anchor.
     pub fn cursor_visual_row(&self) -> usize {
-        self.visual_positions()
-            .iter()
-            .position(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments)
-            .unwrap_or(0)
+        let positions = self.visual_positions();
+        let segs = &self.cursor.segments;
+        // Exact match first.
+        if let Some(idx) = positions.iter().position(|p|
+            p.bundle == self.cursor.bundle && p.segments == *segs
+        ) {
+            return idx;
+        }
+        // Prefix-anchor fallback: first descendant row.
+        if !segs.is_empty() {
+            if let Some(idx) = positions.iter().position(|p|
+                p.bundle == self.cursor.bundle && p.segments.starts_with(segs.as_slice())
+            ) {
+                return idx;
+            }
+        }
+        0
     }
 
     /// Total number of visual rows.
@@ -284,28 +303,37 @@ impl AppState {
 
     /// Clamps the cursor to a valid position in the current render model.
     ///
-    /// Called after `apply_filter` rebuilds the model: if the cursor's key was
-    /// filtered out, climb to the nearest visible ancestor (or bundle header).
+    /// Called after `apply_filter` rebuilds the model.  A cursor position is
+    /// valid when:
+    ///   - it exactly matches a visual row (exact entry or group header), OR
+    ///   - `cursor.segments` is non-empty and is a prefix of some visual row
+    ///     (key-segment anchor pointing into a chain-collapsed node that has no
+    ///     visual row of its own, but its descendant entry is still visible).
+    ///
+    /// If neither holds, walk up the segment stack until a valid position is
+    /// found, then fall back to row 0.
     fn clamp_cursor_to_model(&mut self) {
         let positions = self.visual_positions();
         if positions.is_empty() { return; }
-        // Cursor already valid?
-        if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments) {
-            return;
-        }
-        // Walk up the segment stack until we find a visible ancestor.
+
+        let is_valid = |segs: &Vec<String>| {
+            positions.iter().any(|p| {
+                p.bundle == self.cursor.bundle
+                    && (p.segments == *segs
+                        || (!segs.is_empty() && p.segments.starts_with(segs.as_slice())))
+            })
+        };
+
+        if is_valid(&self.cursor.segments) { return; }
+
+        // Walk up until we find a valid anchor (exact row or valid prefix).
         let mut segs = self.cursor.segments.clone();
         while !segs.is_empty() {
             segs.pop();
-            if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments == segs) {
+            if is_valid(&segs) {
                 self.cursor.segments = segs;
                 return;
             }
-        }
-        // Try bundle header.
-        if positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments.is_empty()) {
-            self.cursor.segments = vec![];
-            return;
         }
         // Fall back to row 0 (first visible row).
         let first = &positions[0];
@@ -385,24 +413,17 @@ impl AppState {
         None
     }
 
-    /// Find the nearest visible ancestor row, walking up the segment stack.
+    /// Returns true when `cursor.segments` is a prefix anchor — i.e. the cursor
+    /// points to an intermediate node that has no visual row of its own but is
+    /// "inside" a chain-collapsed entry that does have a visual row.
     ///
-    /// Checks the direct parent first, then grandparent, and so on.  This is
-    /// needed because single-child chain collapsing can make intermediate nodes
-    /// (e.g. `["app","confirm2"]`) invisible even though `["app"]` is visible.
-    /// Used by Left navigation so the cursor always lands on a rendered row.
-    pub fn find_nearest_visible_ancestor(&self) -> Option<(Option<String>, Vec<String>)> {
-        if self.cursor.segments.is_empty() { return None; }
+    /// Used by Left/Right to decide whether to pop/push a segment or to
+    /// switch to a locale column.
+    pub fn cursor_is_prefix_anchor(&self) -> bool {
+        if self.cursor.segments.is_empty() { return false; }
         let positions = self.visual_positions();
-        for len in (0..self.cursor.segments.len()).rev() {
-            let ancestor_segs = &self.cursor.segments[..len];
-            if let Some(pos) = positions.iter().find(|p| {
-                p.bundle == self.cursor.bundle && p.segments.as_slice() == ancestor_segs
-            }) {
-                return Some((pos.bundle.clone(), pos.segments.clone()));
-            }
-        }
-        None
+        !positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments == self.cursor.segments)
+            && positions.iter().any(|p| p.bundle == self.cursor.bundle && p.segments.starts_with(self.cursor.segments.as_slice()))
     }
 
     /// Find the first visual position that is a (direct or indirect) child of the cursor.
