@@ -30,28 +30,30 @@ struct RenderModel {
 
 ```rust
 struct BundleModel {
-    name:    String,           // "" for bare/legacy keys
-    locales: Vec<String>,      // locale files present in this bundle
-    entries: Vec<Entry>,       // ALL keys in this bundle, sorted alphabetically
+    name:    String,                       // "" for bare/legacy keys
+    locales: Vec<String>,                  // locale files present in this bundle
+    entries: Vec<Entry>,                   // ALL keys, sorted alphabetically
+    groups:  HashMap<String, Group>,       // prefix path → Group (see docs/group-merge.md)
 }
 ```
 
-Entries are sorted by their full dot-joined key path. This ordering is the load-bearing
-property that makes rendering and navigation simple (see below).
+Entries are sorted by their full dot-joined key path. This ordering is the
+load-bearing property that makes rendering and navigation simple (see below).
+
+`groups` is computed by the group-merge scan pass over `entries`. It records
+which prefix paths form chain-collapsed visual nodes, their ranges
+(`first_entry..=last_entry`), and whether they are branch nodes. The renderer
+queries it freely; entries themselves hold no references to groups.
 
 ### Entry
 
 ```rust
 struct Entry {
-    segments:      Vec<String>,             // real key split on '.', e.g. ["app","title"]
-    cells:         Vec<LocaleCell>,         // one per locale in BundleModel.locales
-    intro_headers: Vec<MergedSegmentRef>,   // merged_segments whose first_entry == this entry,
-                                            // ordered shallowest to deepest.
-                                            // The renderer emits one header line per element,
-                                            // then the key line. See docs/group-merge.md.
+    segments:  Vec<String>,    // real key split on '.', e.g. ["app","title"]
+    cells:     Vec<LocaleCell>, // one per locale in BundleModel.locales
     is_dirty:  bool,
     is_pinned: bool,
-    flags:     EntryFlags,                  // dangling, temp-pinned, etc.
+    flags:     EntryFlags,     // dangling, temp-pinned, etc.
 }
 
 struct LocaleCell {
@@ -60,9 +62,8 @@ struct LocaleCell {
 }
 ```
 
-`intro_headers` is the only rendering-related field on `Entry`. The entry itself
-has no concept of how many visual lines it will produce — that is entirely the
-renderer's concern. The render model carries no separate header rows.
+Entries carry no rendering hints. There are no header rows in the model — groups
+are structural facts stored separately in `BundleModel.groups` (see below).
 
 ### Cursor
 
@@ -112,50 +113,52 @@ toward leaf = `cursor.segments.push(next_seg)`.
 
 ## Rendering
 
-### No separate header rows
+### No header rows in the model
 
 The render model contains only actual key entries — one per translatable key.
-There are no `Header` / `Key` row variants. Visual group headers are a rendering
-detail, not a model concern.
+There are no `Header` / `Key` row variants. Groups (the `BundleModel.groups`
+map) are structural facts about the data. What to do with them visually is
+entirely the renderer's decision.
 
-### How the renderer produces multiple lines per entry
+### How the renderer uses groups
 
-Each entry carries `intro_headers: Vec<MergedSegmentRef>` (computed by the
-group-merge scan pass, see `docs/group-merge.md`). When the renderer reaches
-an entry it emits:
-
-1. One header line per element of `intro_headers` (the merged_segment's label
-   and visual depth).
-2. One key line for the entry itself (segments, locale cells).
-
-The entry does not know how many lines it will produce. The renderer iterates
-entries 1:1 and expands them. For example, the entry
-`[http, status, detail, something, msg, firstmessage]` has
-`intro_headers = [MS_detail·something, US_msg]` and produces three lines:
+For each entry `i`, the renderer queries:
 
 ```
-    .detail.something:          ← intro_header line 1
-      .msg:                     ← intro_header line 2
-        .firstmessage  [de] …   ← key line
+headers_for(i) = [g for g in bundle.groups.values()
+                    if g.first_entry == i and g.is_branch]
+                 sorted by depth
+```
+
+It then decides freely how to present those groups — header lines with
+indentation, decorations, collapsed labels, group metadata, whatever. No model
+change is required to change the visual representation.
+
+For example, the entry `[http, status, detail, something, msg, firstmessage]`
+has two groups starting at it (`detail.something` and `msg`). One possible
+rendering:
+
+```
+    .detail.something:          ← group header line
+      .msg:                     ← group header line
+        .firstmessage  [de] …   ← entry key line
 ```
 
 ### Chain collapsing — why a single lookahead is not sufficient
 
-A naive "compare adjacent entries" approach determines depth and display text
-correctly but cannot detect single-child chains with only one entry of lookahead.
-The chain `detail → something` spans entries 8–10; when the renderer reaches
+A naive "compare adjacent entries" approach can determine depth and display text
+but cannot detect single-child chains with only one entry of lookahead. The
+chain `detail → something` spans entries 8–10; when the renderer reaches
 entry 8, it cannot tell from entry 9 alone that `detail` will never have any
-child other than `something`. The group-merge scan, which runs before rendering,
-resolves this by tracking distinct children per open group and firing merges when
-a group closes.
+child other than `something`. The group-merge scan (see `docs/group-merge.md`)
+resolves this before rendering by tracking distinct children per open group and
+extending group labels in place when a single-child chain closes.
 
 ### Visual depth
 
-Visual depth = real segment depth minus the number of depths absorbed by merged
-chains above the current node on the path from root. Each `MergedSegment`
-carries an `absorbed` count (number of unique_segments in its chain minus 1).
-This is pre-computed during the scan pass and stored on the `MergedSegment`,
-so the renderer reads it directly.
+Visual depth = real segment depth minus the number of depths absorbed by
+merged chains above the current node on the path from root. Each `Group`
+carries this offset; the renderer reads it to compute indentation.
 
 ## Refactoring Order
 
