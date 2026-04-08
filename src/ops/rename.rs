@@ -58,16 +58,7 @@ pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: 
     }
     let dot_prefix = format!("{old_prefix}.");
 
-    let visible: std::collections::HashSet<String> = if !all_children {
-        state.render_model.bundles.iter()
-            .flat_map(|b| b.entries.iter().map(move |e| {
-                let key = e.segments.join(".");
-                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
-            }))
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let visible = if !all_children { state.visible_full_keys() } else { std::collections::HashSet::new() };
 
     let keys_to_rename: Vec<String> = state.workspace.merged_keys.iter()
         .filter(|k| {
@@ -197,16 +188,7 @@ fn commit_cross_bundle_prefix_rename(state: &mut AppState, old_prefix: &str, new
 
     let dot_prefix = format!("{old_prefix}.");
 
-    let visible: std::collections::HashSet<String> = if !all_children {
-        state.render_model.bundles.iter()
-            .flat_map(|b| b.entries.iter().map(move |e| {
-                let key = e.segments.join(".");
-                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
-            }))
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let visible = if !all_children { state.visible_full_keys() } else { std::collections::HashSet::new() };
 
     let keys_to_move: Vec<String> = state.workspace.merged_keys.iter()
         .filter(|k| {
@@ -308,16 +290,7 @@ pub fn commit_prefix_copy(state: &mut AppState, old_prefix: &str, new_prefix: St
     }
 
     let dot_prefix = format!("{old_prefix}.");
-    let visible: std::collections::HashSet<String> = if !all_children {
-        state.render_model.bundles.iter()
-            .flat_map(|b| b.entries.iter().map(move |e| {
-                let key = e.segments.join(".");
-                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
-            }))
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let visible = if !all_children { state.visible_full_keys() } else { std::collections::HashSet::new() };
 
     let keys_to_copy: Vec<String> = state.workspace.merged_keys.iter()
         .filter(|k| {

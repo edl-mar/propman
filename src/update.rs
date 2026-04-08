@@ -341,14 +341,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 SelectionScope::Exact => vec![key],
                 SelectionScope::Children => {
                     let mut keys = vec![key.clone()];
-                    keys.extend(
-                        state.render_model.bundles.iter()
-                            .flat_map(|b| b.entries.iter().map(move |e| {
-                                let pfx = if b.name.is_empty() { String::new() } else { format!("{}:", b.name) };
-                                format!("{pfx}{}", e.segments.join("."))
-                            }))
-                            .filter(|k| k.starts_with(&dot_prefix))
-                    );
+                    keys.extend(state.visible_full_keys().into_iter().filter(|k| k.starts_with(&dot_prefix)));
                     keys
                 }
                 SelectionScope::ChildrenAll => {
@@ -625,36 +618,6 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                             }
                         }
                     }
-                }
-            }
-        }
-        (Mode::Pasting, Message::CommitPasteCell) => {
-            // Paste focused locale's selected history entry into (cursor row, focused locale).
-            // Stays in paste mode so the user can continue pasting.
-            let full_key = match state.cursor.full_key() {
-                Some(k) if !state.cursor.is_bundle_header() => k,
-                _ => {
-                    state.status_message = Some("Select a key row to paste".to_string());
-                    return state;
-                }
-            };
-            let to_paste: Option<(String, String)> = {
-                let locale_keys = state.paste_locales();
-                locale_keys.into_iter().nth(state.paste_locale_cursor).and_then(|locale| {
-                    let pos = *state.paste_history_pos.get(&locale).unwrap_or(&0);
-                    state.clipboard.get(&locale).and_then(|h| h.get(pos)).cloned()
-                        .map(|v| (locale, v))
-                })
-            };
-            if let Some((locale, value)) = to_paste {
-                let (bundle, _) = workspace::split_key(&full_key);
-                if state.workspace.bundle_has_locale(bundle, &locale) {
-                    ops::insert::apply_cell_value(&mut state, &full_key, &locale, value);
-                    state.apply_filter();
-                } else {
-                    state.status_message = Some(
-                        format!("No [{locale}] file for this key's bundle")
-                    );
                 }
             }
         }

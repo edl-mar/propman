@@ -21,6 +21,7 @@ pub struct Group {
     /// Index of the first `Entry` in this group's range (inclusive).
     pub first_entry: usize,
     /// Index of the last `Entry` in this group's range (inclusive).
+    #[allow(dead_code)] // computed by group-merge scan; verified in tests; not yet consumed by renderer
     pub last_entry: usize,
     /// True when this group has ≥2 direct child groups.
     pub is_branch: bool,

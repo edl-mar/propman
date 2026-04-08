@@ -5,7 +5,7 @@ use crate::{
     editor::CellEdit,
     filter::{self, ColumnDirective},
     render_model::{self, RenderModel, VisualPosition},
-    workspace::{self, Workspace},
+    workspace::Workspace,
 };
 
 /// A committed edit queued for the next Ctrl+S flush.
@@ -238,6 +238,17 @@ impl AppState {
     /// Returns the bundle name for the current cursor row, or `""` for bare keys.
     pub fn current_row_bundle(&self) -> &str {
         self.cursor.bundle.as_deref().unwrap_or("")
+    }
+
+    /// Bundle-qualified full-key strings for every entry currently in the render model.
+    /// Used by ops to determine which keys are filter-visible (the `Children` scope).
+    pub fn visible_full_keys(&self) -> HashSet<String> {
+        self.render_model.bundles.iter()
+            .flat_map(|b| b.entries.iter().map(move |e| {
+                let key = e.segments.join(".");
+                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
+            }))
+            .collect()
     }
 
     // ── Visual-row navigation ─────────────────────────────────────────────────

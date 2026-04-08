@@ -563,9 +563,9 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                     // can be committed-to via Header insert).
                     render_locale_cells(
                         &mut spans, locales, row_key, true, false,
-                        is_selected, in_scope, false, false,
+                        is_selected, in_scope, false,
                         state.cursor.locale.as_deref(), &state.mode, &state.column_directive,
-                        &dirty_cells, &bundle.name, &bundle.locales,
+                        &dirty_cells, &bundle.locales,
                         None, // no Entry (header row)
                     );
                     lines.push(Line::from(spans));
@@ -610,9 +610,9 @@ fn draw_table(f: &mut Frame, area: Rect, state: &AppState) {
                 );
                 render_locale_cells(
                     &mut spans, locales, full_key, false, entry.is_temp_pinned,
-                    is_selected, in_scope, entry.is_pinned, entry.is_dirty,
+                    is_selected, in_scope, entry.is_pinned,
                     state.cursor.locale.as_deref(), &state.mode, &state.column_directive,
-                    &dirty_cells, &bundle.name, &bundle.locales,
+                    &dirty_cells, &bundle.locales,
                     Some(entry),
                 );
                 lines.push(Line::from(spans));
@@ -678,12 +678,10 @@ fn render_locale_cells(
     is_selected: bool,
     in_scope: bool,
     is_perm_pinned: bool,
-    is_dirty_row: bool,
     cursor_locale: Option<&str>,
     mode: &Mode,
     column_directive: &ColumnDirective,
     dirty_cells: &std::collections::HashSet<(&str, &str)>,
-    bundle_name: &str,
     bundle_locales: &[String],
     entry: Option<&crate::render_model::Entry>,
 ) {

@@ -83,19 +83,10 @@ pub enum Message {
     CommitPaste,
     /// Ctrl+Enter in paste mode — structural paste (all `>` selections), stay in paste mode.
     CommitPasteStay,
-    /// Ctrl+Enter in paste mode — paste the focused locale's `>` value into the current cell.
-    CommitPasteCell,
     /// Ctrl+P in paste mode — paste clipboard_last into the current cell, stay in paste mode.
     PasteHere,
     /// Ctrl+Y in paste mode — yank the current cell's value into the panel-focused locale's history.
     YankToFocusedLocale,
-    // ── Key-segment cursor ───────────────────────────────────────────────────
-    /// Ctrl+Left in Normal mode — extend the key-segment cursor one segment to the left
-    /// (includes one more dot-segment of the key path in the visual selection anchor).
-    KeySegCursorLeft,
-    /// Ctrl+Right in Normal mode — shrink the key-segment cursor back one segment,
-    /// down to 0 (the row's own display suffix).
-    KeySegCursorRight,
     /// Ctrl+Up — jump to the first row of the previous sibling at the anchor level.
     SiblingUp,
     /// Ctrl+Down — jump to the first row of the next sibling at the anchor level.

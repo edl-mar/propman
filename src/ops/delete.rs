@@ -90,16 +90,7 @@ pub fn delete_key(state: &mut AppState, full_key: &str) {
 pub fn delete_key_prefix(state: &mut AppState, prefix: &str, all_children: bool) {
     let dot_prefix = format!("{prefix}.");
 
-    let visible: std::collections::HashSet<String> = if !all_children {
-        state.render_model.bundles.iter()
-            .flat_map(|b| b.entries.iter().map(move |e| {
-                let key = e.segments.join(".");
-                if b.name.is_empty() { key } else { format!("{}:{}", b.name, key) }
-            }))
-            .collect()
-    } else {
-        std::collections::HashSet::new()
-    };
+    let visible = if !all_children { state.visible_full_keys() } else { std::collections::HashSet::new() };
 
     let keys: Vec<String> = state.workspace.merged_keys.iter()
         .filter(|k| {
