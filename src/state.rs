@@ -4,7 +4,7 @@ use tui_textarea::TextArea;
 use crate::{
     editor::CellEdit,
     filter::{self, ColumnDirective},
-    render_model::{self, DisplayRow},
+    render_model::{self, DisplayRow, RenderModel},
     workspace::{self, Workspace},
 };
 
@@ -144,6 +144,9 @@ pub struct AppState {
     /// Flat list of header + key rows derived from `workspace.merged_keys`.
     /// `cursor_row` indexes into this vec; `Header` rows are skipped during navigation.
     pub display_rows: Vec<DisplayRow>,
+    /// Hierarchical render model built in parallel with `display_rows`.
+    /// The renderer will switch to consuming this once Step 2 of the refactoring lands.
+    pub render_model: RenderModel,
     /// Locale columns currently visible; a subset of `workspace.all_locales()`
     /// when a locale selector is active, otherwise the full list.
     pub visible_locales: Vec<String>,
@@ -243,6 +246,38 @@ impl AppState {
             .collect()
     }
 
+    /// Derives the set of `(full_key, locale)` pairs that have at least one pending
+    /// (unsaved) write.  Used to compute `LocaleCell.is_dirty` in the render model.
+    fn compute_dirty_cells(&self) -> HashSet<(String, String)> {
+        let path_to_locale: std::collections::HashMap<&std::path::Path, &str> = self
+            .workspace
+            .groups
+            .iter()
+            .flat_map(|g| g.files.iter())
+            .map(|f| (f.path.as_path(), f.locale.as_str()))
+            .collect();
+
+        self.pending_writes
+            .iter()
+            .filter_map(|c| {
+                let (path, full_key) = match c {
+                    PendingChange::Update { path, full_key, .. } => {
+                        (path.as_path(), full_key.as_str())
+                    }
+                    PendingChange::Insert { path, full_key, .. } => {
+                        (path.as_path(), full_key.as_str())
+                    }
+                    PendingChange::Delete { path, full_key, .. } => {
+                        (path.as_path(), full_key.as_str())
+                    }
+                };
+                path_to_locale
+                    .get(path)
+                    .map(|locale| (full_key.to_string(), locale.to_string()))
+            })
+            .collect()
+    }
+
     /// Re-evaluates the filter query, rebuilds `display_rows` and `visible_locales`,
     /// then clamps the cursor to the new bounds.
     pub fn apply_filter(&mut self) {
@@ -279,6 +314,17 @@ impl AppState {
         };
         let bundle_names = self.workspace.bundle_names();
         self.display_rows = render_model::build_display_rows(&filtered, &bundle_names);
+        let dirty_cells = self.compute_dirty_cells();
+        self.render_model = render_model::build_render_model(
+            &self.workspace,
+            &filtered,
+            &bundle_names,
+            &visible,
+            &self.dirty_keys,
+            &dirty_cells,
+            &self.pinned_keys,
+            &self.temp_pins,
+        );
         self.visible_locales = visible;
         self.column_directive = directive;
         let max_row = self.display_rows.len().saturating_sub(1);
@@ -393,10 +439,23 @@ impl AppState {
         let bundle_names = workspace.bundle_names();
         let display_rows = render_model::build_display_rows(&workspace.merged_keys, &bundle_names);
         let visible_locales = workspace.all_locales();
+        let empty_keys: HashSet<String> = HashSet::new();
+        let empty_cells: HashSet<(String, String)> = HashSet::new();
+        let hier_model = render_model::build_render_model(
+            &workspace,
+            &workspace.merged_keys,
+            &bundle_names,
+            &visible_locales,
+            &empty_keys,
+            &empty_cells,
+            &empty_keys,
+            &[],
+        );
         let cursor_row = 0;
         Self {
             workspace,
             display_rows,
+            render_model: hier_model,
             visible_locales,
             cursor_row,
             cursor_section: CursorSection::Key { segment: 0 },

@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use crate::workspace;
 
 #[derive(Debug, Clone)]
 pub enum DisplayRow {
@@ -191,6 +192,306 @@ fn walk(node: &TrieNode, seg_path: &str, depth: usize, header_prefix: Option<&st
     }
 }
 
+// ── Hierarchical Render Model ─────────────────────────────────────────────────
+
+/// A structural group in a `BundleModel`.  Produced by the group-merge scan over
+/// sorted entries.  Branch groups (≥2 direct children) are rendered as header lines;
+/// leaf groups are stored for navigation and structural highlighting but not shown.
+///
+/// A group's `label` may span multiple dot-joined segments after single-child chain
+/// collapsing (e.g. `"detail.something"` after merging a single-child chain).
+#[derive(Debug, Clone)]
+pub struct Group {
+    /// Segment label; extended in place during the scan for single-child chains.
+    pub label: String,
+    /// Real segment depth of the shallowest segment (0-based).
+    pub depth: usize,
+    /// Index of the first `Entry` in this group's range (inclusive).
+    pub first_entry: usize,
+    /// Index of the last `Entry` in this group's range (inclusive).
+    pub last_entry: usize,
+    /// True when this group has ≥2 direct child groups.
+    pub is_branch: bool,
+}
+
+/// One locale cell inside an `Entry`.
+#[derive(Debug, Clone)]
+pub struct LocaleCell {
+    /// Raw translation value, or `None` when the key is absent in this locale file.
+    pub value: Option<String>,
+    /// True when there is a pending (unsaved) write for this (key, locale) pair.
+    pub is_dirty: bool,
+}
+
+/// One translatable key in a `BundleModel`.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    /// Key segments split on `'.'`, e.g. `["app", "title"]`.
+    pub segments: Vec<String>,
+    /// One cell per locale in the parent `BundleModel.locales`, in the same order.
+    pub cells: Vec<LocaleCell>,
+    /// True when this key has at least one unsaved change.
+    pub is_dirty: bool,
+    /// True when this key is permanently pinned by the user.
+    pub is_pinned: bool,
+    /// True when this key was surfaced temporarily by the `ChildrenAll` scope.
+    pub is_temp_pinned: bool,
+}
+
+impl Entry {
+    /// Dot-joined key path (no bundle prefix).
+    pub fn real_key(&self) -> String {
+        self.segments.join(".")
+    }
+}
+
+/// All visible data for one bundle (one group of `.properties` files sharing the
+/// same base name).  Entries are sorted alphabetically by their joined segment path.
+/// Groups are derived from the sorted entry list via the group-merge scan and stored
+/// as pure structural data — the renderer queries them freely.
+#[derive(Debug, Clone)]
+pub struct BundleModel {
+    /// Bundle name (empty string for bare/legacy keys).
+    pub name: String,
+    /// Locale names in display order, matching the indices in each `Entry.cells`.
+    pub locales: Vec<String>,
+    /// All visible entries, sorted by their dot-joined key path.
+    pub entries: Vec<Entry>,
+    /// Structural groups derived via the group-merge scan.
+    /// Keys are dot-joined prefix paths within the bundle (no bundle qualifier).
+    pub groups: HashMap<String, Group>,
+}
+
+/// The complete hierarchical render model.  This is the single source of truth
+/// for the renderer once Step 2 of the refactoring is complete.  Until then it
+/// lives alongside `display_rows` and is rebuilt in parallel.
+#[derive(Debug, Clone)]
+pub struct RenderModel {
+    pub bundles: Vec<BundleModel>,
+}
+
+/// Build a `RenderModel` from the workspace and the current filter/display state.
+///
+/// `filtered_keys`  — the bundle-qualified keys to include (after filter).
+/// `always_bundles` — bundle names that must emit a `BundleModel` even when empty.
+/// `visible_locales`— locale columns currently visible.
+/// `dirty_keys`     — bundle-qualified keys with unsaved changes.
+/// `dirty_cells`    — `(full_key, locale)` pairs with unsaved changes.
+/// `pinned_keys`    — permanently pinned keys (bypass filter).
+/// `temp_pins`      — temporarily surfaced keys (`ChildrenAll` scope).
+pub fn build_render_model(
+    ws: &workspace::Workspace,
+    filtered_keys: &[String],
+    always_bundles: &[String],
+    visible_locales: &[String],
+    dirty_keys: &HashSet<String>,
+    dirty_cells: &HashSet<(String, String)>,
+    pinned_keys: &HashSet<String>,
+    temp_pins: &[String],
+) -> RenderModel {
+    // Group keys by bundle name.  `BTreeMap` keeps bundles in alphabetical order,
+    // matching the order produced by `build_display_rows`.
+    let mut by_bundle: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in filtered_keys {
+        match key.find(':') {
+            Some(idx) => {
+                by_bundle
+                    .entry(key[..idx].to_string())
+                    .or_default()
+                    .push(key[idx + 1..].to_string());
+            }
+            None => {
+                by_bundle.entry(String::new()).or_default().push(key.clone());
+            }
+        }
+    }
+    for bundle in always_bundles {
+        by_bundle.entry(bundle.clone()).or_default();
+    }
+
+    let mut bundles: Vec<BundleModel> = Vec::new();
+
+    for (bundle, real_keys) in &by_bundle {
+        // Locales this bundle can provide (intersect visible_locales with what the
+        // bundle actually has; bare-key bundles accept all visible locales).
+        let bundle_locales: Vec<String> = visible_locales
+            .iter()
+            .filter(|l| ws.bundle_has_locale(bundle, l))
+            .cloned()
+            .collect();
+
+        // Sort real keys within the bundle (they are already globally sorted when
+        // coming from `merged_keys`, but sort explicitly for correctness).
+        let mut sorted_keys = real_keys.clone();
+        sorted_keys.sort();
+
+        let entries: Vec<Entry> = sorted_keys
+            .iter()
+            .map(|real_key| {
+                let full_key = if bundle.is_empty() {
+                    real_key.clone()
+                } else {
+                    format!("{bundle}:{real_key}")
+                };
+                let segments: Vec<String> =
+                    real_key.split('.').map(|s| s.to_string()).collect();
+                let cells: Vec<LocaleCell> = bundle_locales
+                    .iter()
+                    .map(|locale| {
+                        let value = ws.get_value(&full_key, locale).map(|v| v.to_string());
+                        let is_dirty =
+                            dirty_cells.contains(&(full_key.clone(), locale.clone()));
+                        LocaleCell { value, is_dirty }
+                    })
+                    .collect();
+                Entry {
+                    segments,
+                    cells,
+                    is_dirty: dirty_keys.contains(&full_key),
+                    is_pinned: pinned_keys.contains(&full_key),
+                    is_temp_pinned: temp_pins.iter().any(|k| k == &full_key),
+                }
+            })
+            .collect();
+
+        let groups = build_groups(&entries);
+
+        bundles.push(BundleModel {
+            name: bundle.clone(),
+            locales: bundle_locales,
+            entries,
+            groups,
+        });
+    }
+
+    RenderModel { bundles }
+}
+
+/// Single-forward-pass group-merge scan over a sorted entry list.
+///
+/// Detects which prefix paths form structural groups and which of those are
+/// single-child chains (collapsible into a merged label).  Returns a map from
+/// dot-joined prefix path → `Group`.  Both the original prefix and any merged
+/// child prefix map to the same `Group` object after a chain collapse.
+///
+/// See `docs/group-merge.md` for the full algorithm description and worked example.
+fn build_groups(entries: &[Entry]) -> HashMap<String, Group> {
+    // Mutable build state for one group while it is being constructed.
+    struct Bg {
+        label: String,
+        depth: usize,
+        first: usize,
+        last: usize,
+        is_branch: bool,
+        /// Index in `bg` of the group that absorbed this one (self-referential if not absorbed).
+        canonical: usize,
+    }
+
+    // One slot on the stack of currently-open (not yet closed) groups.
+    struct Open {
+        idx: usize,            // index in `bg`
+        prefix: String,        // dot-joined prefix at this depth
+        children: Vec<usize>,  // bg indices of direct children (appended as they close)
+    }
+
+    let mut bg: Vec<Bg> = Vec::new();
+    // Pairs of (prefix, bg_idx) collected as groups close; used to build the final map.
+    let mut closed: Vec<(String, usize)> = Vec::new();
+    let mut stack: Vec<Open> = Vec::new();
+
+    let n = entries.len();
+
+    // Process entries 0..n, then a sentinel (i == n, segs = []) that closes everything.
+    for i in 0..=n {
+        let segs: &[String] = if i < n { &entries[i].segments } else { &[] };
+        let prev_segs: &[String] = if i > 0 { &entries[i - 1].segments } else { &[] };
+
+        let shared = common_prefix_len(segs, prev_segs);
+
+        // Close depths >= shared, deepest first.
+        while stack.len() > shared {
+            let open = stack.pop().unwrap();
+            bg[open.idx].last = i.saturating_sub(1);
+
+            if open.children.len() == 1 {
+                let child_idx = open.children[0];
+                // Extend-in-place if ranges match: this group had exactly one child
+                // that spanned the same entries — a single-child chain.
+                if bg[child_idx].first == bg[open.idx].first
+                    && bg[child_idx].last == bg[open.idx].last
+                {
+                    let child_label = bg[child_idx].label.clone();
+                    bg[open.idx].label.push('.');
+                    bg[open.idx].label.push_str(&child_label);
+                    // Inherit the child's branch status (it may have been a branch itself
+                    // due to cascading merges from deeper single-child chains).
+                    bg[open.idx].is_branch = bg[child_idx].is_branch;
+                    // Redirect: child's canonical now points to this group.
+                    bg[child_idx].canonical = open.idx;
+                }
+                // If ranges don't match the child had a different extent — no merge.
+            } else if open.children.len() > 1 {
+                bg[open.idx].is_branch = true;
+            }
+
+            // Register this group with its parent (if one is open).
+            if let Some(parent) = stack.last_mut() {
+                parent.children.push(open.idx);
+            }
+
+            closed.push((open.prefix, open.idx));
+        }
+
+        if i == n {
+            break;
+        }
+
+        // Open new groups for depths `shared..segs.len()`.
+        for d in shared..segs.len() {
+            let prefix = segs[..=d].join(".");
+            let idx = bg.len();
+            bg.push(Bg {
+                label: segs[d].clone(),
+                depth: d,
+                first: i,
+                last: i,      // updated when this group closes
+                is_branch: false,
+                canonical: idx, // self initially
+            });
+            stack.push(Open { idx, prefix, children: Vec::new() });
+        }
+    }
+
+    // Build the final map.  For each closed prefix, follow the canonical chain to
+    // the surviving group object and record it.  Both original and merged prefixes
+    // will point to the same `Group` data (the absorbing group's data).
+    let mut map: HashMap<String, Group> = HashMap::new();
+    for (prefix, idx) in closed {
+        // Follow the canonical chain.
+        let mut canon = idx;
+        loop {
+            let next = bg[canon].canonical;
+            if next == canon { break; }
+            canon = next;
+        }
+        let g = &bg[canon];
+        map.entry(prefix).or_insert_with(|| Group {
+            label: g.label.clone(),
+            depth: g.depth,
+            first_entry: g.first,
+            last_entry: g.last,
+            is_branch: g.is_branch,
+        });
+    }
+
+    map
+}
+
+/// Number of leading elements shared between two slices.
+fn common_prefix_len(a: &[String], b: &[String]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -336,5 +637,147 @@ mod tests {
         assert_eq!(headers(&rows), vec!["com.err"]);
         assert_eq!(displays(&rows), vec!["com.err", ".other", ".second", ".timeout.deeper"]);
         assert_eq!(depths(&rows),   vec![0,          1,        1,         1]);
+    }
+
+    // ── Group-merge scan tests ────────────────────────────────────────────────
+
+    fn segs(key: &str) -> Vec<String> {
+        key.split('.').map(|s| s.to_string()).collect()
+    }
+
+    fn dummy_entry(key: &str) -> Entry {
+        Entry {
+            segments: segs(key),
+            cells: vec![],
+            is_dirty: false,
+            is_pinned: false,
+            is_temp_pinned: false,
+        }
+    }
+
+    fn entries(keys: &[&str]) -> Vec<Entry> {
+        keys.iter().map(|k| dummy_entry(k)).collect()
+    }
+
+    #[test]
+    fn no_entries_gives_empty_groups() {
+        let groups = build_groups(&[]);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn single_entry_chain_collapses() {
+        // "http.status" → "http" has exactly one child "status" with the same range
+        // → single-child chain collapsed: both prefixes point to the merged group
+        //   with label "http.status".  is_branch = false (leaf chain).
+        let groups = build_groups(&entries(&["http.status"]));
+        assert_eq!(groups.len(), 2);
+        let http = groups.get("http").expect("http group missing");
+        assert!(!http.is_branch);
+        assert_eq!(http.label, "http.status");
+        let status = groups.get("http.status").expect("http.status alias missing");
+        assert!(!status.is_branch);
+        assert_eq!(status.label, "http.status");
+        assert_eq!(status.first_entry, http.first_entry);
+    }
+
+    #[test]
+    fn two_siblings_make_parent_branch() {
+        // "a.x" and "a.y" → "a" is a branch (2 children: x, y).
+        let groups = build_groups(&entries(&["a.x", "a.y"]));
+        let a = groups.get("a").expect("a group missing");
+        assert!(a.is_branch);
+        assert_eq!(a.label, "a");
+        assert_eq!(a.first_entry, 0);
+        assert_eq!(a.last_entry, 1);
+    }
+
+    #[test]
+    fn single_child_chain_collapses() {
+        // "detail" → "something" → [two children] should collapse into "detail.something".
+        let es = entries(&[
+            "detail.something.msg.first",
+            "detail.something.msg.second",
+            "detail.something.notmsg",
+        ]);
+        let groups = build_groups(&es);
+        // "detail" had one child "something" and same range → merged to "detail.something".
+        let g = groups.get("detail").expect("detail group missing");
+        assert_eq!(g.label, "detail.something");
+        assert!(g.is_branch);
+        assert_eq!(g.first_entry, 0);
+        assert_eq!(g.last_entry, 2);
+        // "detail.something" also maps to the same group.
+        let g2 = groups.get("detail.something").expect("detail.something missing");
+        assert_eq!(g2.label, "detail.something");
+        assert_eq!(g2.first_entry, g.first_entry);
+        // "msg" at depth 2 has two children → branch, no merge.
+        let msg = groups.get("detail.something.msg").expect("msg missing");
+        assert_eq!(msg.label, "msg");
+        assert!(msg.is_branch);
+    }
+
+    #[test]
+    fn worked_example_detail_something() {
+        // The worked example from docs/group-merge.md (bundle `stripping`):
+        //   0:  [http, something]
+        //   1:  [http, status]
+        //   2:  [http, status, 200]
+        //   3:  [http, status, 400]
+        //   4:  [http, status, 401]
+        //   5:  [http, status, 403]
+        //   6:  [http, status, 404]
+        //   7:  [http, status, 500]
+        //   8:  [http, status, detail, something, msg, firstmessage]
+        //   9:  [http, status, detail, something, msg, secondmessage]
+        //   10: [http, status, detail, something, notmsg]
+        //   11: [http, status, x]
+        //   12: [http, y]
+        let es = entries(&[
+            "http.something",
+            "http.status",
+            "http.status.200",
+            "http.status.400",
+            "http.status.401",
+            "http.status.403",
+            "http.status.404",
+            "http.status.500",
+            "http.status.detail.something.msg.firstmessage",
+            "http.status.detail.something.msg.secondmessage",
+            "http.status.detail.something.notmsg",
+            "http.status.x",
+            "http.y",
+        ]);
+        let groups = build_groups(&es);
+
+        // "http" spans all 13 entries, branch (something + status + y).
+        let http = groups.get("http").expect("http");
+        assert!(http.is_branch);
+        assert_eq!(http.first_entry, 0);
+        assert_eq!(http.last_entry, 12);
+
+        // "http.status" spans entries 1–11 and is a branch.
+        let status = groups.get("http.status").expect("http.status");
+        assert!(status.is_branch);
+        assert_eq!(status.first_entry, 1);
+        assert_eq!(status.last_entry, 11);
+
+        // "http.status.detail" had one child "something" with matching range 8–10
+        // → merged to "detail.something".
+        let detail = groups.get("http.status.detail").expect("http.status.detail");
+        assert_eq!(detail.label, "detail.something");
+        assert_eq!(detail.first_entry, 8);
+        assert_eq!(detail.last_entry, 10);
+        // Both prefixes resolve to the same group data.
+        let ds = groups.get("http.status.detail.something").expect("detail.something alias");
+        assert_eq!(ds.label, "detail.something");
+        assert_eq!(ds.first_entry, 8);
+
+        // "msg" at depth 4 has two children (firstmessage, secondmessage) → branch.
+        let msg = groups.get("http.status.detail.something.msg").expect("msg");
+        assert_eq!(msg.label, "msg");
+        assert!(msg.is_branch);
+        assert_eq!(msg.first_entry, 8);
+        assert_eq!(msg.last_entry, 9);
     }
 }
