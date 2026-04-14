@@ -62,14 +62,17 @@ is the file name — renaming a bundle would rename the file on disk).
 
 ```rust
 pub workspace: Workspace,
-pub display_rows: Vec<DisplayRow>,   // rebuilt on every filter/edit change
-pub visible_locales: Vec<String>,    // subset of all_locales() when locale
-                                     // selector is active; full list otherwise
-pub cursor_row: usize,               // index into display_rows
-pub cursor_section: CursorSection,   // Key { segment } | Locale(idx); replaces the old
-                                     // cursor_col + key_segment_cursor pair
-pub preferred_locale: Option<String>, // sticky locale: set on explicit navigation,
-                                     // restored by clamp_cursor_section when possible
+pub domain_model: DomainModel,       // hierarchical source of truth; rebuilt by apply_filter
+pub view_rows: Vec<ViewRow>,         // flat ordered row list built from domain_model;
+                                     // rebuilt on every filter/workspace change
+pub visible_locales: Vec<String>,    // subset of all_locales() when a locale filter is
+                                     // active; full list otherwise
+pub cursor_row: usize,               // index into view_rows
+pub cursor_segment: usize,           // within-row offset from leaf toward root (Left/Right
+                                     // nav on chain-collapsed rows); 0 = leaf is anchor
+pub cursor_locale: Option<String>,   // selected locale column; None = key column
+                                     // set by set_locale_cursor(); never changed by clamping
+pub vp_height: usize,                // table viewport height from the last render pass
 pub scroll_offset: usize,
 pub mode: Mode,
 pub filter_textarea: TextArea<'static>, // always present; lines()[0] is the query
@@ -137,9 +140,9 @@ with ←→. `n` on a bundle locale cell opens key-naming pre-filled with
 value editing and rename.
 
 `current_row_bundle()` returns the bundle name for any row type:
-- `Key` row: `split_key(full_key).0`
-- Within-bundle `Header`: `split_key(prefix).0`
-- Bundle-level `Header`: the prefix itself (it IS the bundle name — no colon)
+- Leaf row (`is_leaf = true`): `split_key(full_key).0`
+- Group header (`!is_leaf && prefix != bundle`): `split_key(prefix).0`
+- Bundle-level header (`!is_leaf && prefix == bundle`): `prefix` (it IS the bundle name — no colon)
 
 Cross-bundle rename/move is supported: renaming a key to a different bundle
 prefix runs `commit_cross_bundle_rename`, which snapshots values, deletes
@@ -166,63 +169,62 @@ newline are preserved verbatim as the physical value; the display layer strips
 them for rendering). The writer collapses multi-line values to a single line
 on save (re-splitting is a future TODO).
 
-**Render model**
-`build_display_rows(keys: &[String], always_bundles: &[String]) -> Vec<DisplayRow>`
-groups keys by bundle, emits a bundle `Header` at depth 0 for each bundle,
-then walks a dot-split trie for the real keys within it. `always_bundles`
-ensures bundle headers are emitted even when all their keys are filtered out
-(e.g. the `-/` filter that hides all keys).
+**View model**
+`build_view_rows(dm: &DomainModel, visible_locales: &[String], column_directive) -> Vec<ViewRow>`
+builds the flat row list from the hierarchical domain model. Called by `apply_filter`
+after every filter or workspace change.
 
-```rust
-enum DisplayRow {
-    Header { display: String, prefix: String, depth: usize },
-    Key    { display: String, full_key: String, depth: usize },
-}
-```
-
-`Header.prefix` is bundle-qualified for within-bundle headers
-(e.g. `"messages:app.confirm"`); for bundle-level headers it is just the
-bundle name. `Key.full_key` is always bundle-qualified.
+Each `ViewRow` carries a `RowIdentity` struct plus display fields:
+- `identity.bundle` — bundle name (empty for bare keys)
+- `identity.prefix` — bundle-qualified key prefix this row represents
+- `identity.full_key: Option<String>` — `Some` for leaf rows, `None` for headers
+- `identity.is_leaf` — `true` for key rows, `false` for group/bundle headers
+- `key_segments: Vec<String>` — the display segments for this row's key column
+- `indent: usize` — indentation level (drives leading spaces in the renderer)
+- `locale_cells: Vec<LocaleCell>` — one cell per visible locale
 
 Trie rules (applied per bundle):
-- A non-key node with ≥2 key-children emits a `Header`; single-child chains
-  collapse (the child's display is the full relative path from the outer header).
-- A key-node that also has children emits only a `Key` row; its children
-  appear indented below it at depth+1.
-- `depth` drives indentation (`"  ".repeat(depth)`).
+- A node with ≥2 key-children emits a group header row; single-child chains
+  collapse into one row whose `key_segments` spans the full chain.
+- A key-node that also has children emits only a leaf row; its children appear
+  as separate rows below it at a higher indent level.
+- Bundle-level header: `!is_leaf && prefix == bundle`.
+- Group header: `!is_leaf && prefix != bundle`.
 
 Keys without `:` (legacy / test keys) take the bare path — no bundle header.
 
-**CursorSection**
-`CursorSection` is a typed enum that replaces the old `cursor_col: usize` +
-`key_segment_cursor: usize` pair:
+`always_bundles` ensures bundle headers appear even when all their keys are
+filtered out (e.g. the `-/` filter that hides all keys).
 
-```rust
-pub enum CursorSection {
-    Key { segment: usize }, // key column; segment = k (depth offset from leaf)
-    Locale(usize),          // 0-based index into visible_locales
-}
-```
+**Cursor state**
+The cursor is three independent fields on `AppState`:
 
-Helper methods: `is_key()`, `locale_idx() -> Option<usize>`, `reset_segment()`.
-Always update `cursor_section` through `set_locale_cursor(idx)` when moving to a
-locale column — that method also writes `preferred_locale`, keeping both in sync.
+- `cursor_row: usize` — index into `view_rows`
+- `cursor_segment: usize` — depth offset from the rightmost segment toward the root
+  (0 = leaf is the anchor; increases as the user presses Left on a chain-collapsed row)
+- `cursor_locale: Option<String>` — the sticky preferred locale column; `None` = key column
+
+`cursor_locale` is set exclusively by `set_locale_cursor(idx)` (explicit user
+navigation) and is never modified by clamping. `effective_locale_idx()` snaps
+left to the nearest locale the current bundle owns, giving the *visual* cursor
+position without touching the sticky preference.
 
 **Sticky locale**
-`preferred_locale: Option<String>` remembers the user's intended locale column.
-It is set exclusively by `set_locale_cursor()` (explicit user navigation), never
-by clamping. `clamp_cursor_section()` tries to restore it first when a bundle
-transition would otherwise land on a different column.
+`cursor_locale` remembers the user's intended locale column across bundle
+transitions. When the current bundle does not own that locale, the renderer
+and navigation use `effective_locale_idx()` to clamp visually while leaving
+`cursor_locale` unchanged so it can be restored when the user returns to a
+bundle that has it.
 
 **Selection model**
-`cursor_row` indexes into `display_rows`. All rows (Header and Key) are
-navigable. `cursor_section` is either `Key { segment }` (key column) or
-`Locale(idx)` (0-based index into `visible_locales`). `<missing>` in red marks
-cells where the key is absent from that locale file. Bundle-level Header locale
-cells show `[locale]` in dark gray (navigable, but no stored value).
+`cursor_row` indexes into `view_rows`. All rows (group headers, bundle headers,
+and leaf rows) are navigable. `cursor_locale` is either `Some(name)` (locale
+column) or `None` (key column). `<missing>` in red marks cells where the key is
+absent from that locale file. Bundle-level header locale cells show `[locale]` in
+dark gray (navigable, but no stored value).
 
 The logical cursor in the key column is two-dimensional:
-`(cursor_row, CursorSection::Key { segment })`. `segment` (k) is a depth offset
+`(cursor_row, cursor_segment)`. `cursor_segment` (k) is a depth offset
 from the current row's full key toward the bundle root:
 
 - k=0 → anchor = full key (last/deepest segment highlighted — the default)
@@ -239,7 +241,7 @@ cursor to the anchor row in the table (the Header or Key whose key == anchor).
 At k=max there is no parent row to jump to (the anchor is the bundle itself).
 
 `→` (Right): when k>0, walk the anchor back toward leaf (decrements k). At k=0
-the right arrow moves `cursor_section` to `Locale(0)` (first available locale).
+the right arrow sets `cursor_locale` to the first available locale.
 
 `Ctrl+↑` / `Ctrl+↓` (SiblingUp / SiblingDown): navigate to the previous/next
 row at the **same absolute segment depth** as the current anchor, regardless of
@@ -251,7 +253,7 @@ the anchor highlights the correct depth level on the target row.
 `Ctrl+→` (GoToFirstChild): jump to the first row whose key starts with
 `{anchor}.`, and reset k=0.
 
-`↑` / `↓` (row movement): move one display row; reset k=0.
+`↑` / `↓` (row movement): move one row in `view_rows`; reset k=0.
 
 **Key-segment helpers (state.rs)**
 
@@ -262,7 +264,7 @@ for depth-based Ctrl+↑/↓ navigation (same absolute depth, reduces depth when
 `find_anchor_row()` → `Option<usize>` — row (≠ cursor_row) whose key == anchor.
 `find_first_child()` → `Option<usize>` — first row starting with `{anchor}.`.
 
-`apply_filter` resets `cursor_section` segment to 0. `sibling_nav` re-applies the
+`apply_filter` resets `cursor_segment` to 0. `sibling_nav` re-applies the
 computed k after calling `refresh_temp_pins` (which would otherwise reset it).
 
 **Filter system**

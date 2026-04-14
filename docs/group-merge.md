@@ -1,5 +1,14 @@
 # Group-Merge: Segment Group Detection
 
+> **Alternative approach — not implemented.** The current code uses a
+> `CompressedTrie` (`radix_tree_arena.rs`) to detect chain-collapse boundaries
+> via `key_partitions()`. Group-merge is a simpler single-forward-scan algorithm
+> that achieves the same result given one precondition: entries must be sorted
+> alphabetically by key. We currently satisfy that precondition (`merged_keys` is
+> always sorted), but may not always. The algorithm is documented here for
+> reference — it is clean, well-understood, and worth keeping in mind if the trie
+> ever becomes a bottleneck or the sorting assumption is re-evaluated.
+
 ## Context
 
 This idea came up while designing the hierarchical render model
