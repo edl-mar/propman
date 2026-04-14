@@ -43,7 +43,7 @@ pub fn commit_exact_rename(state: &mut AppState, old_key: &str, new_key: String)
 /// Routes to `commit_cross_bundle_prefix_rename` when the bundle prefix changes.
 ///
 /// `all_children`: when `true`, renames hidden children too (`ChildrenAll` scope).
-/// When `false`, only renames keys currently visible in `display_rows` (`Children`
+/// When `false`, only renames keys currently visible in `view_rows` (`Children`
 /// scope — hidden ones are left untouched).
 pub fn commit_prefix_rename(state: &mut AppState, old_prefix: &str, new_prefix: String, all_children: bool) {
     let (old_bundle, _) = workspace::split_key(old_prefix);

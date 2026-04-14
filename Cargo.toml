@@ -13,3 +13,4 @@ crossterm = "0.28"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
 anyhow = "1"
 walkdir = "2"
+bumpalo = "3"

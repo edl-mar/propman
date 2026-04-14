@@ -20,7 +20,7 @@ pub enum StatusModifier {
 }
 
 /// Column visibility directive derived from `:?` / `:!` terms.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColumnDirective {
     /// No directive — all rows visible.
     None,

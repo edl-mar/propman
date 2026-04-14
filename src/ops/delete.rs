@@ -86,7 +86,7 @@ pub fn delete_key(state: &mut AppState, full_key: &str) {
 ///
 /// `all_children`: when `true`, deletes hidden (filter-invisible) children too
 /// (`ChildrenAll` scope).  When `false`, only deletes keys currently visible in
-/// `display_rows` (`Children` scope — hidden ones are silently left untouched).
+/// `view_rows` (`Children` scope — hidden ones are silently left untouched).
 pub fn delete_key_prefix(state: &mut AppState, prefix: &str, all_children: bool) {
     let dot_prefix = format!("{prefix}.");
 

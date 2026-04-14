@@ -131,9 +131,11 @@ pub fn commit_cell_edit(state: &mut AppState, new_value: String) {
         Some(l) => l,
         None => return,
     };
-    let full_key = match state.cursor.full_key() {
-        Some(k) if !state.cursor.is_bundle_header() => k,
-        _ => return, // Bundle header or key column — no-op.
+    let full_key = match state.view_rows.get(state.cursor_row)
+        .and_then(|r| r.identity.full_key.clone())
+    {
+        Some(k) => k,
+        None => return,
     };
 
     // Split bundle qualifier: files store the real key without bundle prefix.
@@ -203,9 +205,11 @@ pub fn commit_cell_insert(state: &mut AppState, new_value: String) {
         Some(l) => l,
         None => return,
     };
-    let full_key = match state.cursor.full_key() {
+    let full_key = match state.view_rows.get(state.cursor_row)
+        .and_then(|r| r.identity.full_key.clone())
+    {
         Some(k) => k,
-        None => return, // Bundle header — no-op.
+        None => return,
     };
 
     // If this key isn't in merged_keys yet (e.g. translating a Header row whose

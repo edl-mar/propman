@@ -1,19 +1,22 @@
+mod app_model;
+mod view_model;
 mod editor;
 mod filter;
 mod keybindings;
 mod messages;
 mod ops;
 mod parser;
-mod render_model;
+mod radix_tree_arena;
 mod search;
 mod state;
 mod tui;
 mod update;
+mod widgets;
 mod workspace;
 mod writer;
 
-use std::path::PathBuf;
 use anyhow::Result;
+use std::path::PathBuf;
 
 fn main() -> Result<()> {
     let dir = std::env::args()
