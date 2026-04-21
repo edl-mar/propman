@@ -41,10 +41,9 @@ All functions take `&mut AppState` — no mode or message knowledge.
 ### AppState methods added (state.rs)
 
 ```
-apply_filter()       — re-evaluates filter, rebuilds display_rows + visible_locales
+apply_filter()       — re-evaluates filter, rebuilds view_rows + visible_locales
 current_cell_value() — value at current cursor cell, or None
 current_row_bundle() — bundle name for the current row
-clamp_cursor_col()   — snaps cursor_col to a valid column for the current bundle
 clamp_scroll()       — keeps scroll_offset in sync with cursor_row
 ```
 

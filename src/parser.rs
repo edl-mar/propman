@@ -13,7 +13,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub enum FileEntry {
     KeyValue { first_line: usize, last_line: usize, key: String, value: String },
-    Comment  { line: usize, raw: String },
+    Comment  { line: usize },
     Blank    { line: usize },
 }
 
@@ -36,7 +36,7 @@ pub fn parse(path: &Path) -> io::Result<Vec<FileEntry>> {
             entries.push(FileEntry::Blank { line: first_line });
             i += 1;
         } else if trimmed.starts_with('#') || trimmed.starts_with('!') {
-            entries.push(FileEntry::Comment { line: first_line, raw: raw.clone() });
+            entries.push(FileEntry::Comment { line: first_line });
             i += 1;
         } else if let Some((k, v)) = trimmed.split_once('=') {
             let key = k.trim().to_string();
@@ -64,7 +64,7 @@ pub fn parse(path: &Path) -> io::Result<Vec<FileEntry>> {
             entries.push(FileEntry::KeyValue { first_line, last_line, key, value });
         } else {
             // Lines without '=' (malformed or bare continuation) — preserve verbatim.
-            entries.push(FileEntry::Comment { line: first_line, raw: raw.clone() });
+            entries.push(FileEntry::Comment { line: first_line });
             i += 1;
         }
     }

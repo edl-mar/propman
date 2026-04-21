@@ -20,6 +20,7 @@ wants to keep visible across sessions or operations, independent of dirty state.
 ### Pin state (AppState)
 
 ```rust
+// D6 (architectural_debt.md): migrate to Vec<KeyId> / HashSet<KeyId> once key.rs is retired
 pub temp_pins: Vec<String>,        // current op only; discarded on mode exit
 pub pinned_keys: HashSet<String>,  // persistent; user-controlled via m/M
 ```

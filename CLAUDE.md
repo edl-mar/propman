@@ -20,17 +20,18 @@ The app follows The Elm Architecture (TEA):
 tui           ratatui + crossterm — layout, rendering, raw keyboard event capture
 keybindings   HashMap<KeyEvent, Message> per mode — translates raw events to messages
 messages      Message enum — all possible actions in the app
-update        (State, Message) → State — pure except SaveFile (flushes pending_writes)
-state         AppState — complete app state (see fields below)
+update        (State, Message) → State — pure dispatcher; all business logic in ops
+state         AppState — navigation + UI state; owns DomainModel and Workspace
 filter        FilterExpr AST, parse(), evaluate(), visible_locales()
-render_model  build_display_rows() — converts bundle-qualified key slice → Vec<DisplayRow>
+view_model    build_view_rows() — converts DomainModel → Vec<ViewRow> for rendering
 editor        CellEdit — wraps TextArea<'static> + original string for change detection
-workspace     Workspace — owns all FileGroup/PropertiesFile/FileEntry data;
-              single source of truth for keys and values
+store         Store — ID tables, trie, translations, in-session mutation tracking
+domain        DomainModel — single source of truth; exposes typed handles, no raw IDs
+workspace     Workspace — I/O only: loads .properties at startup; saves at Ctrl+S
+              by reading the domain model's change set and writing minimal file diffs
 parser        line-by-line reader — preserves KeyValue, Comment, Blank entries;
               joins \-continuation lines into a single logical value string
-writer        write_change(), write_insert(), write_delete() — targeted file rewrites
-search        stub (nucleo fuzzy search planned; currently unused)
+writer        targeted file rewrite helpers called by workspace.save()
 ```
 
 New features are added by introducing new `Message` variants and handling them
@@ -62,19 +63,23 @@ is the file name — renaming a bundle would rename the file on disk).
 
 ```rust
 pub workspace: Workspace,
-pub display_rows: Vec<DisplayRow>,   // rebuilt on every filter/edit change
-pub visible_locales: Vec<String>,    // subset of all_locales() when locale
-                                     // selector is active; full list otherwise
-pub cursor_row: usize,               // index into display_rows
-pub cursor_section: CursorSection,   // Key { segment } | Locale(idx); replaces the old
-                                     // cursor_col + key_segment_cursor pair
-pub preferred_locale: Option<String>, // sticky locale: set on explicit navigation,
-                                     // restored by clamp_cursor_section when possible
+pub domain_model: DomainModel,       // single source of truth; wraps Store; exposes typed handles
+pub view_rows: Vec<ViewRow>,         // flat ordered row list built from domain_model;
+                                     // rebuilt on every filter/workspace change
+pub visible_locales: Vec<String>,    // subset of all_locales() when a locale filter is
+                                     // active; full list otherwise
+pub cursor_row: usize,               // index into view_rows
+pub cursor_segment: usize,           // within-row offset from leaf toward root (Left/Right
+                                     // nav on chain-collapsed rows); 0 = leaf is anchor
+pub cursor_locale: Option<String>,   // selected locale column; None = key column
+                                     // set by set_locale_cursor(); never changed by clamping
+pub vp_height: usize,                // table viewport height from the last render pass
 pub scroll_offset: usize,
 pub mode: Mode,
 pub filter_textarea: TextArea<'static>, // always present; lines()[0] is the query
 pub unsaved_changes: bool,
-pub pending_writes: Vec<PendingChange>, // flushed on SaveFile
+pub pending_writes: Vec<PendingChange>, // D5 (architectural_debt.md): being retired in favour
+                                     // of store change_set(); flushed on SaveFile for now
 pub quitting: bool,
 pub edit_buffer: Option<CellEdit>,   // present while mode is Editing / KeyNaming
                                      // / KeyRenaming / LocaleNaming / BundleNaming
@@ -83,8 +88,8 @@ pub selection_scope: SelectionScope, // Exact / Children / ChildrenAll; Tab-cycl
                                      // in Normal, KeyRenaming, Deleting
 pub status_message: Option<String>,  // one-shot; cleared on next keypress
 pub show_preview: bool,              // Space toggles read-only value preview pane
-pub dirty_keys: HashSet<String>,     // keys with unsaved changes; auto-set on any
-                                     // mutation, cleared per-key on Ctrl+S
+pub dirty_keys: HashSet<String>,     // D8 (architectural_debt.md): being replaced by store
+                                     // mutation tracking; currently string-keyed
 pub temp_pins: Vec<String>,          // hidden children surfaced while ChildrenAll
                                      // is active; discarded on mode exit
 pub pinned_keys: HashSet<String>,    // manual bookmarks; bypass filter until unpinned
@@ -124,11 +129,11 @@ Escape cycles: `Normal → Filter → Normal`.
 
 **Bundle system**
 Files are grouped by bundle (base filename before `_`). Keys are stored in
-`merged_keys` as `"bundle:real_key"` (e.g. `"messages:app.title"`).
-`workspace::split_key(full_key) -> (&str, &str)` splits on the first `:`.
-`workspace.get_value(full_key, locale)` routes lookups through the correct
-bundle group. Files on disk always store the bare real key — the bundle
-prefix is an in-memory convention only.
+the `Store` under their bundle, identified by typed IDs (`BundleId`, `KeyId`).
+The bundle-qualified string form `"bundle:real_key"` (e.g. `"messages:app.title"`)
+is used only at I/O boundaries; `domain.rs`'s `find_key()` and `insert_key()`
+are the sole entry points for splitting on `:`. Files on disk always store the
+bare real key — the bundle prefix is an in-memory convention only.
 
 Bundle-level Header rows (depth 0, prefix == bundle name) display `[locale]`
 tags for the locales that belong to that bundle. These cells are navigable
@@ -137,9 +142,9 @@ with ←→. `n` on a bundle locale cell opens key-naming pre-filled with
 value editing and rename.
 
 `current_row_bundle()` returns the bundle name for any row type:
-- `Key` row: `split_key(full_key).0`
-- Within-bundle `Header`: `split_key(prefix).0`
-- Bundle-level `Header`: the prefix itself (it IS the bundle name — no colon)
+- Leaf row (`is_leaf = true`): `split_key(full_key).0`
+- Group header (`!is_leaf && prefix != bundle`): `split_key(prefix).0`
+- Bundle-level header (`!is_leaf && prefix == bundle`): `prefix` (it IS the bundle name — no colon)
 
 Cross-bundle rename/move is supported: renaming a key to a different bundle
 prefix runs `commit_cross_bundle_rename`, which snapshots values, deletes
@@ -155,7 +160,7 @@ its original line number. On save, only the changed lines are rewritten.
 ```rust
 enum FileEntry {
     KeyValue { first_line: usize, last_line: usize, key: String, value: String },
-    Comment  { line: usize, raw: String },
+    Comment  { line: usize },
     Blank    { line: usize },
 }
 ```
@@ -166,63 +171,63 @@ newline are preserved verbatim as the physical value; the display layer strips
 them for rendering). The writer collapses multi-line values to a single line
 on save (re-splitting is a future TODO).
 
-**Render model**
-`build_display_rows(keys: &[String], always_bundles: &[String]) -> Vec<DisplayRow>`
-groups keys by bundle, emits a bundle `Header` at depth 0 for each bundle,
-then walks a dot-split trie for the real keys within it. `always_bundles`
-ensures bundle headers are emitted even when all their keys are filtered out
-(e.g. the `-/` filter that hides all keys).
+**View model**
+`build_view_rows(dm: &DomainModel, visible_locales: &[String], column_directive) -> Vec<ViewRow>`
+builds the flat row list from the hierarchical domain model. Called by `apply_filter`
+after every filter or workspace change.
 
-```rust
-enum DisplayRow {
-    Header { display: String, prefix: String, depth: usize },
-    Key    { display: String, full_key: String, depth: usize },
-}
-```
-
-`Header.prefix` is bundle-qualified for within-bundle headers
-(e.g. `"messages:app.confirm"`); for bundle-level headers it is just the
-bundle name. `Key.full_key` is always bundle-qualified.
+Each `ViewRow` carries a `RowIdentity` struct plus display fields:
+- `identity.bundle` — bundle name (empty for bare keys)
+- `identity.prefix` — bundle-qualified key prefix this row represents
+- `identity.full_key: Option<Key>` — `Some` for leaf rows, `None` for headers (D6: migrate to `key_id`)
+- `identity.key_id: Option<KeyId>` — D6 migration target; consume this instead of `full_key` once D6 is done
+- `identity.is_leaf` — `true` for key rows, `false` for group/bundle headers
+- `key_segments: Vec<String>` — the display segments for this row's key column
+- `indent: usize` — indentation level (drives leading spaces in the renderer)
+- `locale_cells: Vec<LocaleCell>` — one cell per visible locale
 
 Trie rules (applied per bundle):
-- A non-key node with ≥2 key-children emits a `Header`; single-child chains
-  collapse (the child's display is the full relative path from the outer header).
-- A key-node that also has children emits only a `Key` row; its children
-  appear indented below it at depth+1.
-- `depth` drives indentation (`"  ".repeat(depth)`).
+- A node with ≥2 key-children emits a group header row; single-child chains
+  collapse into one row whose `key_segments` spans the full chain.
+- A key-node that also has children emits only a leaf row; its children appear
+  as separate rows below it at a higher indent level.
+- Bundle-level header: `!is_leaf && prefix == bundle`.
+- Group header: `!is_leaf && prefix != bundle`.
 
 Keys without `:` (legacy / test keys) take the bare path — no bundle header.
 
-**CursorSection**
-`CursorSection` is a typed enum that replaces the old `cursor_col: usize` +
-`key_segment_cursor: usize` pair:
+`always_bundles` ensures bundle headers appear even when all their keys are
+filtered out (e.g. the `-/` filter that hides all keys).
 
-```rust
-pub enum CursorSection {
-    Key { segment: usize }, // key column; segment = k (depth offset from leaf)
-    Locale(usize),          // 0-based index into visible_locales
-}
-```
+**Cursor state**
+The cursor is three independent fields on `AppState`:
 
-Helper methods: `is_key()`, `locale_idx() -> Option<usize>`, `reset_segment()`.
-Always update `cursor_section` through `set_locale_cursor(idx)` when moving to a
-locale column — that method also writes `preferred_locale`, keeping both in sync.
+- `cursor_row: usize` — index into `view_rows`
+- `cursor_segment: usize` — depth offset from the rightmost segment toward the root
+  (0 = leaf is the anchor; increases as the user presses Left on a chain-collapsed row)
+- `cursor_locale: Option<String>` — the sticky preferred locale column; `None` = key column
+
+`cursor_locale` is set exclusively by `set_locale_cursor(idx)` (explicit user
+navigation) and is never modified by clamping. `effective_locale_idx()` snaps
+left to the nearest locale the current bundle owns, giving the *visual* cursor
+position without touching the sticky preference.
 
 **Sticky locale**
-`preferred_locale: Option<String>` remembers the user's intended locale column.
-It is set exclusively by `set_locale_cursor()` (explicit user navigation), never
-by clamping. `clamp_cursor_section()` tries to restore it first when a bundle
-transition would otherwise land on a different column.
+`cursor_locale` remembers the user's intended locale column across bundle
+transitions. When the current bundle does not own that locale, the renderer
+and navigation use `effective_locale_idx()` to clamp visually while leaving
+`cursor_locale` unchanged so it can be restored when the user returns to a
+bundle that has it.
 
 **Selection model**
-`cursor_row` indexes into `display_rows`. All rows (Header and Key) are
-navigable. `cursor_section` is either `Key { segment }` (key column) or
-`Locale(idx)` (0-based index into `visible_locales`). `<missing>` in red marks
-cells where the key is absent from that locale file. Bundle-level Header locale
-cells show `[locale]` in dark gray (navigable, but no stored value).
+`cursor_row` indexes into `view_rows`. All rows (group headers, bundle headers,
+and leaf rows) are navigable. `cursor_locale` is either `Some(name)` (locale
+column) or `None` (key column). `<missing>` in red marks cells where the key is
+absent from that locale file. Bundle-level header locale cells show `[locale]` in
+dark gray (navigable, but no stored value).
 
 The logical cursor in the key column is two-dimensional:
-`(cursor_row, CursorSection::Key { segment })`. `segment` (k) is a depth offset
+`(cursor_row, cursor_segment)`. `cursor_segment` (k) is a depth offset
 from the current row's full key toward the bundle root:
 
 - k=0 → anchor = full key (last/deepest segment highlighted — the default)
@@ -239,7 +244,7 @@ cursor to the anchor row in the table (the Header or Key whose key == anchor).
 At k=max there is no parent row to jump to (the anchor is the bundle itself).
 
 `→` (Right): when k>0, walk the anchor back toward leaf (decrements k). At k=0
-the right arrow moves `cursor_section` to `Locale(0)` (first available locale).
+the right arrow sets `cursor_locale` to the first available locale.
 
 `Ctrl+↑` / `Ctrl+↓` (SiblingUp / SiblingDown): navigate to the previous/next
 row at the **same absolute segment depth** as the current anchor, regardless of
@@ -251,7 +256,7 @@ the anchor highlights the correct depth level on the target row.
 `Ctrl+→` (GoToFirstChild): jump to the first row whose key starts with
 `{anchor}.`, and reset k=0.
 
-`↑` / `↓` (row movement): move one display row; reset k=0.
+`↑` / `↓` (row movement): move one row in `view_rows`; reset k=0.
 
 **Key-segment helpers (state.rs)**
 
@@ -262,7 +267,7 @@ for depth-based Ctrl+↑/↓ navigation (same absolute depth, reduces depth when
 `find_anchor_row()` → `Option<usize>` — row (≠ cursor_row) whose key == anchor.
 `find_first_child()` → `Option<usize>` — first row starting with `{anchor}.`.
 
-`apply_filter` resets `cursor_section` segment to 0. `sibling_nav` re-applies the
+`apply_filter` resets `cursor_segment` to 0. `sibling_nav` re-applies the
 computed k after calling `refresh_temp_pins` (which would otherwise reset it).
 
 **Filter system**
@@ -307,21 +312,19 @@ after every rebuild, so changing the filter never jumps the user to a different 
 
 See `docs/filtering.md` for the full syntax and AST.
 
-**PendingChange / write model**
+**Write model** *(current state — see D5 in docs/architectural_debt.md)*
 Edits are committed in-memory immediately and appended to `pending_writes`.
 Ctrl+S flushes them to disk. Failed writes are kept for retry. `[+]` in the
 status bar reflects `unsaved_changes`.
 
 ```rust
+// D5: being retired — workspace.save() will read the store's change_set() instead
 enum PendingChange {
     Update { path, first_line, last_line, key, value, full_key }, // rewrite existing entry
     Insert { path, after_line, key, value, full_key },            // append new entry
     Delete { path, first_line, last_line, full_key },             // remove entry
 }
 ```
-
-`full_key` is the bundle-qualified key name used to rebuild `dirty_keys` after a
-save: once all pending writes for a key flush successfully, the key leaves `dirty_keys`.
 
 `insert_into_file(state, gi, fi, real_key, value)` is the shared helper used
 by cell insert and cross-bundle move. It finds the insertion point, bumps
@@ -330,12 +333,13 @@ subsequent line numbers in-memory, and queues a `PendingChange::Insert`.
 When entries are deleted, line numbers of all subsequent entries in the same
 file are shifted down immediately so in-memory state stays consistent.
 
-**Dirty tracking**
+**Dirty tracking** *(current state — see D8 in docs/architectural_debt.md)*
 A key is dirty when it has unsaved changes in the current session. `dirty_keys`
-is a `HashSet<String>` of bundle-qualified key names; every mutation path
-(`ops::insert`, `ops::delete`, `ops::rename`) inserts the affected key immediately.
-On Ctrl+S, `dirty_keys` is rebuilt from the keys still referenced by `pending_writes`
-— keys whose writes flushed successfully are automatically removed.
+is a `HashSet<String>` (D8: being replaced by store `KeyMutation` tracking).
+Every mutation path (`ops::insert`, `ops::delete`, `ops::rename`) inserts the
+bundle-qualified key name immediately. On Ctrl+S, `dirty_keys` is rebuilt from
+the keys still referenced by `pending_writes` — keys whose writes flushed
+successfully are automatically removed.
 
 Dirty keys bypass the filter (always visible, like pinned keys) and are shown with
 a yellow key name and `#` prefix in the key column. Individual locale cells with a
@@ -364,7 +368,7 @@ all temp pins are cleared.
 
 **Deletion**
 - `d` on a locale cell: yanks the value then removes that one `(key, locale)` entry,
-  leaving the key in `merged_keys` (other locales still visible).
+  leaving the key in the store (other locales still visible).
 - `d` on the key column: enters `Mode::Deleting`. The pane shows the key
   (read-only). Tab cycles selection scope. Enter confirms; Esc cancels. Dangling
   (unsaved) keys are dropped without a file write.
@@ -580,6 +584,10 @@ careful — the writer must never corrupt a file.
 
 ## Further documentation
 
+- [docs/architecture.md](docs/architecture.md) — **layer rules, string boundary rule, mutation flow,
+  anti-patterns, refactoring checklist. Read this before touching ops, update, or domain.**
+- [docs/architectural_debt.md](docs/architectural_debt.md) — current violations, fix order, code fragments
+- [docs/store.md](docs/store.md) — Store internals, ID types, planned mutation model
 - [docs/filtering.md](docs/filtering.md) — filter syntax, AST, evaluation
 - [docs/dirty.md](docs/dirty.md) — dirty tracking design
 - [docs/pinned_keys.md](docs/pinned_keys.md) — pinning and temp-pins design

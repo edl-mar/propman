@@ -1,5 +1,12 @@
 # Refactoring: Hierarchical Render Model + Structured Cursor
 
+> **Archived design proposal.** This document describes the intent and plan for
+> the refactoring that was carried out on branch `refactor/hierarchical-model`.
+> The implementation diverged from some specifics: `DomainModel` was used instead
+> of `RenderModel`; the proposed `Cursor` struct was not introduced — instead the
+> cursor is three independent fields on `AppState` (`cursor_row`, `cursor_segment`,
+> `cursor_locale`). Treat this as historical context, not a description of current code.
+
 ## Motivation
 
 The current architecture stores the render model as a flat `Vec<DisplayRow>` in `AppState`

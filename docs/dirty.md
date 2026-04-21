@@ -10,7 +10,8 @@ those changes have not yet been flushed to disk.  "Anything" means:
 - the key was renamed (the new name is dirty; the old name is gone)
 
 Dirty is tracked at **key level**: one `HashSet<String>` keyed on the
-bundle-qualified key name.  The filter DSL already provides locale specificity
+bundle-qualified key name (D8 in `docs/architectural_debt.md`: being migrated
+to store `KeyMutation` tracking).  The filter DSL already provides locale specificity
 through its locale-selector section, so no (key, locale) pair structure is
 needed at the state level.  Per-cell dirty state (for rendering `#[de]` tags) is
 derived at render time from `pending_writes` + a path→locale map.
