@@ -64,9 +64,9 @@ impl Widget for PropertiesWidget<'_> {
             let is_in_scope = !is_cursor_row
                 && scope_pfx
                     .as_ref()
-                    .map_or(false, |p| row.identity.prefix.starts_with(p.as_str()));
+                    .map_or(false, |p| row.identity.prefix_str().starts_with(p.as_str()));
 
-            let is_bundle_hdr = !row.identity.is_leaf && row.identity.prefix == row.identity.bundle;
+            let is_bundle_hdr = row.identity.is_bundle_header();
 
             if is_bundle_hdr {
                 draw_bundle_header(row, is_cursor_row, cursor_locale, is_in_scope, buf, area, y);
@@ -113,7 +113,7 @@ fn draw_bundle_header(
     };
 
     let mut spans: Vec<Span> = vec![
-        Span::styled(row.identity.bundle.clone(), name_style),
+        Span::styled(row.identity.bundle_name().to_string(), name_style),
         Span::styled(":", default_tag),
     ];
     for cell in &row.locale_cells {
@@ -162,7 +162,7 @@ fn draw_group_header(
         Style::default().fg(Color::DarkGray)
     };
 
-    let base = usize::from(!row.identity.bundle.is_empty());
+    let base = usize::from(!row.identity.bundle_name().is_empty());
     let gi = row.indent.saturating_sub(base);
 
     let mut spans = group_indent_spans(gi, pad_style, dot_style);
@@ -219,7 +219,7 @@ fn draw_leaf(
         Style::default().add_modifier(Modifier::BOLD)
     };
 
-    let base = usize::from(!row.identity.bundle.is_empty());
+    let base = usize::from(!row.identity.bundle_name().is_empty());
     let gi = row.indent.saturating_sub(base);
 
     let mut spans = leaf_indent_spans(

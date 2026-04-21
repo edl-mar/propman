@@ -45,6 +45,7 @@ pub enum Message {
     FocusFilter,
     /// A raw key event forwarded to the filter TextArea (Filter mode).
     FilterInput(crossterm::event::KeyEvent),
+    #[allow(dead_code)] // implemented in update.rs; no keybinding assigned yet
     ClearFilter,
     // File ops
     SaveFile,

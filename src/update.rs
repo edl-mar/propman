@@ -1,10 +1,10 @@
 use crate::{
+    domain,
     editor::CellEdit,
     messages::Message,
     ops,
-    state::{AppState, Mode, PendingChange, SelectionScope},
-    workspace,
-    writer,
+    state::{AppState, Mode, SelectionScope},
+    store::KeyId,
 };
 
 /// Recompute `temp_pins` for the current cursor and call `apply_filter` at
@@ -22,8 +22,8 @@ use crate::{
 ///    call and leaves the cursor exactly where it is.
 fn refresh_temp_pins(state: &mut AppState) {
     if state.selection_scope != SelectionScope::ChildrenAll {
-        if !state.temp_pins.is_empty() {
-            state.temp_pins.clear();
+        if state.domain_model.has_temp_pins() {
+            state.domain_model.clear_temp_pins();
             state.apply_filter();
         }
         return;
@@ -50,41 +50,41 @@ fn refresh_temp_pins(state: &mut AppState) {
     };
 
     // Bundle headers don't have meaningful leaf-key children; skip.
-    if !anchor.identity.is_leaf && anchor.identity.prefix == anchor.identity.bundle {
-        if !state.temp_pins.is_empty() {
-            state.temp_pins.clear();
+    if anchor.identity.is_bundle_header() {
+        if state.domain_model.has_temp_pins() {
+            state.domain_model.clear_temp_pins();
             state.apply_filter();
         }
         return;
     }
 
-    // Anchor key: full_key for leaf rows, prefix for group-header rows.
-    let anchor_key = anchor.identity.full_key.as_deref()
-        .unwrap_or(anchor.identity.prefix.as_str())
-        .to_string();
+    // Anchor key: key string for leaf rows, prefix for group-header rows.
+    let anchor_key = anchor.identity.key_id
+        .map(|k| state.domain_model.key_qualified_str(k))
+        .unwrap_or_else(|| anchor.identity.prefix_str().to_string());
     let dot_key = format!("{anchor_key}.");
 
     // ── Step 2: compute desired temp_pins ────────────────────────────────────
-    // Naturally-visible keys = full_keys of non-temp-pinned rows in view_rows.
-    // This is what the filter, dirty-bypass, and pin-bypass already surface.
-    let naturally_visible: std::collections::HashSet<&str> = state.view_rows.iter()
+    // Naturally-visible keys = KeyIds of non-temp-pinned rows already in view.
+    let naturally_visible: std::collections::HashSet<KeyId> = state.view_rows.iter()
         .filter(|r| !r.identity.is_temp_pinned)
-        .filter_map(|r| r.identity.full_key.as_deref())
+        .filter_map(|r| r.identity.key_id)
         .collect();
 
-    let new_pins: Vec<String> = state.workspace.merged_keys.iter()
-        .filter(|k| {
-            (*k == &anchor_key || k.starts_with(&dot_key))
-                && !naturally_visible.contains(k.as_str())
+    let all_ids: Vec<KeyId> = state.domain_model.all_key_ids().collect();
+    let new_pins: Vec<KeyId> = all_ids.iter()
+        .filter(|&&k| {
+            let qk = state.domain_model.key_qualified_str(k);
+            (qk == anchor_key || qk.starts_with(&dot_key)) && !naturally_visible.contains(&k)
         })
-        .cloned()
+        .copied()
         .collect();
 
     // ── Step 3: rebuild only if the set changed ───────────────────────────────
-    if new_pins == state.temp_pins {
+    if state.domain_model.temp_pins_match(&new_pins) {
         return;
     }
-    state.temp_pins = new_pins;
+    state.domain_model.set_temp_pins(new_pins);
     state.apply_filter();
 }
 
@@ -176,7 +176,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             if state.cursor_locale.is_none() {
                 // Key column.
                 let is_bundle_header = state.view_rows.get(state.cursor_row)
-                    .map_or(false, |r| !r.identity.is_leaf && r.identity.prefix == r.identity.bundle);
+                    .map_or(false, |r| r.identity.is_bundle_header());
                 // Block rename of bundle-level header rows.
                 if is_bundle_header {
                     return state;
@@ -187,7 +187,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 };
                 // Group header rows have no exact key — force Children scope.
                 let is_group_header = state.view_rows.get(state.cursor_row)
-                    .map_or(false, |r| !r.identity.is_leaf && r.identity.prefix != r.identity.bundle);
+                    .map_or(false, |r| !r.identity.is_leaf && !r.identity.is_bundle_header());
                 if is_group_header {
                     state.selection_scope = SelectionScope::Children;
                 }
@@ -197,7 +197,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             } else {
                 // Locale column: block value editing on bundle-level headers.
                 let is_bundle_header = state.view_rows.get(state.cursor_row)
-                    .map_or(false, |r| !r.identity.is_leaf && r.identity.prefix == r.identity.bundle);
+                    .map_or(false, |r| r.identity.is_bundle_header());
                 if is_bundle_header {
                     return state;
                 }
@@ -210,7 +210,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             if state.cursor_locale.is_none() {
                 // Key column.
                 let is_bundle_header = state.view_rows.get(state.cursor_row)
-                    .map_or(false, |r| !r.identity.is_leaf && r.identity.prefix == r.identity.bundle);
+                    .map_or(false, |r| r.identity.is_bundle_header());
                 // Block bundle-level headers.
                 if is_bundle_header {
                     return state;
@@ -221,7 +221,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 };
                 // Group header rows have no exact key — force Children scope.
                 let is_group_header = state.view_rows.get(state.cursor_row)
-                    .map_or(false, |r| !r.identity.is_leaf && r.identity.prefix != r.identity.bundle);
+                    .map_or(false, |r| !r.identity.is_leaf && !r.identity.is_bundle_header());
                 if is_group_header {
                     state.selection_scope = SelectionScope::Children;
                 }
@@ -230,14 +230,15 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 refresh_temp_pins(&mut state);
             } else {
                 // Locale cell: yank then immediately delete (vim-style).
-                if let (Some(full_key), Some(locale_idx)) = (
-                    state.view_rows.get(state.cursor_row).and_then(|r| r.identity.full_key.clone()),
+                if let (Some(key_id), Some(locale_idx)) = (
+                    state.view_rows.get(state.cursor_row).and_then(|r| r.identity.key_id),
                     state.effective_locale_idx(),
                 ) {
                     if let Some(locale) = state.visible_locales.get(locale_idx).cloned() {
                         if state.current_cell_value().is_some() {
                             state.yank_cell();
-                            ops::delete::delete_locale_entry(&mut state, &full_key, &locale);
+                            let msg = ops::delete::delete_locale_entry(&mut state.domain_model, key_id, &locale);
+                            state.status_message = Some(msg);
                             state.apply_filter();
                         }
                     }
@@ -248,43 +249,49 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             state.show_preview = !state.show_preview;
         }
         (Mode::Normal, Message::TogglePin) => {
-            let key = match state.view_rows.get(state.cursor_row).and_then(|r| r.identity.full_key.clone()) {
+            let key_id = match state.view_rows.get(state.cursor_row)
+                .and_then(|r| r.identity.key_id)
+            {
                 Some(k) => k,
-                None => {
-                    // Bundle header — pin by bundle name (not a key operation).
-                    return state;
-                }
+                None => { return state; } // bundle header — no key to pin
             };
-
-            let pin = !state.pinned_keys.contains(&key);
+            let key = state.domain_model.key_qualified_str(key_id);
+            let pin = !state.domain_model.is_pinned(key_id);
             let dot_prefix = format!("{key}.");
-            let affected: Vec<String> = match state.selection_scope {
-                SelectionScope::Exact => vec![key],
-                SelectionScope::Children => {
-                    let mut keys = vec![key.clone()];
-                    keys.extend(state.visible_full_keys().into_iter().filter(|k| k.starts_with(&dot_prefix)));
-                    keys
-                }
-                SelectionScope::ChildrenAll => {
-                    let mut keys = vec![key.clone()];
-                    keys.extend(
-                        state.workspace.merged_keys.iter()
-                            .filter(|k| k.starts_with(&dot_prefix))
-                            .cloned()
-                    );
-                    keys
+
+            let affected: Vec<KeyId> = {
+                let dm = &state.domain_model;
+                match state.selection_scope {
+                    SelectionScope::Exact => vec![key_id],
+                    SelectionScope::Children => {
+                        let mut kids = vec![key_id];
+                        kids.extend(
+                            state.view_rows.iter()
+                                .filter_map(|r| r.identity.key_id)
+                                .filter(|&k| dm.key_qualified_str(k).starts_with(&dot_prefix))
+                        );
+                        kids
+                    }
+                    SelectionScope::ChildrenAll => {
+                        let all: Vec<KeyId> = dm.all_key_ids().collect();
+                        let mut kids = vec![key_id];
+                        kids.extend(
+                            all.iter().copied()
+                                .filter(|&k| dm.key_qualified_str(k).starts_with(&dot_prefix))
+                        );
+                        kids
+                    }
                 }
             };
 
             let count = affected.len();
-            let label = affected.first().cloned().unwrap_or_default();
             for k in affected {
-                if pin { state.pinned_keys.insert(k); } else { state.pinned_keys.remove(&k); }
+                if pin { state.domain_model.pin_key(k); } else { state.domain_model.unpin_key(k); }
             }
 
             let action = if pin { "Pinned" } else { "Unpinned" };
             state.status_message = Some(if count == 1 {
-                format!("{action} {label}")
+                format!("{action} {key}")
             } else {
                 format!("{action} {count} keys")
             });
@@ -397,11 +404,12 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 Some(value) => {
                     if state.cursor_locale.is_none() {
                         state.status_message = Some("Select a locale cell to quick-paste".to_string());
-                    } else if state.current_cell_value().is_some() {
-                        ops::insert::commit_cell_edit(&mut state, value);
-                        state.apply_filter();
-                    } else {
-                        ops::insert::commit_cell_insert(&mut state, value);
+                    } else if let Some((key_id, locale)) = cursor_key_locale(&state) {
+                        if state.current_cell_value().is_some() {
+                            ops::insert::commit_cell_edit(&mut state.domain_model, key_id, locale, value);
+                        } else if let Err(msg) = ops::insert::commit_cell_insert(&mut state.domain_model, key_id, locale, value) {
+                            state.status_message = Some(msg);
+                        }
                         state.apply_filter();
                     }
                 }
@@ -417,11 +425,11 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 Some(value) => {
                     if state.cursor_locale.is_none() {
                         state.status_message = Some("Select a locale cell to paste".to_string());
-                    } else {
+                    } else if let Some((key_id, locale)) = cursor_key_locale(&state) {
                         if state.current_cell_value().is_some() {
-                            ops::insert::commit_cell_edit(&mut state, value);
-                        } else {
-                            ops::insert::commit_cell_insert(&mut state, value);
+                            ops::insert::commit_cell_edit(&mut state.domain_model, key_id, locale, value);
+                        } else if let Err(msg) = ops::insert::commit_cell_insert(&mut state.domain_model, key_id, locale, value) {
+                            state.status_message = Some(msg);
                         }
                         state.apply_filter();
                         state.mode = Mode::Normal;
@@ -438,11 +446,11 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 Some(value) => {
                     if state.cursor_locale.is_none() {
                         state.status_message = Some("Select a locale cell to paste".to_string());
-                    } else {
+                    } else if let Some((key_id, locale)) = cursor_key_locale(&state) {
                         if state.current_cell_value().is_some() {
-                            ops::insert::commit_cell_edit(&mut state, value);
-                        } else {
-                            ops::insert::commit_cell_insert(&mut state, value);
+                            ops::insert::commit_cell_edit(&mut state.domain_model, key_id, locale, value);
+                        } else if let Err(msg) = ops::insert::commit_cell_insert(&mut state.domain_model, key_id, locale, value) {
+                            state.status_message = Some(msg);
                         }
                         state.apply_filter();
                     }
@@ -489,18 +497,19 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
         (Mode::Pasting, Message::CommitPasteStay) |
         (Mode::Pasting, Message::CommitPaste) => {
             // Paste all locales' selected history entries into the cursor row's key.
-            let full_key = match state.view_rows.get(state.cursor_row).and_then(|r| r.identity.full_key.clone()) {
+            let paste_key_id = match state.view_rows.get(state.cursor_row).and_then(|r| r.identity.key_id) {
                 Some(k) => k,
                 None => {
                     state.status_message = Some("Select a key row to paste".to_string());
                     return state;
                 }
             };
+            let full_key = state.domain_model.key_qualified_str(paste_key_id);
             let to_paste: Vec<(String, String)> = {
                 let locale_keys = state.paste_locales();
-                let (bundle, _) = workspace::split_key(&full_key);
+                let (bundle, _) = domain::split_key(&full_key);
                 locale_keys.iter()
-                    .filter(|locale| state.workspace.bundle_has_locale(bundle, locale))
+                    .filter(|locale| state.domain_model.bundle_has_locale(bundle, locale))
                     .filter_map(|locale| {
                         let pos = *state.paste.history_pos.get(locale).unwrap_or(&0);
                         state.paste.history.get(locale).and_then(|h| h.get(pos)).cloned()
@@ -510,7 +519,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             };
             let count = to_paste.len();
             for (locale, value) in to_paste {
-                ops::insert::apply_cell_value(&mut state, &full_key, &locale, value);
+                ops::common::apply_cell_value(&mut state.domain_model, paste_key_id, &locale, value);
             }
             state.status_message = Some(format!("Pasted {count} locale(s) into {full_key}"));
             state.apply_filter();
@@ -529,20 +538,26 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             }
         }
         (Mode::Editing, Message::CommitEdit) | (Mode::Editing, Message::StartEdit) => {
+            // Extract cursor before taking edit_buffer (both borrow state).
+            let cursor = cursor_key_locale(&state);
             if let Some(edit) = state.edit_buffer.take() {
                 if edit.is_modified() {
                     let new_value = edit.current_value();
-                    // Dispatch: insert if the key is absent from the locale file,
-                    // update if it already exists there.
-                    if state.current_cell_value().is_none() {
-                        ops::insert::commit_cell_insert(&mut state, new_value);
-                    } else {
-                        ops::insert::commit_cell_edit(&mut state, new_value);
+                    if let Some((key_id, locale)) = cursor {
+                        // Dispatch: insert if the key is absent from the locale file,
+                        // update if it already exists there.
+                        if state.current_cell_value().is_none() {
+                            if let Err(msg) = ops::insert::commit_cell_insert(&mut state.domain_model, key_id, locale, new_value) {
+                                state.status_message = Some(msg);
+                            }
+                        } else {
+                            ops::insert::commit_cell_edit(&mut state.domain_model, key_id, locale, new_value);
+                        }
+                        // Rebuild display: dangling status may have changed (key is no
+                        // longer dangling after its first translation), and locale-status
+                        // filters (e.g. `:de?`, `*`) should re-evaluate immediately.
+                        state.apply_filter();
                     }
-                    // Rebuild display: dangling status may have changed (key is no
-                    // longer dangling after its first translation), and locale-status
-                    // filters (e.g. `:de?`, `*`) should re-evaluate immediately.
-                    state.apply_filter();
                 }
             }
             state.mode = Mode::Normal;
@@ -599,49 +614,17 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 return state;
             }
 
-            // Reject if a bundle with this name already exists.
-            if state.workspace.groups.iter().any(|g| g.base_name == bundle_name) {
+            if state.workspace.has_bundle(&bundle_name) {
                 state.status_message = Some(format!("Bundle '{bundle_name}' already exists"));
                 return state;
             }
 
-            // Determine directory and first locale from existing bundles.
-            let (dir, first_locale) = {
-                let existing = state.workspace.groups.iter()
-                    .find(|g| !g.base_name.is_empty() && !g.files.is_empty());
-                let dir = existing
-                    .and_then(|g| g.files.first())
-                    .and_then(|f| f.path.parent())
-                    .map(|p| p.to_path_buf());
-                let locale = existing
-                    .and_then(|g| g.files.first())
-                    .map(|f| f.locale.clone())
-                    .unwrap_or_else(|| "default".to_string());
-                (dir, locale)
+            let (filename, first_locale) = match state.workspace.create_bundle(&bundle_name) {
+                Ok(pair) => pair,
+                Err(msg) => { state.status_message = Some(msg); return state; }
             };
 
-            let dir = match dir {
-                Some(d) => d,
-                None => std::env::current_dir().unwrap_or_default(),
-            };
-
-            let filename = format!("{}_{}.properties", bundle_name, first_locale);
-            let new_path = dir.join(&filename);
-
-            if let Err(e) = std::fs::File::create(&new_path) {
-                state.status_message = Some(format!("Failed to create file: {e}"));
-                return state;
-            }
-
-            // Register the new group in the workspace.
-            state.workspace.groups.push(crate::workspace::FileGroup {
-                base_name: bundle_name.clone(),
-                files: vec![crate::workspace::PropertiesFile {
-                    path: new_path,
-                    locale: first_locale.clone(),
-                    entries: Vec::new(),
-                }],
-            });
+            state.domain_model.register_locale(&bundle_name, &first_locale);
 
             state.edit_buffer = None;
             state.mode = Mode::Normal;
@@ -649,7 +632,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
             // Navigate to the new bundle header.
             if let Some(idx) = state.view_rows.iter().position(|r| {
-                !r.identity.is_leaf && r.identity.bundle == bundle_name && r.identity.prefix == bundle_name
+                r.identity.is_bundle_header() && r.identity.bundle_name() == bundle_name
             }) {
                 state.cursor_row = idx;
             }
@@ -684,9 +667,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             // Bundle-level header, key column: open locale-naming to add a new locale file.
             let row = state.view_rows.get(state.cursor_row);
             let id = row.map(|r| &r.identity);
-            let bundle_str = id.map_or("", |id| id.bundle.as_str()).to_string();
-            let is_bundle_hdr = id.map_or(false, |id| !id.is_leaf && id.prefix == id.bundle);
-            let is_group_hdr  = id.map_or(false, |id| !id.is_leaf && id.prefix != id.bundle);
+            let bundle_str = id.map_or_else(String::new, |id| id.bundle_name().to_string());
+            let is_bundle_hdr = id.map_or(false, |id| id.is_bundle_header());
+            let is_group_hdr  = id.map_or(false, |id| !id.is_leaf && !id.is_bundle_header());
 
             if is_bundle_hdr && locale.is_none() {
                 state.edit_buffer = Some(CellEdit::new(String::new()));
@@ -699,9 +682,10 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 format!("{bundle_str}:{locale_str}:")
             } else {
                 let key_str = id.map(|id| {
-                    id.full_key.as_deref().unwrap_or(&id.prefix).to_string()
+                    id.key_id.map(|k| state.domain_model.key_qualified_str(k))
+                        .unwrap_or_else(|| id.prefix_str().to_string())
                 }).unwrap_or_default();
-                let (_, real_key) = workspace::split_key(&key_str);
+                let (_, real_key) = domain::split_key(&key_str);
                 let key_prefix = if is_group_hdr {
                     format!("{real_key}.")
                 } else {
@@ -756,9 +740,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             // Valid key: non-empty, not already known, and either:
             //   - contains a '.' (bare key: "app.title")
             //   - is bundle-qualified with a non-empty real key ("messages:app")
-            let (_, real_part) = workspace::split_key(&new_key);
+            let (_, real_part) = domain::split_key(&new_key);
             let is_valid = !new_key.is_empty()
-                && !state.workspace.merged_keys.contains(&new_key)
+                && state.domain_model.find_key(&new_key).is_none()
                 && (new_key.contains('.') || (!real_part.is_empty() && new_key.contains(':')));
 
             if is_valid {
@@ -766,8 +750,8 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
                 // If a locale was specified, ensure the locale file exists in this bundle.
                 if let Some(ref locale) = target_locale {
-                    let (bundle, _) = workspace::split_key(&new_key);
-                    if !bundle.is_empty() && !state.workspace.bundle_has_locale(bundle, locale) {
+                    let (bundle, _) = domain::split_key(&new_key);
+                    if !bundle.is_empty() && !state.domain_model.bundle_has_locale(bundle, locale) {
                         let bundle = bundle.to_string();
                         if let Err(msg) = ensure_locale_file(&mut state, &bundle, locale) {
                             state.status_message = Some(msg);
@@ -777,23 +761,26 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     }
                 }
 
-                // Register in the workspace and rebuild the display.
-                state.workspace.merged_keys.push(new_key.clone());
-                state.workspace.merged_keys.sort();
+                // Insert into the store so the new key appears immediately in
+                // visible_rows() (it may not have a translation yet — that's fine).
+                let new_key_id = {
+                    let (bundle, real_key) = domain::split_key(&new_key);
+                    state.domain_model.insert_key(bundle, real_key)
+                };
 
-                // If the immediate parent is a dangling placeholder (in merged_keys
-                // but no file entry), it is now a pure namespace — drop it.
-                let (bundle, real) = workspace::split_key(&new_key);
+                // If the immediate parent is a dangling placeholder (in the store
+                // but with no translations), it is now a pure namespace — remove it.
+                let (bundle, real) = domain::split_key(&new_key);
                 if let Some(dot) = real.rfind('.') {
                     let parent_key = if bundle.is_empty() {
                         real[..dot].to_string()
                     } else {
                         format!("{bundle}:{}", &real[..dot])
                     };
-                    if state.workspace.merged_keys.contains(&parent_key)
-                        && state.workspace.is_dangling(&parent_key)
-                    {
-                        state.workspace.merged_keys.retain(|k| k != &parent_key);
+                    if let Some(parent_kid) = state.domain_model.find_key(&parent_key) {
+                        if state.domain_model.is_dangling(parent_kid) {
+                            state.domain_model.delete_key(parent_kid);
+                        }
                     }
                 }
 
@@ -801,7 +788,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
                 // Navigate to the new key.
                 if let Some(idx) = state.view_rows.iter().position(|r| {
-                    r.identity.full_key.as_deref() == Some(new_key.as_str())
+                    r.identity.key_id
+                        .map(|k| state.domain_model.key_qualified_str(k))
+                        .as_deref() == Some(new_key.as_str())
                 }) {
                     state.cursor_row = idx;
                 }
@@ -814,7 +803,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                     // Inline value supplied: write it directly into the target locale.
                     // `target_locale` is always Some when inline_value is Some (3-segment).
                     if let Some(ref locale) = target_locale {
-                        ops::insert::apply_cell_value(&mut state, &new_key, locale, value);
+                        ops::common::apply_cell_value(&mut state.domain_model, new_key_id, locale, value);
                         state.apply_filter();
                     }
                     state.mode = Mode::Normal;
@@ -851,11 +840,9 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
             // Cursor must still be on the bundle header.
             let bundle = match state.view_rows.get(state.cursor_row) {
-                Some(r) if !r.identity.is_leaf
-                    && r.identity.prefix == r.identity.bundle
-                    && !r.identity.bundle.is_empty() =>
+                Some(r) if r.identity.is_bundle_header() =>
                 {
-                    r.identity.bundle.clone()
+                    r.identity.bundle_name().to_string()
                 }
                 _ => {
                     state.status_message = Some("No bundle selected".to_string());
@@ -863,67 +850,24 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 }
             };
 
-            // Reject if the locale already exists in this bundle.
-            let already_exists = state.workspace.groups.iter()
-                .any(|g| g.base_name == bundle
-                    && g.files.iter().any(|f| f.locale == locale_name));
-            if already_exists {
+            if state.workspace.has_locale(&bundle, &locale_name) {
                 state.status_message = Some(
                     format!("[{locale_name}] already exists in bundle '{bundle}'")
                 );
                 return state;
             }
 
-            // Derive the target directory from the bundle's first existing file.
-            let dir = state.workspace.groups.iter()
-                .find(|g| g.base_name == bundle)
-                .and_then(|g| g.files.first())
-                .and_then(|f| f.path.parent())
-                .map(|p| p.to_path_buf());
-
-            let dir = match dir {
-                Some(d) => d,
-                None => {
-                    state.status_message = Some(
-                        format!("Cannot find directory for bundle '{bundle}'")
-                    );
-                    return state;
-                }
+            let filename = match state.workspace.create_locale(&bundle, &locale_name) {
+                Ok(f)   => f,
+                Err(msg) => { state.status_message = Some(msg); return state; }
             };
 
-            let filename = format!("{}_{}.properties", bundle, locale_name);
-            let new_path = dir.join(&filename);
-
-            if let Err(e) = std::fs::File::create(&new_path) {
-                state.status_message = Some(format!("Failed to create file: {e}"));
-                return state;
-            }
-
-            // Register the new file in the workspace.
-            if let Some(group) = state.workspace.groups.iter_mut()
-                .find(|g| g.base_name == bundle)
-            {
-                group.files.push(crate::workspace::PropertiesFile {
-                    path: new_path,
-                    locale: locale_name.clone(),
-                    entries: Vec::new(),
-                });
-                // Keep files sorted: "default" first, then alphabetically.
-                group.files.sort_by(|a, b| {
-                    match (a.locale.as_str(), b.locale.as_str()) {
-                        ("default", _) => std::cmp::Ordering::Less,
-                        (_, "default") => std::cmp::Ordering::Greater,
-                        (a, b)        => a.cmp(b),
-                    }
-                });
-            }
+            state.domain_model.register_locale(&bundle, &locale_name);
 
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
-            state.status_message = Some(
-                format!("Created {filename}")
-            );
+            state.status_message = Some(format!("Created {filename}"));
         }
         (Mode::LocaleNaming, Message::CancelEdit) => {
             state.edit_buffer = None;
@@ -961,28 +905,29 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
                 state.status_message = Some("Key must contain at least one '.'".to_string());
                 // Stay in KeyRenaming so the user can fix it.
             } else if new_key != old_key {
-                match state.selection_scope {
+                let visible = state.visible_key_ids();
+                state.domain_model.clear_temp_pins();
+                let result = match state.selection_scope {
                     SelectionScope::Children => {
-                        // Only filter-visible children; hidden ones ignored.
-                        // Clear temp_pins before the op so they don't stay visible.
-                        state.temp_pins.clear();
-                        ops::rename::commit_prefix_rename(&mut state, &old_key, new_key, false);
+                        let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                        ops::rename::commit_prefix_rename(&mut state.domain_model, anchor, new_key, false, &visible)
                     }
                     SelectionScope::ChildrenAll => {
-                        // All children including hidden (temp-pinned).
-                        // Dirty tracking is automatic (rename_key_in_workspace marks new keys dirty).
-                        // Use `#` in the filter to review changed entries after the op.
-                        state.temp_pins.clear();
-                        ops::rename::commit_prefix_rename(&mut state, &old_key, new_key, true);
+                        let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                        ops::rename::commit_prefix_rename(&mut state.domain_model, anchor, new_key, true, &visible)
                     }
                     SelectionScope::Exact => {
-                        state.temp_pins.clear();
-                        ops::rename::commit_exact_rename(&mut state, &old_key, new_key);
+                        let key_id = state.cursor_key_id_for_ops().expect("Exact scope on leaf");
+                        ops::rename::commit_exact_rename(&mut state.domain_model, key_id, new_key)
                     }
+                };
+                match result {
+                    Ok(msg)  => { state.status_message = msg; state.edit_buffer = None; state.mode = Mode::Normal; state.apply_filter(); }
+                    Err(msg) => { state.status_message = Some(msg); }
                 }
             } else {
                 // No change — just close.
-                state.temp_pins.clear();
+                state.domain_model.clear_temp_pins();
                 state.edit_buffer = None;
                 state.mode = Mode::Normal;
                 state.apply_filter();
@@ -1003,24 +948,30 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             } else if new_key == old_key {
                 state.status_message = Some("Copy destination is the same as source".to_string());
             } else {
-                match state.selection_scope {
+                let visible = state.visible_key_ids();
+                state.domain_model.clear_temp_pins();
+                let result = match state.selection_scope {
                     SelectionScope::Exact => {
-                        state.temp_pins.clear();
-                        ops::rename::commit_exact_copy(&mut state, &old_key, new_key);
+                        let key_id = state.cursor_key_id_for_ops().expect("Exact scope on leaf");
+                        ops::rename::commit_exact_copy(&mut state.domain_model, key_id, new_key)
                     }
                     SelectionScope::Children => {
-                        state.temp_pins.clear();
-                        ops::rename::commit_prefix_copy(&mut state, &old_key, new_key, false);
+                        let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                        ops::rename::commit_prefix_copy(&mut state.domain_model, anchor, new_key, false, &visible)
                     }
                     SelectionScope::ChildrenAll => {
-                        state.temp_pins.clear();
-                        ops::rename::commit_prefix_copy(&mut state, &old_key, new_key, true);
+                        let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                        ops::rename::commit_prefix_copy(&mut state.domain_model, anchor, new_key, true, &visible)
                     }
+                };
+                match result {
+                    Ok(msg)  => { state.status_message = msg; state.edit_buffer = None; state.mode = Mode::Normal; state.apply_filter(); }
+                    Err(msg) => { state.status_message = Some(msg); }
                 }
             }
         }
         (Mode::KeyRenaming, Message::CancelEdit) => {
-            state.temp_pins.clear();
+            state.domain_model.clear_temp_pins();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
@@ -1033,23 +984,29 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
         // ── Deleting mode ────────────────────────────────────────────────────
         (Mode::Deleting, Message::CommitDelete) => {
-            let key = state.edit_buffer.as_ref()
-                .map(|e| e.current_value())
-                .unwrap_or_default();
-
-            state.temp_pins.clear(); // Discard temp pins before the op.
-            match state.selection_scope {
-                SelectionScope::Children   => ops::delete::delete_key_prefix(&mut state, &key, false),
-                SelectionScope::ChildrenAll => ops::delete::delete_key_prefix(&mut state, &key, true),
-                SelectionScope::Exact      => ops::delete::delete_key(&mut state, &key),
-            }
-
+            state.domain_model.clear_temp_pins();
+            let visible = state.visible_key_ids();
+            let msg = match state.selection_scope {
+                SelectionScope::Children => {
+                    let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                    ops::delete::delete_key_prefix(&mut state.domain_model, anchor, false, &visible)
+                }
+                SelectionScope::ChildrenAll => {
+                    let anchor = state.cursor_node_id_for_ops().expect("non-bundle row");
+                    ops::delete::delete_key_prefix(&mut state.domain_model, anchor, true, &visible)
+                }
+                SelectionScope::Exact => {
+                    let key_id = state.cursor_key_id_for_ops().expect("Exact scope on leaf");
+                    ops::delete::delete_key(&mut state.domain_model, key_id)
+                }
+            };
+            state.status_message = Some(msg);
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
         }
         (Mode::Deleting, Message::CancelEdit) => {
-            state.temp_pins.clear();
+            state.domain_model.clear_temp_pins();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
@@ -1060,7 +1017,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             Mode::Editing | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting,
             Message::MoveCursorUp,
         ) => {
-            state.temp_pins.clear();
+            state.domain_model.clear_temp_pins();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
@@ -1070,7 +1027,7 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
             Mode::Editing | Mode::KeyNaming | Mode::KeyRenaming | Mode::Deleting,
             Message::MoveCursorDown,
         ) => {
-            state.temp_pins.clear();
+            state.domain_model.clear_temp_pins();
             state.edit_buffer = None;
             state.mode = Mode::Normal;
             state.apply_filter();
@@ -1110,32 +1067,8 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
         // ── Universal ────────────────────────────────────────────────────────
         (_, Message::SaveFile) => {
-            // Flush pending writes. Any that fail are put back so the user can retry.
-            // NOTE: this is the one place in update() that performs I/O.
-            let changes = std::mem::take(&mut state.pending_writes);
-            for change in changes {
-                let result = match &change {
-                    PendingChange::Update { path, first_line, last_line, key, value, .. } =>
-                        writer::write_change(path, *first_line, *last_line, key, value),
-                    PendingChange::Insert { path, after_line, key, value, .. } =>
-                        writer::write_insert(path, *after_line, key, value),
-                    PendingChange::Delete { path, first_line, last_line, .. } =>
-                        writer::write_delete(path, *first_line, *last_line),
-                };
-                if result.is_err() {
-                    state.pending_writes.push(change);
-                }
-            }
-            state.unsaved_changes = !state.pending_writes.is_empty();
-            // Rebuild dirty_keys to reflect only writes that are still pending.
-            state.dirty_keys = state.pending_writes.iter()
-                .map(|c| match c {
-                    PendingChange::Update { full_key, .. } => full_key,
-                    PendingChange::Insert { full_key, .. } => full_key,
-                    PendingChange::Delete { full_key, .. } => full_key,
-                })
-                .cloned()
-                .collect();
+            state.workspace.save(&mut state.domain_model);
+            state.apply_filter();
         }
         (_, Message::Quit) => {
             state.quitting = true;
@@ -1149,50 +1082,26 @@ pub fn update(mut state: AppState, msg: Message) -> AppState {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Extract the cursor `KeyId` and locale string from the current navigation state.
+/// Returns `None` when the cursor is on a header row or the locale column is not selected.
+/// Call this in `update.rs` before invoking insert ops (D7).
+fn cursor_key_locale(state: &AppState) -> Option<(KeyId, String)> {
+    let key_id = state.view_rows.get(state.cursor_row)?.identity.key_id?;
+    let locale = state.effective_locale_idx()
+        .and_then(|i| state.visible_locales.get(i))?
+        .to_string();
+    Some((key_id, locale))
+}
+
 /// Ensures the locale file for `bundle`+`locale` exists, creating it if not.
 /// Returns `Ok(filename)` on success (created or already present), `Err(msg)` on failure.
 /// Does nothing and returns `Ok("")` if the locale already exists.
 fn ensure_locale_file(state: &mut AppState, bundle: &str, locale: &str) -> Result<String, String> {
-    if state.workspace.bundle_has_locale(bundle, locale) {
-        return Ok(String::new()); // Already exists — nothing to do.
+    if state.domain_model.bundle_has_locale(bundle, locale) {
+        return Ok(String::new());
     }
-
-    let dir = state.workspace.groups.iter()
-        .find(|g| g.base_name == bundle)
-        .and_then(|g| g.files.first())
-        .and_then(|f| f.path.parent())
-        .map(|p| p.to_path_buf());
-
-    let dir = match dir {
-        Some(d) => d,
-        None => return Err(format!("Cannot find directory for bundle '{bundle}'")),
-    };
-
-    // "default" maps to `bundle.properties` (no underscore suffix).
-    let filename = if locale == "default" {
-        format!("{bundle}.properties")
-    } else {
-        format!("{bundle}_{locale}.properties")
-    };
-    let new_path = dir.join(&filename);
-
-    if let Err(e) = std::fs::File::create(&new_path) {
-        return Err(format!("Failed to create file: {e}"));
-    }
-
-    if let Some(group) = state.workspace.groups.iter_mut().find(|g| g.base_name == bundle) {
-        group.files.push(crate::workspace::PropertiesFile {
-            path: new_path,
-            locale: locale.to_string(),
-            entries: Vec::new(),
-        });
-        group.files.sort_by(|a, b| match (a.locale.as_str(), b.locale.as_str()) {
-            ("default", _) => std::cmp::Ordering::Less,
-            (_, "default") => std::cmp::Ordering::Greater,
-            (a, b)         => a.cmp(b),
-        });
-    }
-
+    let filename = state.workspace.create_locale(bundle, locale)?;
+    state.domain_model.register_locale(bundle, locale);
     Ok(filename)
 }
 

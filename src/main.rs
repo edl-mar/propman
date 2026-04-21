@@ -1,4 +1,4 @@
-mod app_model;
+mod domain;
 mod view_model;
 mod editor;
 mod filter;
@@ -6,9 +6,8 @@ mod keybindings;
 mod messages;
 mod ops;
 mod parser;
-mod radix_tree_arena;
-mod search;
 mod state;
+mod store;
 mod tui;
 mod update;
 mod widgets;

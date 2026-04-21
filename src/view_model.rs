@@ -1,7 +1,9 @@
 use crate::{
-    app_model::{common_prefix_len, qualify, DomainModel, Entry},
+    domain::{DomainModel, RowDescriptor},
     filter::ColumnDirective,
+    store::{BundleId, KeyId, NodeId},
 };
+
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -9,8 +11,8 @@ use crate::{
 ///
 /// The flat `Vec<ViewRow>` in `AppState` is the single source of truth for
 /// both navigation (`cursor_row` indexes into it) and rendering (the renderer
-/// paints a window of it).  Built by `build_view_rows` from the `DomainModel`;
-/// rebuilt whenever the filter or workspace changes.
+/// paints a window of it).  Built by `enrich_rows` from `DomainModel`
+/// descriptors; rebuilt whenever the filter or workspace changes.
 #[derive(Debug)]
 pub struct ViewRow {
     /// Visual indentation level; drives `"  ".repeat(indent)` in the renderer.
@@ -51,123 +53,139 @@ pub enum CellContent {
 
 #[derive(Debug)]
 pub struct RowIdentity {
-    pub bundle: String,
-    /// Bundle-qualified full key (`"bundle:a.b.c"`), or `None` for header rows.
-    pub full_key: Option<String>,
-    /// Bundle-qualified prefix this row represents.
-    ///
-    /// - Bundle header: just the bundle name (`"messages"`).
-    /// - Group header:  `"messages:app.confirm"`.
-    /// - Leaf:          same as `full_key`.
-    ///
-    /// Used by Left navigation (find ancestor row) and scope highlighting
-    /// (descendant rows share this prefix).
-    pub prefix:         String,
-    pub is_leaf:        bool,
-    pub is_pinned:      bool,
-    pub is_temp_pinned: bool,
-    pub is_dangling:    bool,
-    pub is_dirty:       bool,
+    /// The store's `KeyId` for the key on this row, or `None` for header rows.
+    pub key_id:          Option<KeyId>,
+    /// The bundle this row belongs to.  Stable across filter rebuilds.
+    pub bundle_id:       BundleId,
+    /// The trie `NodeId` this row represents.
+    /// - Bundle header → virtual bundle-root node.
+    /// - Group header  → deepest node of the chain-collapsed partition group.
+    /// - Leaf          → `key_node` of the key.
+    /// Used by navigation (equality, ancestry, depth) instead of `Key` strings.
+    pub node_id:         NodeId,
+    pub is_leaf:         bool,
+    pub is_pinned:       bool,
+    pub is_temp_pinned:  bool,
+    pub is_dangling:     bool,
+    pub is_dirty:        bool,
+    // ── Cached at build time ──────────────────────────────────────────────────
+    bundle_name_s:   String,   // bundle name string (empty for bare keys)
+    qualified_str_s: String,   // bundle-qualified row prefix string
+    is_bundle_hdr:   bool,     // true for bundle-level header rows
+}
+
+impl RowIdentity {
+    /// Bundle name this row belongs to; empty string for bare (no-bundle) keys.
+    pub fn bundle_name(&self) -> &str { &self.bundle_name_s }
+
+    /// True when this is a bundle-level header row (not a group or leaf row).
+    pub fn is_bundle_header(&self) -> bool { self.is_bundle_hdr }
+
+    /// Bundle-qualified prefix string (e.g. `"messages:app.confirm"` or `"messages"`).
+    pub fn prefix_str(&self) -> &str { &self.qualified_str_s }
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
 
-/// Build the flat view row list from the current domain model.
+/// Enrich a list of structural row descriptors into fully-populated view rows.
 ///
-/// Emits rows in display order:
-/// - One bundle header row per named bundle.
-/// - For each entry: zero or more group header rows (newly introduced render
-///   boundaries, using trie + consecutive comparison) followed by one leaf row.
+/// Each `RowDescriptor` from `DomainModel::visible_rows` carries structural
+/// data only (bundle id, segment ids, key id, indent).  This function resolves
+/// segments to strings, looks up translations from the domain model, and attaches
+/// dirty/pinned flags to produce `ViewRow`s ready for the renderer.
 ///
-/// The `column_directive` sets the `visible` flag on leaf locale cells; header
-/// locale cells are always visible.
-pub fn build_view_rows(
+/// All data (translations, locale membership, dangling status) is read from `dm`.
+pub fn enrich_rows(
+    descriptors: Vec<RowDescriptor>,
     dm: &DomainModel,
     visible_locales: &[String],
     column_directive: ColumnDirective,
 ) -> Vec<ViewRow> {
     let mut rows = Vec::new();
 
-    for bundle in &dm.bundles {
-        let is_named    = !bundle.name.is_empty();
-        // Content inside a named bundle is indented by 1 (below the header).
+    for desc in descriptors {
+        let bundle_name = dm.bundle_name_str(desc.bundle_id);
+        let is_named    = !bundle_name.is_empty();
+        // Named bundles: content rows are indented below the bundle header.
         let base_indent = if is_named { 1 } else { 0 };
 
         // ── Bundle header row ─────────────────────────────────────────────────
-        if is_named {
+        if desc.partitions.is_empty() && desc.key_id.is_none() {
+            // Bare-key bundles (empty name) have no visual header row.
+            if !is_named { continue; }
             rows.push(ViewRow {
                 indent:       0,
-                key_segments: vec![bundle.name.clone()],
-                locale_cells: header_cells(visible_locales, &bundle.locales),
+                key_segments: vec![bundle_name.to_string()],
+                locale_cells: header_cells(visible_locales, bundle_name, dm),
                 identity: RowIdentity {
-                    bundle:         bundle.name.clone(),
-                    full_key:       None,
-                    prefix:         bundle.name.clone(),
-                    is_leaf:        false,
-                    is_pinned:      false,
-                    is_temp_pinned: false,
-                    is_dangling:    false,
-                    is_dirty:       false,
+                    key_id:          None,
+                    bundle_id:       desc.bundle_id,
+                    node_id:         desc.node_id,
+                    is_leaf:         false,
+                    is_pinned:       false,
+                    is_temp_pinned:  false,
+                    is_dangling:     false,
+                    is_dirty:        false,
+                    bundle_name_s:   bundle_name.to_string(),
+                    qualified_str_s: dm.node_qualified_str(desc.node_id),
+                    is_bundle_hdr:   true,
                 },
             });
+            continue;
         }
 
-        let mut prev_segs: &[String] = &[];
+        // Resolve the display segments for this row's key column.
+        let key_segments: Vec<String> = desc.partitions.iter()
+            .map(|&s| dm.segment_str(s).to_string())
+            .collect();
 
-        for entry in &bundle.entries {
-            let segs     = &entry.segments;
-            let shared   = common_prefix_len(segs, prev_segs);
-            let full_key = qualify(&bundle.name, &entry.real_key());
+        let indent = base_indent + desc.indent;
 
-            let seg_strs: Vec<&str> = segs.iter().map(|s| s.as_str()).collect();
-            let partitions = bundle.trie.key_partitions(&seg_strs);
-            // The last partition is the leaf; all earlier ones are group headers.
-            let (leaf_range, header_ranges) = partitions.split_last()
-                .expect("key_partitions always returns at least one range");
+        // ── Leaf row ──────────────────────────────────────────────────────────
+        if let Some(key_id) = desc.key_id {
+            let is_dirty       = dm.is_dirty(key_id);
+            let is_pinned      = dm.is_pinned(key_id);
+            let is_temp_pinned = dm.is_temp_pinned(key_id);
+            let is_dangling    = dm.is_dangling(key_id);
 
-            for (gi, range) in header_ranges.iter().enumerate() {
-                // Skip headers shared with the previous entry (already emitted).
-                // A partition ending at or before `shared` is fully within the
-                // common prefix — its header row was already rendered.
-                if range.end <= shared { continue; }
-                let prefix = qualify_prefix(&bundle.name, segs, range.end - 1);
-                rows.push(ViewRow {
-                    indent:       base_indent + gi,
-                    key_segments: segs[range.clone()].to_vec(),
-                    locale_cells: header_cells(visible_locales, &bundle.locales),
-                    identity: RowIdentity {
-                        bundle:         bundle.name.clone(),
-                        full_key:       None,
-                        prefix,
-                        is_leaf:        false,
-                        is_pinned:      false,
-                        is_temp_pinned: false,
-                        is_dangling:    false,
-                        is_dirty:       false,
-                    },
-                });
-            }
-
-            // ── Leaf row ──────────────────────────────────────────────────────
-            let gi           = header_ranges.len();
-            let locale_cells = leaf_cells(visible_locales, &bundle.locales, entry, &column_directive);
             rows.push(ViewRow {
-                indent:       base_indent + gi,
-                key_segments: segs[leaf_range.clone()].to_vec(),
-                locale_cells,
+                indent,
+                key_segments,
+                locale_cells: leaf_cells(visible_locales, bundle_name, key_id, column_directive, dm),
                 identity: RowIdentity {
-                    bundle:         bundle.name.clone(),
-                    full_key:       Some(full_key.clone()),
-                    prefix:         full_key,
-                    is_leaf:        true,
-                    is_pinned:      entry.is_pinned,
-                    is_temp_pinned: entry.is_temp_pinned,
-                    is_dangling:    entry.is_dangling,
-                    is_dirty:       entry.is_dirty,
+                    key_id:          Some(key_id),
+                    bundle_id:       desc.bundle_id,
+                    node_id:         desc.node_id,
+                    is_leaf:         true,
+                    is_pinned,
+                    is_temp_pinned,
+                    is_dangling,
+                    is_dirty,
+                    bundle_name_s:   bundle_name.to_string(),
+                    qualified_str_s: dm.node_qualified_str(desc.node_id),
+                    is_bundle_hdr:   false,
                 },
             });
-
-            prev_segs = segs;
+        } else {
+            // ── Group header row ──────────────────────────────────────────────
+            rows.push(ViewRow {
+                indent,
+                key_segments,
+                locale_cells: header_cells(visible_locales, bundle_name, dm),
+                identity: RowIdentity {
+                    key_id:          None,
+                    bundle_id:       desc.bundle_id,
+                    node_id:         desc.node_id,
+                    is_leaf:         false,
+                    is_pinned:       false,
+                    is_temp_pinned:  false,
+                    is_dangling:     false,
+                    is_dirty:        false,
+                    bundle_name_s:   bundle_name.to_string(),
+                    qualified_str_s: dm.node_qualified_str(desc.node_id),
+                    is_bundle_hdr:   false,
+                },
+            });
         }
     }
 
@@ -178,48 +196,50 @@ pub fn build_view_rows(
 
 /// Locale cells for a bundle or group header row.
 /// Bundle-owned locales → `Tag`; others → `Empty`.
-fn header_cells(visible_locales: &[String], bundle_locales: &[String]) -> Vec<LocaleCellView> {
+fn header_cells(
+    visible_locales: &[String],
+    bundle_name: &str,
+    dm: &DomainModel,
+) -> Vec<LocaleCellView> {
     visible_locales.iter().map(|locale| {
-        let content = if bundle_locales.contains(locale) {
-            CellContent::Tag
-        } else {
-            CellContent::Empty
-        };
+        let in_bundle = dm.bundle_has_locale(bundle_name, locale);
+        let content   = if in_bundle { CellContent::Tag } else { CellContent::Empty };
         LocaleCellView { locale: locale.clone(), content, dirty: false, visible: true }
     }).collect()
 }
 
 /// Locale cells for a leaf row, with `visible` flags set by `column_directive`.
+///
+/// Translation values, locale membership, and per-cell dirty state are all
+/// read from `dm` — no external dirty sets needed.
 fn leaf_cells(
     visible_locales:  &[String],
-    bundle_locales:   &[String],
-    entry:            &Entry,
-    column_directive: &ColumnDirective,
+    bundle_name:      &str,
+    key_id:           KeyId,
+    column_directive: ColumnDirective,
+    dm:               &DomainModel,
 ) -> Vec<LocaleCellView> {
     visible_locales.iter().map(|locale| {
-        let cell_opt = bundle_locales.iter()
-            .position(|l| l == locale)
-            .and_then(|i| entry.cells.get(i));
+        let in_bundle = dm.bundle_has_locale(bundle_name, locale);
 
-        let (content, dirty) = match cell_opt {
-            Some(cell) => {
-                let c = match &cell.value {
-                    Some(v) => CellContent::Value(v.clone()),
-                    None    => CellContent::Missing,
-                };
-                (c, cell.is_dirty)
-            }
-            // Locale has no file in this bundle — treat as Empty, not Missing.
-            // Missing means "the bundle has a locale file but this key is absent";
-            // Empty means "the bundle doesn't support this locale at all".
-            None => (CellContent::Empty, false),
+        let (content, dirty) = if !in_bundle {
+            // Locale has no file in this bundle — Empty, not Missing.
+            (CellContent::Empty, false)
+        } else {
+            let value   = dm.translation_str(key_id, locale);
+            let content = match value {
+                Some(v) => CellContent::Value(v.to_string()),
+                None    => CellContent::Missing,
+            };
+            let is_dirty = dm.is_dirty_for_locale(key_id, locale);
+            (content, is_dirty)
         };
 
-        // Empty cells (locale not in this bundle) are never shown on leaf rows.
+        // Empty cells (locale not in bundle) are never visible on leaf rows.
         let visible = if matches!(content, CellContent::Empty) {
             false
         } else {
-            match *column_directive {
+            match column_directive {
                 ColumnDirective::None        => true,
                 ColumnDirective::MissingOnly => matches!(content, CellContent::Missing),
                 ColumnDirective::PresentOnly => matches!(content, CellContent::Value(_)),
@@ -230,65 +250,46 @@ fn leaf_cells(
     }).collect()
 }
 
-/// Build the bundle-qualified prefix string for a group header at depth `d`.
-/// `segs[..=d]` is the full path; `bundle` is empty for bare-key bundles.
-fn qualify_prefix(bundle: &str, segs: &[String], d: usize) -> String {
-    let key_part = segs[..=d].join(".");
-    qualify(bundle, &key_part)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        app_model::{BundleModel, DomainModel, Entry, LocaleCell},
+        domain::DomainModel,
         filter::ColumnDirective,
-        radix_tree_arena::CompressedTrie,
+        store::Store,
     };
-
-    // ── Test helpers ──────────────────────────────────────────────────────────
 
     fn sv(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
     }
 
-    fn bare_model(keys: &[&str]) -> DomainModel {
-        named_model("", keys, &[])
+    // ── Test helpers ──────────────────────────────────────────────────────────
+
+    /// Build a Store with a named bundle and a set of bare keys (no locales).
+    fn store_with_keys(bundle: &str, keys: &[&str]) -> Store {
+        let mut store = Store::new();
+        for k in keys { store.insert_key(bundle, k); }
+        store
     }
 
-    fn named_model(bundle: &str, keys: &[&str], locales: &[&str]) -> DomainModel {
-        let mut sorted: Vec<String> = keys.iter().map(|s| s.to_string()).collect();
-        sorted.sort();
-
-        let bundle_locales: Vec<String> = locales.iter().map(|s| s.to_string()).collect();
-
-        let entries: Vec<Entry> = sorted.iter().map(|k| {
-            let cells: Vec<LocaleCell> = bundle_locales.iter()
-                .map(|_| LocaleCell { value: None, is_dirty: false })
-                .collect();
-            Entry {
-                segments: k.split('.').map(|s| s.to_string()).collect(),
-                cells,
-                is_dirty: false, is_pinned: false,
-                is_temp_pinned: false, is_dangling: false,
-            }
-        }).collect();
-
-        let mut trie = CompressedTrie::new();
-        for (i, e) in entries.iter().enumerate() {
-            trie.insert_str(&e.real_key(), i);
+    /// Build a Store with locale registration and optional translations.
+    ///
+    /// `locales` — which locale files the bundle has.
+    /// `key_values` — `(locale, key, value)` triples written into the store.
+    fn store_for_bundle(bundle: &str, locales: &[&str], key_values: &[(&str, &str, &str)]) -> Store {
+        let mut store = Store::new();
+        for &l in locales { store.register_locale(bundle, l); }
+        for &(locale, key, value) in key_values {
+            let kid = store.insert_key(bundle, key);
+            store.set_translation(kid, locale, value.to_string());
         }
+        store
+    }
 
-        DomainModel {
-            bundles: vec![BundleModel {
-                name: bundle.to_string(),
-                locales: bundle_locales,
-                entries,
-                trie,
-            }],
-        }
+    fn rows(dm: &DomainModel, visible_locales: &[String]) -> Vec<ViewRow> {
+        enrich_rows(dm.visible_rows(|_| true), dm, visible_locales, ColumnDirective::None)
     }
 
     fn segs(rows: &[ViewRow]) -> Vec<Vec<&str>> {
@@ -305,187 +306,186 @@ mod tests {
         rows.iter().map(|r| r.identity.is_leaf).collect()
     }
 
-    fn prefixes(rows: &[ViewRow]) -> Vec<&str> {
-        rows.iter().map(|r| r.identity.prefix.as_str()).collect()
+    fn prefixes(rows: &[ViewRow]) -> Vec<String> {
+        rows.iter().map(|r| r.identity.prefix_str().to_string()).collect()
     }
 
-    fn full_keys(rows: &[ViewRow]) -> Vec<Option<&str>> {
-        rows.iter().map(|r| r.identity.full_key.as_deref()).collect()
-    }
-
-    // ── Row structure tests (bare keys, no bundle) ────────────────────────────
+    // ── Structure ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn siblings_get_a_header() {
-        let dm   = bare_model(&["app.confirm.delete", "app.confirm.discard"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        assert_eq!(segs(&rows),    vec![vec!["app","confirm"], vec!["delete"], vec!["discard"]]);
-        assert_eq!(indents(&rows), vec![0, 1, 1]);
-        assert_eq!(is_leaf(&rows), vec![false, true, true]);
-        assert_eq!(prefixes(&rows), vec!["app.confirm", "app.confirm.delete", "app.confirm.discard"]);
-    }
-
-    #[test]
-    fn lone_key_chain_collapses() {
-        let dm   = bare_model(&["app.loading"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        // Single entry — no branch node anywhere — emits one leaf at indent 0.
-        assert_eq!(rows.len(), 1);
-        assert_eq!(segs(&rows),    vec![vec!["app", "loading"]]);
-        assert_eq!(indents(&rows), vec![0]);
-        assert!(rows[0].identity.is_leaf);
-    }
-
-    #[test]
-    fn truly_bare_key() {
-        let dm   = bare_model(&["loading"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(segs(&rows),    vec![vec!["loading"]]);
-        assert_eq!(indents(&rows), vec![0]);
-        assert!(rows[0].identity.is_leaf);
-    }
-
-    #[test]
-    fn single_child_non_key_chain_collapses() {
-        // com→myapp→error is a single-child chain — no branch — collapses to one header.
-        let dm   = bare_model(&["com.myapp.error.notfound", "com.myapp.error.timeout"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        // Header spans three segments: ["com","myapp","error"]
-        assert_eq!(segs(&rows)[0],    vec!["com", "myapp", "error"]);
-        assert_eq!(indents(&rows),    vec![0, 1, 1]);
-        assert_eq!(is_leaf(&rows),    vec![false, true, true]);
-        assert_eq!(prefixes(&rows),   vec!["com.myapp.error", "com.myapp.error.notfound", "com.myapp.error.timeout"]);
-    }
-
-    #[test]
-    fn mixed_depth_siblings() {
-        let dm   = bare_model(&["app.confirm.delete", "app.confirm.discard", "app.loading"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        assert_eq!(segs(&rows), vec![
-            vec!["app"],
-            vec!["confirm"],
-            vec!["delete"],
-            vec!["discard"],
-            vec!["loading"],
-        ]);
-        assert_eq!(indents(&rows), vec![0, 1, 2, 2, 1]);
-        assert_eq!(is_leaf(&rows), vec![false, false, true, true, true]);
-    }
-
-    #[test]
-    fn key_that_is_also_a_parent_emits_no_header() {
-        // app.x is a key (Interior) AND parent of a, b — Interior never gets a
-        // header row for itself; children appear one level deeper.
-        let dm   = bare_model(&["app.x", "app.x.a", "app.x.b"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        assert_eq!(segs(&rows), vec![vec!["app","x"], vec!["a"], vec!["b"]]);
-        assert_eq!(indents(&rows), vec![0, 1, 1]);
-        assert_eq!(is_leaf(&rows), vec![true, true, true]);
-        // No group header rows.
-        assert!(!rows.iter().any(|r| r.identity.full_key.is_none()));
-    }
-
-    #[test]
-    fn nested_headers() {
-        let dm   = bare_model(&["app.a.b.c", "app.a.b.d", "app.a.e", "app.a.f"]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        assert_eq!(segs(&rows), vec![
-            vec!["app","a"],
-            vec!["b"],
-            vec!["c"],
-            vec!["d"],
-            vec!["e"],
-            vec!["f"],
-        ]);
-        assert_eq!(indents(&rows), vec![0, 1, 2, 2, 1, 1]);
-        assert_eq!(is_leaf(&rows), vec![false, false, true, true, true, true]);
-    }
-
-    // ── Named bundle ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn named_bundle_gets_header_row() {
-        let dm   = named_model("messages", &["app.title", "app.subtitle"], &["de", "fr"]);
-        let rows = build_view_rows(&dm, &sv(&["de", "fr"]), ColumnDirective::None);
-        // Row 0: bundle header.
+    fn named_bundle_header_row() {
+        let store = store_with_keys("messages", &["app.title"]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &sv(&["de"]));
         assert_eq!(rows[0].key_segments, vec!["messages"]);
         assert_eq!(rows[0].indent, 0);
         assert!(!rows[0].identity.is_leaf);
-        assert_eq!(rows[0].identity.prefix, "messages");
-        assert_eq!(rows[0].identity.full_key, None);
-        // Bundle header locale cells are Tags.
-        assert!(rows[0].locale_cells.iter().all(|c| matches!(c.content, CellContent::Tag)));
-        // Content rows are shifted by 1.
-        // app.title and app.subtitle share no branch → chain-collapse into one header "app".
-        // Wait — "app" has 2 children (title, subtitle) → Branch → header.
-        assert_eq!(rows[1].key_segments, vec!["app"]);
-        assert_eq!(rows[1].indent, 1);  // base_indent=1, gi=0 → 1
-        assert!(!rows[1].identity.is_leaf);
-        assert_eq!(rows[2].key_segments, vec!["subtitle"]);
-        assert_eq!(rows[2].indent, 2);
-        assert!(rows[2].identity.is_leaf);
-        assert_eq!(rows[3].key_segments, vec!["title"]);
-        assert_eq!(rows[3].indent, 2);
-        assert!(rows[3].identity.is_leaf);
+        assert!(rows[0].identity.is_bundle_header());
+        assert_eq!(rows[0].identity.prefix_str(), "messages");
+        assert!(rows[0].identity.key_id.is_none());
     }
 
     #[test]
-    fn named_bundle_prefixes_are_bundle_qualified() {
-        let dm   = named_model("msg", &["a.b", "a.c"], &[]);
-        let rows = build_view_rows(&dm, &[], ColumnDirective::None);
-        // bundle header, group header "a", leaf "b", leaf "c"
-        assert_eq!(prefixes(&rows), vec!["msg", "msg:a", "msg:a.b", "msg:a.c"]);
-        assert_eq!(full_keys(&rows), vec![None, None, Some("msg:a.b"), Some("msg:a.c")]);
+    fn named_bundle_content_indented_by_one() {
+        let store = store_with_keys("m", &["app.ok", "app.cancel"]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &[]);
+        // bundle header (0), app header (1), cancel (2), ok (2)
+        assert_eq!(indents(&rows), vec![0, 1, 2, 2]);
+        assert_eq!(is_leaf(&rows), vec![false, false, true, true]);
+    }
+
+    #[test]
+    fn chain_collapsed_row() {
+        let store = store_with_keys("m", &["a.b.c"]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &[]);
+        assert_eq!(segs(&rows), vec![vec!["m"], vec!["a", "b", "c"]]);
+    }
+
+    #[test]
+    fn prefix_on_group_header() {
+        let store = store_with_keys("msg", &["a.b", "a.c"]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &[]);
+        // bundle header, "a" header, "b" leaf, "c" leaf
+        assert_eq!(prefixes(&rows), sv(&["msg", "msg:a", "msg:a.b", "msg:a.c"]));
+    }
+
+    #[test]
+    fn leaf_row_carries_key_id() {
+        let store = store_with_keys("m", &["key"]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &[]);
+        let leaf  = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(leaf.identity.key_id.is_some());
     }
 
     // ── Locale cells ──────────────────────────────────────────────────────────
 
     #[test]
-    fn leaf_locale_cells_match_visible_locales_order() {
-        let dm   = named_model("m", &["key"], &["de", "fr"]);
-        let rows = build_view_rows(&dm, &sv(&["fr", "de"]), ColumnDirective::None);
-        // Leaf row is the last row.
-        let leaf = rows.iter().last().unwrap();
+    fn value_present() {
+        let store = store_for_bundle("m", &["de"], &[("de", "key", "Hallo")]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &sv(&["de"]));
+        let leaf  = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(matches!(&leaf.locale_cells[0].content, CellContent::Value(v) if v == "Hallo"));
+        assert!(leaf.locale_cells[0].visible);
+    }
+
+    #[test]
+    fn missing_cell_when_no_translation() {
+        // de locale registered, but no translation for "key"
+        let store = store_for_bundle("m", &["de"], &[]);
+        let mut s = store;
+        s.insert_key("m", "key"); // add the key without a translation
+        let dm    = DomainModel::from_store(s);
+        let rows  = rows(&dm, &sv(&["de"]));
+        let leaf  = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(matches!(leaf.locale_cells[0].content, CellContent::Missing));
+        assert!(leaf.locale_cells[0].visible);
+    }
+
+    #[test]
+    fn empty_cell_when_locale_not_in_bundle() {
+        // Bundle only has "de"; visible_locales includes "fr" too.
+        let store = store_for_bundle("m", &["de"], &[("de", "key", "Hallo")]);
+        let dm    = DomainModel::from_store(store);
+        let rows  = rows(&dm, &sv(&["de", "fr"]));
+        let leaf  = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(matches!(leaf.locale_cells[0].content, CellContent::Value(_))); // de
+        assert!(matches!(leaf.locale_cells[1].content, CellContent::Empty));    // fr
+        assert!(!leaf.locale_cells[1].visible);
+    }
+
+    #[test]
+    fn header_row_has_tag_for_bundle_locale() {
+        // de registered (no translations needed for header test), fr not registered
+        let store = store_for_bundle("m", &["de"], &[]);
+        let mut s = store;
+        s.insert_key("m", "key");
+        let dm    = DomainModel::from_store(s);
+        let rows  = rows(&dm, &sv(&["de", "fr"]));
+        let header = &rows[0]; // bundle header
+        assert!(matches!(header.locale_cells[0].content, CellContent::Tag));   // de
+        assert!(matches!(header.locale_cells[1].content, CellContent::Empty)); // fr
+    }
+
+    #[test]
+    fn locale_cell_order_follows_visible_locales() {
+        let store = store_for_bundle("m", &["de", "fr"], &[
+            ("de", "key", "D"), ("fr", "key", "F"),
+        ]);
+        let dm   = DomainModel::from_store(store);
+        let rows = rows(&dm, &sv(&["fr", "de"])); // fr first
+        let leaf = rows.iter().find(|r| r.identity.is_leaf).unwrap();
         assert_eq!(leaf.locale_cells[0].locale, "fr");
         assert_eq!(leaf.locale_cells[1].locale, "de");
     }
 
+    // ── column_directive ──────────────────────────────────────────────────────
+
     #[test]
-    fn locale_not_in_bundle_is_empty_on_header() {
-        // visible_locales includes "it" but bundle only has "de".
-        let dm   = named_model("m", &["key"], &["de"]);
-        let rows = build_view_rows(&dm, &sv(&["de", "it"]), ColumnDirective::None);
-        let header = &rows[0]; // bundle header
-        assert!(matches!(header.locale_cells[0].content, CellContent::Tag));   // de → Tag
-        assert!(matches!(header.locale_cells[1].content, CellContent::Empty)); // it → Empty
+    fn missing_only_hides_present_cells() {
+        // de has translation, fr registered but missing
+        let store = store_for_bundle("m", &["de", "fr"], &[("de", "key", "Hallo")]);
+        let mut s = store;
+        s.insert_key("m", "key"); // ensure key exists for fr (no translation)
+        let dm    = DomainModel::from_store(s);
+        let descs = dm.visible_rows(|_| true);
+        let rows  = enrich_rows(
+            descs, &dm, &sv(&["de", "fr"]),
+            ColumnDirective::MissingOnly,
+        );
+        let leaf = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(!leaf.locale_cells[0].visible); // de has value → hidden
+        assert!(leaf.locale_cells[1].visible);  // fr missing → shown
     }
 
     #[test]
-    fn column_directive_missing_only_hides_present_cells() {
-        // Build a model where one locale has a value and another doesn't.
-        // We do this by constructing Entry.cells manually.
-        let mut dm = named_model("m", &["key"], &["de", "fr"]);
-        // Set de=Some("Hallo"), fr=None.
-        dm.bundles[0].entries[0].cells[0].value = Some("Hallo".to_string());
-        // fr stays None (Missing).
+    fn present_only_hides_missing_cells() {
+        // de has translation, fr registered but missing
+        let store = store_for_bundle("m", &["de", "fr"], &[("de", "key", "Hallo")]);
+        let mut s = store;
+        s.insert_key("m", "key");
+        let dm    = DomainModel::from_store(s);
+        let descs = dm.visible_rows(|_| true);
+        let rows  = enrich_rows(
+            descs, &dm, &sv(&["de", "fr"]),
+            ColumnDirective::PresentOnly,
+        );
+        let leaf = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(leaf.locale_cells[0].visible);  // de has value → shown
+        assert!(!leaf.locale_cells[1].visible); // fr missing → hidden
+    }
 
-        let rows = build_view_rows(&dm, &sv(&["de", "fr"]), ColumnDirective::MissingOnly);
-        let leaf = rows.iter().last().unwrap();
-        // de has a value → not visible under MissingOnly.
-        assert!(!leaf.locale_cells[0].visible); // de
-        // fr is Missing → visible.
-        assert!(leaf.locale_cells[1].visible);  // fr
+    // ── Flags ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn dirty_flag_on_leaf() {
+        // set_translation marks the entry as inserted → key is dirty
+        let store = store_for_bundle("m", &["de"], &[("de", "key", "val")]);
+        let dm    = DomainModel::from_store(store);
+        let descs = dm.visible_rows(|_| true);
+        let rows = enrich_rows(
+            descs, &dm, &sv(&["de"]),
+            ColumnDirective::None,
+        );
+        let leaf = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(leaf.identity.is_dirty);
     }
 
     #[test]
-    fn column_directive_present_only_hides_missing_cells() {
-        let mut dm = named_model("m", &["key"], &["de", "fr"]);
-        dm.bundles[0].entries[0].cells[0].value = Some("Hallo".to_string());
-
-        let rows = build_view_rows(&dm, &sv(&["de", "fr"]), ColumnDirective::PresentOnly);
-        let leaf = rows.iter().last().unwrap();
-        assert!(leaf.locale_cells[0].visible);  // de has value → visible
-        assert!(!leaf.locale_cells[1].visible); // fr Missing → not visible
+    fn dirty_cell_flag() {
+        // store_for_bundle calls set_translation, so the entry is in inserted_entries
+        let store = store_for_bundle("m", &["de"], &[("de", "key", "Hallo")]);
+        let dm    = DomainModel::from_store(store);
+        let descs = dm.visible_rows(|_| true);
+        let rows = enrich_rows(
+            descs, &dm, &sv(&["de"]),
+            ColumnDirective::None,
+        );
+        let leaf = rows.iter().find(|r| r.identity.is_leaf).unwrap();
+        assert!(leaf.locale_cells[0].dirty);
     }
 }

@@ -358,7 +358,7 @@ fn draw_status(f: &mut Frame, area: Rect, state: &AppState) {
         Mode::Filter       => "FILTER",
         Mode::Pasting      => "PASTE ",
     };
-    let dirty = if state.unsaved_changes { " [+]" } else { "    " };
+    let dirty = if state.domain_model.has_changes() { " [+]" } else { "    " };
     // Status message (e.g. rename conflict) overrides the normal hints for one keypress.
     let hints: std::borrow::Cow<str> = if let Some(msg) = &state.status_message {
         format!("  {msg}").into()

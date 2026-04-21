@@ -20,17 +20,18 @@ The app follows The Elm Architecture (TEA):
 tui           ratatui + crossterm — layout, rendering, raw keyboard event capture
 keybindings   HashMap<KeyEvent, Message> per mode — translates raw events to messages
 messages      Message enum — all possible actions in the app
-update        (State, Message) → State — pure except SaveFile (flushes pending_writes)
-state         AppState — complete app state (see fields below)
+update        (State, Message) → State — pure dispatcher; all business logic in ops
+state         AppState — navigation + UI state; owns DomainModel and Workspace
 filter        FilterExpr AST, parse(), evaluate(), visible_locales()
-render_model  build_display_rows() — converts bundle-qualified key slice → Vec<DisplayRow>
+view_model    build_view_rows() — converts DomainModel → Vec<ViewRow> for rendering
 editor        CellEdit — wraps TextArea<'static> + original string for change detection
-workspace     Workspace — owns all FileGroup/PropertiesFile/FileEntry data;
-              single source of truth for keys and values
+store         Store — ID tables, trie, translations, in-session mutation tracking
+domain        DomainModel — single source of truth; exposes typed handles, no raw IDs
+workspace     Workspace — I/O only: loads .properties at startup; saves at Ctrl+S
+              by reading the domain model's change set and writing minimal file diffs
 parser        line-by-line reader — preserves KeyValue, Comment, Blank entries;
               joins \-continuation lines into a single logical value string
-writer        write_change(), write_insert(), write_delete() — targeted file rewrites
-search        stub (nucleo fuzzy search planned; currently unused)
+writer        targeted file rewrite helpers called by workspace.save()
 ```
 
 New features are added by introducing new `Message` variants and handling them
@@ -62,7 +63,7 @@ is the file name — renaming a bundle would rename the file on disk).
 
 ```rust
 pub workspace: Workspace,
-pub domain_model: DomainModel,       // hierarchical source of truth; rebuilt by apply_filter
+pub domain_model: DomainModel,       // single source of truth; wraps Store; exposes typed handles
 pub view_rows: Vec<ViewRow>,         // flat ordered row list built from domain_model;
                                      // rebuilt on every filter/workspace change
 pub visible_locales: Vec<String>,    // subset of all_locales() when a locale filter is
@@ -77,7 +78,8 @@ pub scroll_offset: usize,
 pub mode: Mode,
 pub filter_textarea: TextArea<'static>, // always present; lines()[0] is the query
 pub unsaved_changes: bool,
-pub pending_writes: Vec<PendingChange>, // flushed on SaveFile
+pub pending_writes: Vec<PendingChange>, // D5 (architectural_debt.md): being retired in favour
+                                     // of store change_set(); flushed on SaveFile for now
 pub quitting: bool,
 pub edit_buffer: Option<CellEdit>,   // present while mode is Editing / KeyNaming
                                      // / KeyRenaming / LocaleNaming / BundleNaming
@@ -86,8 +88,8 @@ pub selection_scope: SelectionScope, // Exact / Children / ChildrenAll; Tab-cycl
                                      // in Normal, KeyRenaming, Deleting
 pub status_message: Option<String>,  // one-shot; cleared on next keypress
 pub show_preview: bool,              // Space toggles read-only value preview pane
-pub dirty_keys: HashSet<String>,     // keys with unsaved changes; auto-set on any
-                                     // mutation, cleared per-key on Ctrl+S
+pub dirty_keys: HashSet<String>,     // D8 (architectural_debt.md): being replaced by store
+                                     // mutation tracking; currently string-keyed
 pub temp_pins: Vec<String>,          // hidden children surfaced while ChildrenAll
                                      // is active; discarded on mode exit
 pub pinned_keys: HashSet<String>,    // manual bookmarks; bypass filter until unpinned
@@ -127,11 +129,11 @@ Escape cycles: `Normal → Filter → Normal`.
 
 **Bundle system**
 Files are grouped by bundle (base filename before `_`). Keys are stored in
-`merged_keys` as `"bundle:real_key"` (e.g. `"messages:app.title"`).
-`workspace::split_key(full_key) -> (&str, &str)` splits on the first `:`.
-`workspace.get_value(full_key, locale)` routes lookups through the correct
-bundle group. Files on disk always store the bare real key — the bundle
-prefix is an in-memory convention only.
+the `Store` under their bundle, identified by typed IDs (`BundleId`, `KeyId`).
+The bundle-qualified string form `"bundle:real_key"` (e.g. `"messages:app.title"`)
+is used only at I/O boundaries; `domain.rs`'s `find_key()` and `insert_key()`
+are the sole entry points for splitting on `:`. Files on disk always store the
+bare real key — the bundle prefix is an in-memory convention only.
 
 Bundle-level Header rows (depth 0, prefix == bundle name) display `[locale]`
 tags for the locales that belong to that bundle. These cells are navigable
@@ -158,7 +160,7 @@ its original line number. On save, only the changed lines are rewritten.
 ```rust
 enum FileEntry {
     KeyValue { first_line: usize, last_line: usize, key: String, value: String },
-    Comment  { line: usize, raw: String },
+    Comment  { line: usize },
     Blank    { line: usize },
 }
 ```
@@ -177,7 +179,8 @@ after every filter or workspace change.
 Each `ViewRow` carries a `RowIdentity` struct plus display fields:
 - `identity.bundle` — bundle name (empty for bare keys)
 - `identity.prefix` — bundle-qualified key prefix this row represents
-- `identity.full_key: Option<String>` — `Some` for leaf rows, `None` for headers
+- `identity.full_key: Option<Key>` — `Some` for leaf rows, `None` for headers (D6: migrate to `key_id`)
+- `identity.key_id: Option<KeyId>` — D6 migration target; consume this instead of `full_key` once D6 is done
 - `identity.is_leaf` — `true` for key rows, `false` for group/bundle headers
 - `key_segments: Vec<String>` — the display segments for this row's key column
 - `indent: usize` — indentation level (drives leading spaces in the renderer)
@@ -309,21 +312,19 @@ after every rebuild, so changing the filter never jumps the user to a different 
 
 See `docs/filtering.md` for the full syntax and AST.
 
-**PendingChange / write model**
+**Write model** *(current state — see D5 in docs/architectural_debt.md)*
 Edits are committed in-memory immediately and appended to `pending_writes`.
 Ctrl+S flushes them to disk. Failed writes are kept for retry. `[+]` in the
 status bar reflects `unsaved_changes`.
 
 ```rust
+// D5: being retired — workspace.save() will read the store's change_set() instead
 enum PendingChange {
     Update { path, first_line, last_line, key, value, full_key }, // rewrite existing entry
     Insert { path, after_line, key, value, full_key },            // append new entry
     Delete { path, first_line, last_line, full_key },             // remove entry
 }
 ```
-
-`full_key` is the bundle-qualified key name used to rebuild `dirty_keys` after a
-save: once all pending writes for a key flush successfully, the key leaves `dirty_keys`.
 
 `insert_into_file(state, gi, fi, real_key, value)` is the shared helper used
 by cell insert and cross-bundle move. It finds the insertion point, bumps
@@ -332,12 +333,13 @@ subsequent line numbers in-memory, and queues a `PendingChange::Insert`.
 When entries are deleted, line numbers of all subsequent entries in the same
 file are shifted down immediately so in-memory state stays consistent.
 
-**Dirty tracking**
+**Dirty tracking** *(current state — see D8 in docs/architectural_debt.md)*
 A key is dirty when it has unsaved changes in the current session. `dirty_keys`
-is a `HashSet<String>` of bundle-qualified key names; every mutation path
-(`ops::insert`, `ops::delete`, `ops::rename`) inserts the affected key immediately.
-On Ctrl+S, `dirty_keys` is rebuilt from the keys still referenced by `pending_writes`
-— keys whose writes flushed successfully are automatically removed.
+is a `HashSet<String>` (D8: being replaced by store `KeyMutation` tracking).
+Every mutation path (`ops::insert`, `ops::delete`, `ops::rename`) inserts the
+bundle-qualified key name immediately. On Ctrl+S, `dirty_keys` is rebuilt from
+the keys still referenced by `pending_writes` — keys whose writes flushed
+successfully are automatically removed.
 
 Dirty keys bypass the filter (always visible, like pinned keys) and are shown with
 a yellow key name and `#` prefix in the key column. Individual locale cells with a
@@ -366,7 +368,7 @@ all temp pins are cleared.
 
 **Deletion**
 - `d` on a locale cell: yanks the value then removes that one `(key, locale)` entry,
-  leaving the key in `merged_keys` (other locales still visible).
+  leaving the key in the store (other locales still visible).
 - `d` on the key column: enters `Mode::Deleting`. The pane shows the key
   (read-only). Tab cycles selection scope. Enter confirms; Esc cancels. Dangling
   (unsaved) keys are dropped without a file write.
@@ -582,6 +584,10 @@ careful — the writer must never corrupt a file.
 
 ## Further documentation
 
+- [docs/architecture.md](docs/architecture.md) — **layer rules, string boundary rule, mutation flow,
+  anti-patterns, refactoring checklist. Read this before touching ops, update, or domain.**
+- [docs/architectural_debt.md](docs/architectural_debt.md) — current violations, fix order, code fragments
+- [docs/store.md](docs/store.md) — Store internals, ID types, planned mutation model
 - [docs/filtering.md](docs/filtering.md) — filter syntax, AST, evaluation
 - [docs/dirty.md](docs/dirty.md) — dirty tracking design
 - [docs/pinned_keys.md](docs/pinned_keys.md) — pinning and temp-pins design
