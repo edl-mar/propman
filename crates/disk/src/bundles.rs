@@ -17,27 +17,36 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 // Language and country codes are only a hint, never a condition (the lists change over time
-// and Java itself checks none). Written from memory on 2026-11-07: ISO 639-1 and ISO 3166-1
-// alpha-2, plus legacy Java language codes (iw, in, ji), a few common three-letter languages
-// and the user-assigned `XK` (Kosovo). Compare with the JDK's `Locale.getISOLanguages()` and
-// `Locale.getISOCountries()` before relying on completeness.
-const LANGUAGES: &str = "aa ab ae af ak am an ar as av ay az ba be bg bh bi bm bn bo br bs ca ce \
-    ch co cr cs cu cv cy da de dv dz ee el en eo es et eu fa ff fi fj fo fr fy ga gd gl gn gu gv \
-    ha he hi ho hr ht hu hy hz ia id ie ig ii ik io is it iu ja jv ka kg ki kj kk kl km kn ko kr \
-    ks ku kv kw ky la lb lg li ln lo lt lu lv mg mh mi mk ml mn mr ms mt my na nb nd ne ng nl nn \
-    no nr nv ny oc oj om or os pa pi pl ps pt qu rm rn ro ru rw sa sc sd se sg si sk sl sm sn so \
-    sq sr ss st su sv sw ta te tg th ti tk tl tn to tr ts tt tw ty ug uk ur uz ve vi vo wa wo xh \
-    yi yo za zh zu iw in ji fil ceb haw yue gsw ast kab";
+// and Java itself checks none).
+//
+// Source: OpenJDK 22.0.2, 2026-11-07, via `java tools/Codes.java`. Languages are `Locale.getISOLanguages()` (ISO 639-1 plus
+// the legacy codes iw, in, ji, mo) united with the languages of `Locale.getAvailableLocales()`
+// (adds three-letter codes such as fil). Countries are `Locale.getISOCountries()` united with
+// the two-letter countries of `Locale.getAvailableLocales()` (adds CS, DG, EA, IC), plus the
+// user-assigned `XK` (Kosovo) by hand. Three-digit regions (UN M.49) are accepted without a list.
+const LANGUAGES: &str = "aa ab ae af agq ak am an ann ar as asa ast av ay az ba bas be bem bez bg bgc bh bho \
+    bi blo bm bn bo br brx bs ca ccp ce ceb cgg ch chr ckb co cr cs csw cu cv cy da dav \
+    de dje doi dsb dua dv dyo dz ebu ee el en eo es et eu ewo fa ff fi fil fj fo fr frr \
+    fur fy ga gd gl gn gsw gu guz gv ha haw he hi ho hr hsb ht hu hy hz ia id ie ig ii \
+    ik in io is it iu iw ja jgo ji jmc jv ka kab kam kde kea kg kgp khq ki kj kk kkj kl \
+    kln km kn ko kok kr ks ksb ksf ksh ku kv kw kxv ky la lag lb lg li lij lkt lmo ln \
+    lo lrc lt lu luo luy lv mai mas mdf mer mfe mg mgh mgo mh mi mk ml mn mni mo mr ms \
+    mt mua my mzn na naq nb nd nds ne ng nl nmg nn nnh no nqo nr nus nv ny nyn oc oj om \
+    or os pa pcm pi pis pl prg ps pt qu raj rm rn ro rof ru rw rwk sa sah saq sat sbp \
+    sc sd se seh ses sg shi si sk sl sm smn sms sn so sq sr ss st su sv sw syr szl ta \
+    te teo tg th ti tk tl tn to tok tr ts tt tw twq ty tzm ug uk ur uz vai ve vec vi \
+    vmw vo vun wa wae wo xh xnr xog yav yi yo yrl yue za zgh zh zu";
 
-const COUNTRIES: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI \
-    BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY \
-    CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN \
-    GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH \
-    KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO \
-    MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL \
-    PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV \
-    SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN \
-    VU WF WS YE YT ZA ZM ZW XK";
+const COUNTRIES: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN \
+    BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CS CU CV CW CX CY \
+    CZ DE DG DJ DK DM DO DZ EA EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG \
+    GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU IC ID IE IL IM IN IO IQ IR \
+    IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY \
+    MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG \
+    NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW \
+    SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK \
+    TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS XK YE YT ZA \
+    ZM ZW";
 
 /// `lang[_script][_COUNTRY[_variant]]` has at most four parts.
 const MAX_SUFFIX_PARTS: usize = 4;
