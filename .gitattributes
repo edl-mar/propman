@@ -1,2 +1,3 @@
-# Test data is compared byte-for-byte; never normalize line endings.
-testdata/** -text
+# Fixtures and playground are compared/inspected byte-for-byte; never normalize line endings.
+fixtures/** -text
+playground/** -text
