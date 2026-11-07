@@ -5,4 +5,5 @@ pub mod bundles;
 pub mod discover;
 pub mod encoding;
 pub mod file;
+pub mod fingerprint;
 pub mod lines;

@@ -6,9 +6,23 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::TempDir;
-use disk::encoding::{DecodeError, Encoding};
-use disk::file::{ReadError, read_file, write_file};
+use disk::encoding::{DecodeError, Decoded, Encoding};
+use disk::file::{ReadError, WriteError};
 use disk::lines::{Line, split_lines};
+
+// These tests are about content. The fingerprint part of the API is specified in
+// `fingerprint.rs`, so here it is dropped (read) and not requested (write).
+fn read_file(path: &Path, hint: Option<Encoding>) -> Result<Decoded, ReadError> {
+    disk::file::read_file(path, hint).map(|loaded| loaded.decoded)
+}
+
+fn write_file(path: &Path, encoding: Encoding, lines: &[Line<'_>]) -> std::io::Result<()> {
+    match disk::file::write_file(path, encoding, lines, None) {
+        Ok(_) => Ok(()),
+        Err(WriteError::Io(e)) => Err(e),
+        Err(other) => panic!("unexpected {other:?} without an expected fingerprint"),
+    }
+}
 
 fn fixtures(rel: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
