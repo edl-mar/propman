@@ -1,47 +1,13 @@
 //! Specification of file discovery (see `disk::discover`).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+mod common;
 
+use std::path::{Path, PathBuf};
+
+use common::TempDir;
 use disk::discover::{DiscoverOptions, Discovery, discover};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// A fresh directory below the system temp dir, removed on drop (no extra dependency).
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "propman-disk-discover-{}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::SeqCst)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-
-    fn touch(&self, rel: &str) {
-        let path = self.0.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"").unwrap();
-    }
-
-    fn mkdir(&self, rel: &str) {
-        std::fs::create_dir_all(self.0.join(rel)).unwrap();
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn recursive() -> DiscoverOptions {
     DiscoverOptions { recursive: true }
