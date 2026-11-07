@@ -1,0 +1,2 @@
+# Test data is compared byte-for-byte; never normalize line endings.
+testdata/** -text
