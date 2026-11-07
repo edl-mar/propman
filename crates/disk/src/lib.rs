@@ -4,4 +4,5 @@ pub mod atomic;
 pub mod bundles;
 pub mod discover;
 pub mod encoding;
+pub mod file;
 pub mod lines;
