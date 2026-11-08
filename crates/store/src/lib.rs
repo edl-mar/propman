@@ -7,4 +7,4 @@ mod store;
 
 pub use pools::{BytesId, PathId, TextId};
 pub use raw::{BundleId, FileId};
-pub use store::{BundleAssignment, FileInput, LineInput, LineView, Store, StoreEdit};
+pub use store::{BundleAssignment, FileInput, FileReload, LineInput, LineView, Store, StoreEdit};

@@ -5,7 +5,9 @@
 use std::path::Path;
 
 use store::history::{EditId, EditKind, Source};
-use store::{BundleAssignment, BundleId, FileId, FileInput, LineInput, Store, StoreEdit};
+use store::{
+    BundleAssignment, BundleId, FileId, FileInput, FileReload, LineInput, Store, StoreEdit,
+};
 use types::{Confidence, Encoding, Fingerprint, LineEnding};
 
 use LineEnding::{Cr, CrLf, Lf, None as NoEnd};
@@ -703,4 +705,308 @@ fn the_assignment_as_a_value_is_comparable() {
     let b: BundleAssignment = store.file_assignment(second).unwrap();
     // the same bundle, the same locale text, the same confidence
     assert_eq!(a, b);
+}
+
+// ── Reload: a new snapshot of the disk ───────────────────────────────────────
+
+/// What `app` does after it read a file again.
+fn reload(
+    store: &mut Store,
+    file: FileId,
+    bytes: &[u8],
+    encoding: Encoding,
+    lines: &[(&str, LineEnding)],
+) -> (bool, EditId) {
+    let lines: Vec<LineInput<'_>> = lines
+        .iter()
+        .map(|&(content, ending)| LineInput { content, ending })
+        .collect();
+    let input = FileReload {
+        bytes,
+        encoding,
+        fingerprint: fingerprint(bytes),
+        lines: &lines,
+    };
+    edit_as(store, EditKind::Reload, DISK, |e| {
+        e.reload_file(file, input)
+    })
+}
+
+fn contents(store: &Store, file: FileId) -> Vec<(String, LineEnding)> {
+    store
+        .file_lines(file)
+        .iter()
+        .map(|l| (l.content.to_owned(), l.ending))
+        .collect()
+}
+
+fn snapshot_contents(store: &Store, file: FileId, snapshot: usize) -> Vec<String> {
+    store
+        .file_lines_in_snapshot(file, snapshot)
+        .iter()
+        .map(|l| l.content.to_owned())
+        .collect()
+}
+
+#[test]
+fn a_new_file_has_one_snapshot() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).lines(&[("a=1", Lf), ("b=2", Lf)]),
+    );
+    assert_eq!(store.snapshots(file), 1);
+    assert_eq!(snapshot_contents(&store, file, 0), ["a=1", "b=2"]);
+    assert!(store.file_lines_in_snapshot(file, 1).is_empty());
+}
+
+#[test]
+fn a_reload_that_finds_the_same_disk_changes_nothing() {
+    let mut store = Store::new();
+    let spec = Spec::new("p/x.properties", "x", None)
+        .bytes(b"a=1\nb=2\n")
+        .lines(&[("a=1", Lf), ("b=2", Lf)]);
+    let file = load_ok(&mut store, &spec);
+
+    let (changed, _) = reload(
+        &mut store,
+        file,
+        b"a=1\nb=2\n",
+        Encoding::Latin1,
+        &[("a=1", Lf), ("b=2", Lf)],
+    );
+
+    assert!(!changed);
+    assert_eq!(store.snapshots(file), 1);
+    assert_eq!(store.fingerprint_versions(file).len(), 1);
+    assert_eq!(store.bytes_versions(file).len(), 1);
+    assert_eq!(store.encoding_versions(file).len(), 1);
+}
+
+#[test]
+fn a_reload_with_new_content_adds_a_snapshot_and_keeps_the_old_one() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None)
+            .bytes(b"a=1\nb=2\n")
+            .lines(&[("a=1", Lf), ("b=2", Lf)]),
+    );
+
+    let (changed, _) = reload(
+        &mut store,
+        file,
+        b"a=1\nb=2\nc=3\n",
+        Encoding::Latin1,
+        &[("a=1", Lf), ("b=2", Lf), ("c=3", Lf)],
+    );
+
+    assert!(changed);
+    assert_eq!(store.snapshots(file), 2);
+    assert_eq!(
+        contents(&store, file),
+        [
+            ("a=1".to_owned(), Lf),
+            ("b=2".to_owned(), Lf),
+            ("c=3".to_owned(), Lf)
+        ]
+    );
+    assert_eq!(snapshot_contents(&store, file, 0), ["a=1", "b=2"]);
+    assert_eq!(snapshot_contents(&store, file, 1), ["a=1", "b=2", "c=3"]);
+}
+
+#[test]
+fn a_changed_order_in_the_file_is_just_another_snapshot() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).lines(&[("a=1", Lf), ("b=2", Lf), ("c=3", Lf)]),
+    );
+
+    reload(
+        &mut store,
+        file,
+        b"c=3\na=1\nb=2\n",
+        Encoding::Latin1,
+        &[("c=3", Lf), ("a=1", Lf), ("b=2", Lf)],
+    );
+
+    assert_eq!(snapshot_contents(&store, file, 1), ["c=3", "a=1", "b=2"]);
+    assert_eq!(snapshot_contents(&store, file, 0), ["a=1", "b=2", "c=3"]);
+    assert_eq!(store.file_lines(file)[0].content, "c=3");
+}
+
+#[test]
+fn a_change_of_only_a_line_ending_is_a_change() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).lines(&[("a=1", Lf)]),
+    );
+    let (changed, _) = reload(
+        &mut store,
+        file,
+        b"a=1\r\n",
+        Encoding::Latin1,
+        &[("a=1", CrLf)],
+    );
+    assert!(changed);
+    assert_eq!(store.snapshots(file), 2);
+    assert_eq!(store.file_lines(file)[0].ending, CrLf);
+}
+
+#[test]
+fn a_reload_replaces_bytes_and_fingerprint_and_keeps_the_old_ones() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).bytes(b"a=1\n"),
+    );
+
+    reload(&mut store, file, b"a=2\n", Encoding::Latin1, &[("a=2", Lf)]);
+
+    assert_eq!(store.file_bytes(file), Some(&b"a=2\n"[..]));
+    assert_eq!(store.file_fingerprint(file), Some(fingerprint(b"a=2\n")));
+    let bytes = store.bytes_versions(file);
+    assert_eq!(bytes.len(), 2);
+    assert_eq!(store.bytes(bytes[0].value), Some(&b"a=1\n"[..]));
+    assert_eq!((bytes[1].source, bytes[1].kind), (DISK, EditKind::Reload));
+    let fingerprints = store.fingerprint_versions(file);
+    assert_eq!(fingerprints.len(), 2);
+    assert_eq!(fingerprints[0].value, fingerprint(b"a=1\n"));
+}
+
+#[test]
+fn everything_a_reload_brings_belongs_to_one_edit() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).encoding(Encoding::Latin1),
+    );
+
+    let (_, edit) = reload(&mut store, file, b"a=2\n", Encoding::Utf8, &[("a=2", Lf)]);
+
+    assert_eq!(store.bytes_versions(file)[1].edit, edit);
+    assert_eq!(store.fingerprint_versions(file)[1].edit, edit);
+    assert_eq!(store.encoding_versions(file)[1].edit, edit);
+}
+
+#[test]
+fn a_reload_keeps_the_encoding_the_user_chose() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).encoding(Encoding::Latin1),
+    );
+    user(&mut store, |e| e.set_encoding(file, Encoding::Utf8));
+
+    // the disk is now detected as Windows-1252
+    reload(
+        &mut store,
+        file,
+        b"a=2\n",
+        Encoding::Windows1252,
+        &[("a=2", Lf)],
+    );
+
+    assert_eq!(store.file_encoding(file), Some(Encoding::Utf8));
+    assert_eq!(store.encoding_base(file, DISK), Some(Encoding::Windows1252));
+    let sources: Vec<(Encoding, Source)> = store
+        .encoding_versions(file)
+        .iter()
+        .map(|v| (v.value, v.source))
+        .collect();
+    assert_eq!(
+        sources,
+        [
+            (Encoding::Latin1, DISK),
+            (Encoding::Utf8, USER),
+            (Encoding::Windows1252, DISK),
+            (Encoding::Utf8, USER),
+        ]
+    );
+}
+
+#[test]
+fn a_reload_that_detects_the_same_encoding_leaves_the_choice_of_the_user() {
+    let mut store = Store::new();
+    let file = load_ok(
+        &mut store,
+        &Spec::new("p/x.properties", "x", None).encoding(Encoding::Latin1),
+    );
+    user(&mut store, |e| e.set_encoding(file, Encoding::Utf8));
+
+    reload(&mut store, file, b"a=2\n", Encoding::Latin1, &[("a=2", Lf)]);
+
+    assert_eq!(store.file_encoding(file), Some(Encoding::Utf8));
+    assert_eq!(store.encoding_versions(file).len(), 2);
+}
+
+#[test]
+fn a_reload_leaves_the_assignment_alone() {
+    let mut store = Store::new();
+    let file = load_ok(&mut store, &Spec::new("p/m_de.properties", "m", Some("de")));
+    let before = store.file_assignment(file);
+
+    reload(&mut store, file, b"a=2\n", Encoding::Latin1, &[("a=2", Lf)]);
+
+    assert_eq!(store.file_assignment(file), before);
+    assert_eq!(store.assignment_versions(file).len(), 1);
+}
+
+#[test]
+fn a_reload_does_not_touch_other_files() {
+    let mut store = Store::new();
+    let first = load_ok(
+        &mut store,
+        &Spec::new("p/a.properties", "a", None).lines(&[("x=1", Lf)]),
+    );
+    let second = load_ok(
+        &mut store,
+        &Spec::new("p/b.properties", "b", None).lines(&[("y=2", Lf)]),
+    );
+
+    reload(
+        &mut store,
+        first,
+        b"x=9\n",
+        Encoding::Latin1,
+        &[("x=9", Lf)],
+    );
+
+    assert_eq!(snapshot_contents(&store, second, 0), ["y=2"]);
+    assert_eq!(store.snapshots(second), 1);
+    assert_eq!(store.fingerprint_versions(second).len(), 1);
+}
+
+#[test]
+fn a_reload_of_an_unknown_file_changes_nothing() {
+    let mut store = Store::new();
+    let own = load_ok(&mut store, &Spec::new("p/m.properties", "m", None));
+
+    let mut other = Store::new();
+    let foreign = load_ok(&mut other, &Spec::new("q/n.properties", "n", None));
+
+    let (changed, _) = reload(
+        &mut store,
+        foreign,
+        b"z=1\n",
+        Encoding::Utf8,
+        &[("z=1", Lf)],
+    );
+
+    assert!(!changed);
+    assert_eq!(store.snapshots(own), 1);
+    assert_eq!(store.file_encoding(own), Some(Encoding::Latin1));
+}
+
+#[test]
+fn the_snapshots_of_an_unknown_file_are_empty() {
+    let store = Store::new();
+    let mut other = Store::new();
+    let foreign = load_ok(&mut other, &Spec::new("q/n.properties", "n", None));
+    assert_eq!(store.snapshots(foreign), 0);
+    assert!(store.file_lines_in_snapshot(foreign, 0).is_empty());
+    assert!(store.bytes_versions(foreign).is_empty());
+    assert!(store.fingerprint_versions(foreign).is_empty());
 }

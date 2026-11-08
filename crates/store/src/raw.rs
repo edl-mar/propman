@@ -22,9 +22,9 @@ use std::path::Path;
 use columns::{Generation, Idx};
 use types::{Confidence, Encoding, Fingerprint, LineEnding};
 
-use crate::history::{Column, Journal, Policy, Restorable, Source, Version};
+use crate::history::{Column, Journal, Policy, ReloadOutcome, Restorable, Source, Version};
 use crate::pools::{BytesId, PathId, Pools, TextId};
-use crate::store::{BundleAssignment, Ctx, FileInput, LineView};
+use crate::store::{BundleAssignment, Ctx, FileInput, FileReload, LineView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
@@ -201,6 +201,69 @@ impl Raw {
         Some(id)
     }
 
+    /// Brings what the disk says about a file as a new snapshot. The lines get a new span only
+    /// if they differ from the current ones. Returns whether anything was appended.
+    pub(crate) fn reload_file(
+        &mut self,
+        ctx: &mut Ctx<'_, '_>,
+        file: FileId,
+        input: FileReload<'_>,
+    ) -> bool {
+        let Some(current) = self.file_lines.current(file) else {
+            return false;
+        };
+        let mut changed = false;
+
+        let lines: Vec<(TextId, LineEnding)> = input
+            .lines
+            .iter()
+            .map(|line| (ctx.pools.add_text(line.content), line.ending))
+            .collect();
+        if !self.same_lines(current, &lines) {
+            let first = self.line_content.len();
+            for &(content, ending) in &lines {
+                let content_index = self.line_content.push_row(ctx.edit, content);
+                let ending_index = self.line_ending.push_row(ctx.edit, ending);
+                debug_assert_eq!(content_index, ending_index);
+            }
+            let span = LineSpan {
+                first,
+                len: lines.len(),
+            };
+            let outcome = ctx.edit.reload(&mut self.file_lines, file, span);
+            changed |= outcome != ReloadOutcome::Unchanged;
+        }
+
+        // every column is reloaded, so none is skipped by a short circuit
+        let bytes = ctx.pools.add_bytes(input.bytes);
+        changed |= ctx.edit.reload(&mut self.file_bytes, file, bytes) != ReloadOutcome::Unchanged;
+        changed |= ctx
+            .edit
+            .reload(&mut self.file_fingerprint, file, input.fingerprint)
+            != ReloadOutcome::Unchanged;
+        changed |= ctx
+            .edit
+            .reload(&mut self.file_encoding, file, input.encoding)
+            != ReloadOutcome::Unchanged;
+        changed
+    }
+
+    /// Whether the rows of a span hold exactly these lines.
+    fn same_lines(&self, span: LineSpan, lines: &[(TextId, LineEnding)]) -> bool {
+        span.len == lines.len()
+            && lines
+                .iter()
+                .enumerate()
+                .all(|(offset, &(content, ending))| {
+                    let line = LineId {
+                        generation: self.generation(),
+                        index: span.first + offset,
+                    };
+                    self.line_content.current(line) == Some(content)
+                        && self.line_ending.current(line) == Some(ending)
+                })
+    }
+
     pub(crate) fn set_encoding(
         &mut self,
         ctx: &mut Ctx<'_, '_>,
@@ -303,9 +366,43 @@ impl Raw {
 
     /// The lines of the current span of a file, in order.
     pub(crate) fn file_lines<'a>(&self, pools: &'a Pools, file: FileId) -> Vec<LineView<'a>> {
-        let Some(span) = self.file_lines.current(file) else {
-            return Vec::new();
-        };
+        match self.file_lines.current(file) {
+            Some(span) => self.lines_of(pools, span),
+            None => Vec::new(),
+        }
+    }
+
+    /// The lines of a snapshot: 0 is the first load, the last is the current one.
+    pub(crate) fn file_lines_in_snapshot<'a>(
+        &self,
+        journal: &Journal,
+        pools: &'a Pools,
+        file: FileId,
+        snapshot: usize,
+    ) -> Vec<LineView<'a>> {
+        match self.file_lines.versions(journal, file).get(snapshot) {
+            Some(version) => self.lines_of(pools, version.value),
+            None => Vec::new(),
+        }
+    }
+
+    pub(crate) fn snapshots(&self, journal: &Journal, file: FileId) -> usize {
+        self.file_lines.versions(journal, file).len()
+    }
+
+    pub(crate) fn bytes_versions(&self, journal: &Journal, file: FileId) -> Vec<Version<BytesId>> {
+        self.file_bytes.versions(journal, file)
+    }
+
+    pub(crate) fn fingerprint_versions(
+        &self,
+        journal: &Journal,
+        file: FileId,
+    ) -> Vec<Version<Fingerprint>> {
+        self.file_fingerprint.versions(journal, file)
+    }
+
+    fn lines_of<'a>(&self, pools: &'a Pools, span: LineSpan) -> Vec<LineView<'a>> {
         (span.first..span.first + span.len)
             .filter_map(|index| {
                 let line = LineId {

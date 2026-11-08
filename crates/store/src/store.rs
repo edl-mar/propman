@@ -63,6 +63,16 @@ pub struct FileInput<'a> {
     pub confidence: Confidence,
 }
 
+/// What the disk says about a file that is already in the store, after it was read again.
+#[derive(Debug, Clone, Copy)]
+pub struct FileReload<'a> {
+    pub bytes: &'a [u8],
+    /// The encoding that was detected, or used to read the file.
+    pub encoding: Encoding,
+    pub fingerprint: Fingerprint,
+    pub lines: &'a [LineInput<'a>],
+}
+
 /// What an operation of a unit needs besides its own tables: the edit it belongs to and the
 /// pools.
 pub(crate) struct Ctx<'a, 'j> {
@@ -205,6 +215,26 @@ impl Store {
         self.raw.encoding_base(&self.journal, file, source)
     }
 
+    /// How many snapshots of its lines a file has: one for every load that brought different
+    /// lines. The last one is the current one.
+    pub fn snapshots(&self, file: FileId) -> usize {
+        self.raw.snapshots(&self.journal, file)
+    }
+
+    /// The lines of an older or the current snapshot; empty for an unknown snapshot or file.
+    pub fn file_lines_in_snapshot(&self, file: FileId, snapshot: usize) -> Vec<LineView<'_>> {
+        self.raw
+            .file_lines_in_snapshot(&self.journal, &self.pools, file, snapshot)
+    }
+
+    pub fn bytes_versions(&self, file: FileId) -> Vec<Version<BytesId>> {
+        self.raw.bytes_versions(&self.journal, file)
+    }
+
+    pub fn fingerprint_versions(&self, file: FileId) -> Vec<Version<Fingerprint>> {
+        self.raw.fingerprint_versions(&self.journal, file)
+    }
+
     /// Whether the encoding or the assignment of a file differs from the base of `source`.
     pub fn file_is_dirty(&self, file: FileId, source: Source) -> bool {
         self.raw.file_is_dirty(&self.journal, file, source)
@@ -295,6 +325,18 @@ impl StoreEdit<'_> {
             pools: &mut *self.pools,
         };
         self.raw.mark_bundle_saved(&mut ctx, bundle)
+    }
+
+    /// Brings what the disk says about a file as a new snapshot: the bytes, the fingerprint,
+    /// the lines and the detected encoding, all from the source `DISK`. The assignment is not
+    /// touched. Returns whether anything changed: false for an unknown file or if the disk says
+    /// the same as before.
+    pub fn reload_file(&mut self, file: FileId, input: FileReload<'_>) -> bool {
+        let mut ctx = Ctx {
+            edit: &mut self.edit,
+            pools: &mut *self.pools,
+        };
+        self.raw.reload_file(&mut ctx, file, input)
     }
 
     /// Restores what the edit `target` changed.
