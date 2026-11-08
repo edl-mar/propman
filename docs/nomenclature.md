@@ -52,6 +52,9 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | conflict | Konflikt | Both sides changed in a column with the policy `Conflict`. A derived state, never stored. |
 | restore, undo | wiederherstellen, zurücknehmen | Both only append. Restore repeats one old value; undo repeats what an edit had changed. |
 | pool | Pool | Append-only storage with deduplication and stable ids for large values (bytes, text, paths). |
+| unit | Einheit | A self-contained area of the store with its own tables and guarantees, for example the raw unit. A guarantee between units belongs to the store. |
+| raw unit | Rohdatei-Einheit | The unit that represents what is on the disk, with its interpretation. Only ever filled from the disk; the user does not edit it. |
+| bundle assignment | Zuordnung | The value that says which bundle and locale a file belongs to, with the confidence. |
 | generation | Generation | The number of a store, carried by every id. An id from another generation gives `None`. |
 
 ## Informal words

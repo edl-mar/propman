@@ -6,6 +6,63 @@ not authoritative.
 
 ## Decisions
 
+### The raw unit: what is on the disk, one way in (2026-11-08)
+The raw unit (`store::raw`, a module of the crate `store`) represents what is on the disk, with
+its interpretation (encoding, line ending, bundle assignment). It is read-only for the user: it
+is only ever filled from the disk (load, reload). There is **one** mutable model, the fragments
+and entries of a later unit, which refers to the raw lines; the raw lines themselves are never
+edited. This avoids two models kept in sync, which was the cause of the save bugs of v1.
+
+Saving will assemble the file from the fragments: an untouched fragment gives back its original
+raw lines unchanged (bytes, line endings, indentation, continuation lines), a changed one is
+built again, keeping the separator and the white space. For later, as an invariant to test: the
+fragments of a file split its lines without loss, so assembling without any change gives the
+same bytes. The raw lines also remain the basis for the line diff after a structural change on
+the disk and for reinterpreting a file with another encoding. Inserting and reordering are
+operations of the fragments, not of the raw lines, so a raw line has no position of its own:
+the order of the lines of a file is the order in which they were created.
+
+Until entries exist, the store offers no operation that changes raw lines for the user, and
+saving a file writes its raw lines unchanged (in the chosen encoding).
+
+### The first data model: three tables in the raw unit (2026-11-08)
+| Table (id) | Column | Value |
+|---|---|---|
+| Bundle (`BundleId`) | `folder` | `PathId` |
+| | `name` | `TextId` |
+| | `excluded` | `bool` (initial `false`) |
+| File (`FileId`) | `path` | `PathId` (where it was found) |
+| | `assignment` | `BundleAssignment` |
+| | `encoding` | `Encoding` |
+| | `fingerprint` | `Fingerprint` |
+| | `bytes` | `BytesId` (the original bytes) |
+| Line (`LineId`) | `file` | `FileId` |
+| | `content` | `TextId` (without the line ending) |
+| | `ending` | `LineEnding` |
+
+- All columns are history columns, also those that never change; the identity columns just never
+  get a second version.
+- `BundleAssignment` is one value: the bundle, the locale (`Option<TextId>`) and the confidence.
+  They always change together, and a confirmation by the user changes only the confidence,
+  which counts as a deviation.
+- The original bytes are stored from the start (in the byte pool). `disk::Loaded` therefore has
+  to return the raw bytes as well.
+- A table creates its row once for all its columns, in one method (`add_file`, `add_line`,
+  `add_bundle`). Loading a file is one edit of the kind `Load` that creates the file and all its
+  lines.
+- The unit guards its own invariants: a bundle is unique by (folder, name) and `add_bundle`
+  returns the existing one; the assignment of a file refers to an existing bundle of the same
+  generation; the lines of a file are created with the file. Guarantees between units belong to
+  the `Store`.
+- The pools are owned by the `Store` and shared by all units, so equal text has the same id
+  everywhere. Operations of a unit get the edit and the pools together in a small context.
+- The columns are private. `app` only sees the `Store`: reading methods, and writing through a
+  store level edit with fixed operations (add a file, set the encoding, set the assignment,
+  exclude a bundle, reload, mark saved, undo). There is no way past the invariants, and the
+  visibility tricks of the draft sketches are not needed.
+- The bundle lives in the raw unit as long as it only groups files. When the tree comes, it
+  refers to the `BundleId` of the raw unit.
+
 ### The store: one history per value, sources on edits (2026-11-08)
 This replaces the earlier split into facts and choices; both live in the same history now.
 - **Values.** Every value is a column of small, trivially copyable entries (ids, enums, flags).
@@ -194,11 +251,11 @@ TOML dependency are open; ask before adding a dependency. Concurrent writers can
 `atomic_write` and the fingerprint.
 
 ### History and the store: what is open
-- **Shape of tables and IDs.** `main17.rs` and `blueprint_v3.rs` (drafts) were experiments about
+- **Shape of tables.** `main17.rs` and `blueprint_v3.rs` (drafts) were experiments about
   *visibility* (owner in a private module, reader, writer), not about how the data is stored.
-  Row or column (SoA) storage, the integer types of the ids, the interface through which `app`
-  writes without breaking invariants, and a macro for tables are open. Lines probably become
-  rows of their own, each with its own history.
+  The tables of the raw unit are decided (see above). Still open: a macro for tables, to be
+  considered after the second or third hand written table, and the fragment model with its own
+  order of lines.
 - **Concept notes in the drafts** (`propman-v2-architektur.md`: version stack per row, edits,
   saving as atomic write followed by a rebuild from disk with domain-stable identity, string
   pool; `propman-architecture-notes.md`: a fragment model in which comments and blank lines are
