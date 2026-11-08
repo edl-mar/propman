@@ -6,6 +6,32 @@ not authoritative.
 
 ## Decisions
 
+### The bundle overview: the first view (2026-11-08)
+- **A flat list, always expanded, with three kinds of items:** a folder, below it its bundles,
+  below each bundle its files. The path of a folder is shown once, relative to the opened folder
+  (`.` for the folder itself) and cut from the left if it is too long, so that its end stays
+  visible. This tells apart two bundles with the same name in different folders (for example
+  `src` and `target`), and it is where an action on a whole folder can attach later.
+- **What an item shows.** Folder: the path and the number of bundles. Bundle: the name, the
+  number of files, `[excluded]` if it is excluded. File: the locale or `(default)`, the file name,
+  the encoding (`UTF-8`, `UTF-8+BOM`, `Windows-1252`, `Latin-1`) and the number of lines.
+- **Marks, never by colour alone:** `>` for the selected item (and reversed), `?` for an uncertain
+  file (and yellow), `[excluded]` for an excluded bundle (and dimmed). The colours are
+  decoration and are not tested.
+- **The list is a pure function of the session** (`app::overview`), as plain values with the text
+  already resolved, so that a view only draws. Sorted by folder path, then bundle name; in a
+  bundle the default file first, then the locales in alphabetical order. A file belongs to the
+  bundle of its current assignment.
+- **Selection and scroll position are indices in the state.** The height of the visible part
+  arrives as a message from the event loop, at the start and whenever the terminal changes its
+  size, because only the terminal knows it. The scroll position moves as little as possible to
+  keep the selection visible. A page is as many items as fit, or one item while the height is
+  unknown. The selection stops at the ends. An index is enough while the list does not reorder;
+  with reload and moving files the selection can hold an id instead (a stale id gives `None`).
+- **Keys:** `j` and `k` or the arrows, page up and page down, home and end.
+- **The view enum exists from now on** with one variant, so that the next view is only another
+  variant. `Session::exclude_bundle` exists; the key for it comes with the first operations.
+
 ### The user interface: structure and the first slice (2026-11-08)
 The structure is inspired by The Elm Architecture (message, update, view), not a strict copy.
 The state, the messages and `update` live in `app` (no terminal crate); the views, the mapping of
