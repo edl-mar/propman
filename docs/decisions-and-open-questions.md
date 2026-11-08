@@ -57,6 +57,21 @@ This replaces the earlier split into facts and choices; both live in the same hi
 - Order of work: first as a specification in tests (loading with layers, reload with precedence,
   reload with conflict, saving with a marker), before the data layout is fixed.
 
+### Generic building blocks in `columns`, the rules in `store` (2026-11-08)
+`columns` holds what is free of the domain:
+- `Idx`: an id gives its index, but cannot be made from one; only the owner of a table creates
+  its ids.
+- `HistoryColumn<Id, T, M>`: rows with an append-only stack of versions; each version holds a
+  value and a small piece of metadata `M`. Operations: add a row, append, current value, all
+  versions, access by reference, and "the latest version whose metadata matches".
+- Pools (later).
+- A reference to a value is generic: `VersionRef<Id>`, an id with a version number.
+
+`store` holds what is specific to propman: sources, edit kinds, the journal, the rules
+(precedence, conflict, markers, reload) and the typed ids of its tables. Several columns of one
+table share one id type, and a row is created once per table. The first version of
+`store::history` mixes both levels to specify the rules and is split afterwards.
+
 ### Shared value types live in a small crate `types` (2026-11-08)
 `disk` and `store` must not know each other, but `store` has to keep the encoding, the line
 endings, the confidence and the fingerprint to save a file again. They are defined once in the
