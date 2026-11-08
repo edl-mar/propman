@@ -157,12 +157,11 @@ pub fn render(state: &AppState, frame: &mut Frame) {
         title,
     );
 
-    let store = session.store();
     frame.render_widget(
         Paragraph::new(format!(
             "{} in {}",
-            counted(store.files().len(), "file", "files"),
-            counted(store.bundles().len(), "bundle", "bundles"),
+            counted(session.file_count(), "file", "files"),
+            counted(session.bundle_count(), "bundle", "bundles"),
         )),
         count,
     );

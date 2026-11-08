@@ -120,9 +120,18 @@ impl Session {
         &self.root
     }
 
-    /// The data, for reading.
+    /// The data, for reading. Views do not use it; they get what they show from `overview` and
+    /// the counts below.
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.store.files().len()
+    }
+
+    pub fn bundle_count(&self) -> usize {
+        self.store.bundles().len()
     }
 
     /// The user chooses the encoding of a file. Returns whether it changed anything.

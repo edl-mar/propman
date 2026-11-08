@@ -43,6 +43,15 @@ fn open_loads_every_properties_file_below_the_folder() {
 }
 
 #[test]
+fn the_session_counts_its_files_and_bundles_for_the_views() {
+    let dir = project();
+    let session = open(&dir);
+    assert_eq!(session.file_count(), session.store().files().len());
+    assert_eq!(session.bundle_count(), session.store().bundles().len());
+    assert_eq!(session.file_count(), 17);
+}
+
+#[test]
 fn files_are_grouped_into_bundles_by_folder_and_name() {
     let dir = project();
     let session = open(&dir);
