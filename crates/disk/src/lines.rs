@@ -4,24 +4,7 @@
 //! Only the last line may have `LineEnding::None`. Content never contains `\r` or `\n`.
 //! Knows nothing about keys, values, continuation lines, encodings or BOMs.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineEnding {
-    None,
-    Lf,
-    Cr,
-    CrLf,
-}
-
-impl LineEnding {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LineEnding::None => "",
-            LineEnding::Lf => "\n",
-            LineEnding::Cr => "\r",
-            LineEnding::CrLf => "\r\n",
-        }
-    }
-}
+pub use types::LineEnding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Line<'a> {

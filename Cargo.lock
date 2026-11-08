@@ -18,6 +18,7 @@ version = "0.1.0"
 name = "disk"
 version = "0.1.0"
 dependencies = [
+ "types",
  "walkdir",
 ]
 
@@ -51,6 +52,10 @@ version = "0.1.0"
 dependencies = [
  "app",
 ]
+
+[[package]]
+name = "types"
+version = "0.1.0"
 
 [[package]]
 name = "walkdir"

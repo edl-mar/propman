@@ -51,11 +51,7 @@ const COUNTRIES: &str = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB B
 /// `lang[_script][_COUNTRY[_variant]]` has at most four parts.
 const MAX_SUFFIX_PARTS: usize = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Confidence {
-    Certain,
-    Uncertain,
-}
+pub use types::Confidence;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Classified {

@@ -7,4 +7,5 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+types = { path = "../types" }
 walkdir.workspace = true

@@ -5,14 +5,7 @@
 //! unchanged file writes the original bytes back.
 //! Pure functions on bytes: no file access, no line handling, no `\uXXXX` parsing.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Encoding {
-    Utf8,
-    /// UTF-8 with a leading BOM. The BOM is not part of the decoded text.
-    Utf8Bom,
-    Windows1252,
-    Latin1,
-}
+pub use types::Encoding;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decoded {

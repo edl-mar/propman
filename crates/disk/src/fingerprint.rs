@@ -14,16 +14,8 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::SystemTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Fingerprint {
-    pub len: u64,
-    /// `None` if the platform cannot report it.
-    pub modified: Option<SystemTime>,
-    /// `hash_bytes` of the raw bytes, including a BOM.
-    pub hash: u64,
-}
+pub use types::Fingerprint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Check {
