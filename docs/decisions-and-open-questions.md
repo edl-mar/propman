@@ -17,11 +17,13 @@ This replaces the earlier split into facts and choices; both live in the same hi
   numbers. Pools are generic and free of the domain (in `columns`); the store instantiates them.
   The original bytes of a file in the byte pool are the likely answer to "reinterpret with unsaved
   changes"; that is decided together with the lines.
-- **Sources.** Every version belongs to an edit, and every edit has a kind and a **source**:
-  the disk, a settings layer (shared, local) or the user. A value comes from outside by an edit
-  of its source (loading the disk, reading a settings file, a reload) or from the user. Layers
-  are data (an ordered list of sources), so profiles later mean more sources, not a new
-  structure, and the store does not hold the form of the settings.
+- **Sources.** Every version belongs to an edit (which has a kind) and carries a **source**:
+  the disk, a settings layer (shared, local) or the user. That is normally the source of its
+  edit; only a version that a reload appends again for a higher ranked source carries that
+  source, so the source is kept per version. A value comes from outside by an edit of its source
+  (loading the disk, reading a settings file, a reload) or from the user. Layers are data (an
+  ordered list of sources), so profiles later mean more sources, not a new structure, and the
+  store does not hold the form of the settings.
 - **Base is a query**, not stored: "the latest version from source S" (the disk, the shared file,
   the local file), falling back to version 0. What goes into a settings file is the deviation
   from the base below that layer, computed in `app`. There are no separate base histories.
@@ -29,13 +31,19 @@ This replaces the earlier split into facts and choices; both live in the same hi
   edit kind save, so that the base query reflects what was written. A reload that finds nothing
   new appends nothing, because the value of the base stays the same.
 - **Precedence versus order.** The history is chronological; the effective value follows the
-  rank disk < shared < local < user. An edit that appends a version from a lower ranked source
-  (a reload) appends the latest value of each higher ranked source again if it differs from the
-  current value, so the highest ranked source wins.
+  rank disk < shared < local < user. A reload appends the new disk value and then, if the
+  highest ranked source that has a version holds a different value, appends that value again.
+  Only the highest ranked source is needed: effective values and bases stay the same without
+  redundant versions.
 - **Reload rule, fixed per column.** *Precedence*: an outside value never beats a higher ranked
   one (encoding, bundle assignment). *Conflict*: if both sides changed, the user decides (lines,
   later entry values). If only one side changed, that change is taken automatically in both
   cases. Automatic resolutions are ordinary edits: visible and undoable.
+- **A conflict is derived, never stored.** While it is unresolved the external value is the
+  current one and the user's version sits one step back; any later version from another source
+  resolves it, by restoring either side (restoring always appends, even an equal value, because
+  it records the decision; setting the current value again appends nothing). A further external
+  change does not hide an unresolved conflict.
 - **IDs** carry the generation number of the store, and lookups return `Option`: a stale id gives
   `None`, so "ids do not survive a rebuild" is enforced by the type and not only by discipline.
   The integer types are a detail.
@@ -182,6 +190,10 @@ TOML dependency are open; ask before adding a dependency. Concurrent writers can
   addressable units). Not authoritative and partly outdated (see their headers).
 - **Structural conflicts** (a key renamed or split outside): not solvable on the level of values.
   `propman-v2-konfliktaufloesung.md` sketches a line diff and a manual way out; open.
+
+### Saving a value that is in conflict
+The draft notes block saving exactly the affected entries while a conflict is unresolved (not
+the whole file, no OS file lock). Not decided; it belongs to the conflict UI.
 
 ### Saving into a layer can be shadowed
 If the user may choose where a setting is saved, saving into the shared file while the local file
