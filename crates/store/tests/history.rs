@@ -1,8 +1,9 @@
 //! Specification of the history rules (see `store::history`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use columns::{Generation, Idx};
 use store::history::{
-    Column, EditId, EditKind, Journal, Policy, ReloadOutcome, Restorable, Row, Source, Status,
+    Column, EditId, EditKind, Journal, Policy, ReloadOutcome, Restorable, Source, Status,
 };
 
 /// A stand-in for a value that the disk can detect and the user can force.
@@ -15,6 +16,20 @@ enum Enc {
 }
 use Enc::{Latin1, Utf8, Utf8Bom, Win1252};
 
+/// The id of a row, made by the owner of the table (here: the tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowId(Generation, usize);
+
+impl Idx for RowId {
+    fn idx(self) -> usize {
+        self.1
+    }
+
+    fn generation(self) -> Generation {
+        self.0
+    }
+}
+
 const DISK: Source = Source::DISK;
 const SHARED: Source = Source::SHARED;
 const LOCAL: Source = Source::LOCAL;
@@ -22,29 +37,29 @@ const USER: Source = Source::USER;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn precedence() -> (Journal, Column<Enc>) {
+fn precedence() -> (Journal, Column<RowId, Enc>) {
     let mut journal = Journal::new();
-    let column = journal.column::<Enc>(Policy::Precedence);
+    let column = journal.column::<RowId, Enc>(Policy::Precedence);
     (journal, column)
 }
 
-fn conflict() -> (Journal, Column<&'static str>) {
+fn conflict() -> (Journal, Column<RowId, &'static str>) {
     let mut journal = Journal::new();
-    let column = journal.column::<&'static str>(Policy::Conflict);
+    let column = journal.column::<RowId, &'static str>(Policy::Conflict);
     (journal, column)
 }
 
-fn load<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, value: T) -> Row {
+fn load<T: Copy + Eq>(j: &mut Journal, c: &mut Column<RowId, T>, value: T) -> RowId {
     let mut edit = j.edit(EditKind::Load, DISK);
-    let row = c.add_row(&mut edit, value);
+    let index = c.push_row(&mut edit, value);
     edit.commit();
-    row
+    RowId(c.generation(), index)
 }
 
 fn write<T: Copy + Eq>(
     j: &mut Journal,
-    c: &mut Column<T>,
-    row: Row,
+    c: &mut Column<RowId, T>,
+    row: RowId,
     value: T,
     kind: EditKind,
     source: Source,
@@ -54,25 +69,45 @@ fn write<T: Copy + Eq>(
     edit.commit()
 }
 
-fn user_sets<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, row: Row, value: T) -> EditId {
+fn user_sets<T: Copy + Eq>(
+    j: &mut Journal,
+    c: &mut Column<RowId, T>,
+    row: RowId,
+    value: T,
+) -> EditId {
     write(j, c, row, value, EditKind::User, USER)
 }
 
-fn reload<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, row: Row, theirs: T) -> ReloadOutcome {
+fn reload<T: Copy + Eq>(
+    j: &mut Journal,
+    c: &mut Column<RowId, T>,
+    row: RowId,
+    theirs: T,
+) -> ReloadOutcome {
     let mut edit = j.edit(EditKind::Reload, DISK);
     let outcome = edit.reload(c, row, theirs);
     edit.commit();
     outcome
 }
 
-fn mark_saved<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, row: Row, to: Source) -> bool {
+fn mark_saved<T: Copy + Eq>(
+    j: &mut Journal,
+    c: &mut Column<RowId, T>,
+    row: RowId,
+    to: Source,
+) -> bool {
     let mut edit = j.edit(EditKind::Save, to);
     let appended = edit.mark_saved(c, row);
     edit.commit();
     appended
 }
 
-fn restore<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, row: Row, version: usize) -> bool {
+fn restore<T: Copy + Eq>(
+    j: &mut Journal,
+    c: &mut Column<RowId, T>,
+    row: RowId,
+    version: usize,
+) -> bool {
     let mut edit = j.edit(EditKind::Restore, USER);
     let found = edit.restore(c, row, version);
     edit.commit();
@@ -80,7 +115,7 @@ fn restore<T: Copy + Eq>(j: &mut Journal, c: &mut Column<T>, row: Row, version: 
 }
 
 /// The history as (value, source) pairs.
-fn trail<T: Copy + Eq>(j: &Journal, c: &Column<T>, row: Row) -> Vec<(T, Source)> {
+fn trail<T: Copy + Eq>(j: &Journal, c: &Column<RowId, T>, row: RowId) -> Vec<(T, Source)> {
     c.versions(j, row)
         .iter()
         .map(|v| (v.value, v.source))
@@ -438,8 +473,8 @@ fn a_precedence_column_never_reports_a_conflict() {
 #[test]
 fn an_edit_with_several_writes_is_undone_as_a_whole_across_columns() {
     let mut j = Journal::new();
-    let mut enc = j.column::<Enc>(Policy::Precedence);
-    let mut excluded = j.column::<bool>(Policy::Precedence);
+    let mut enc = j.column::<RowId, Enc>(Policy::Precedence);
+    let mut excluded = j.column::<RowId, bool>(Policy::Precedence);
     let enc_row = load(&mut j, &mut enc, Latin1);
     let flag_row = load(&mut j, &mut excluded, false);
 
@@ -500,7 +535,7 @@ fn the_history_only_ever_grows() {
     let (mut j, mut c) = conflict();
     let row = load(&mut j, &mut c, "a");
     let mut lengths = vec![c.versions(&j, row).len()];
-    let mut check = |j: &Journal, c: &Column<&'static str>| {
+    let mut check = |j: &Journal, c: &Column<RowId, &'static str>| {
         let len = c.versions(j, row).len();
         assert!(len >= *lengths.last().unwrap());
         lengths.push(len);

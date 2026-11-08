@@ -1,6 +1,6 @@
 //! One history per value, with the source of every change recorded.
 //!
-//! A `Column<T>` keeps, for each row, a history of versions; the current value is the last
+//! A `Column<Id, T>` keeps, for each row, a history of versions; the current value is the last
 //! one, version 0 is the initial value. Nothing is ever removed. Every version belongs to an
 //! edit (which has a kind) and carries a source (the disk, a settings layer, the user). That is
 //! normally the source of its edit; only a version that a reload appends again for a higher
@@ -24,9 +24,13 @@
 //!   append.
 //!
 //! The versions live in a `columns::HistoryColumn`; this module adds the sources, the edits and
-//! the rules on top.
+//! the rules on top. The id type is chosen by the owner of the table: a column only returns the
+//! index of a row it creates (`push_row`), and the owner makes the id from it, so that all
+//! columns of one table share that id. Every id carries a generation, and a column only knows
+//! ids of the generation of its journal.
 //!
-//! Ids carrying the generation of the store are a later step and not part of this module yet.
+//! Each column keeps its own record of what an edit touched, because only the column knows the
+//! type of its ids; `undo` of a target edit uses the records of the columns it is given.
 
 use columns::{Generation, HistoryColumn, Idx, Version as RawVersion, VersionRef};
 
@@ -61,23 +65,6 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditId(usize);
 
-/// The id of a row. It carries the generation of the journal whose column made it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Row {
-    generation: Generation,
-    index: usize,
-}
-
-impl Idx for Row {
-    fn idx(self) -> usize {
-        self.index
-    }
-
-    fn generation(self) -> Generation {
-        self.generation
-    }
-}
-
 /// The metadata of one version: the edit that created it and the source it carries.
 #[derive(Debug, Clone, Copy)]
 struct Meta {
@@ -111,27 +98,12 @@ pub struct Version<T> {
     pub kind: EditKind,
 }
 
-/// A row and the index of its last version before an edit first wrote to it.
-#[derive(Debug, Clone, Copy)]
-struct Touched {
-    column: usize,
-    row: usize,
-    before: usize,
-}
-
-#[derive(Debug)]
-struct EditRecord {
-    kind: EditKind,
-    touched: Vec<Touched>,
-}
-
-/// The log of edits; it knows the kind of each and what each one touched. It also has the
-/// generation that all its columns, and so all their row ids, belong to.
+/// The log of edits; it knows the kind of each. It also has the generation that all its
+/// columns, and so all their ids, belong to.
 #[derive(Debug)]
 pub struct Journal {
     generation: Generation,
-    edits: Vec<EditRecord>,
-    columns: usize,
+    kinds: Vec<EditKind>,
 }
 
 impl Default for Journal {
@@ -144,8 +116,7 @@ impl Journal {
     pub fn new() -> Self {
         Self {
             generation: Generation::next(),
-            edits: Vec::new(),
-            columns: 0,
+            kinds: Vec::new(),
         }
     }
 
@@ -153,23 +124,18 @@ impl Journal {
         self.generation
     }
 
-    pub fn column<T: Copy + Eq>(&mut self, policy: Policy) -> Column<T> {
-        let id = self.columns;
-        self.columns += 1;
+    pub fn column<Id: Idx, T: Copy + Eq>(&mut self, policy: Policy) -> Column<Id, T> {
         Column {
-            id,
             policy,
             versions: HistoryColumn::new(self.generation),
+            touched: Vec::new(),
         }
     }
 
     /// Every change is made through an edit, which may bundle several writes.
     pub fn edit(&mut self, kind: EditKind, source: Source) -> Edit<'_> {
-        let id = EditId(self.edits.len());
-        self.edits.push(EditRecord {
-            kind,
-            touched: Vec::new(),
-        });
+        let id = EditId(self.kinds.len());
+        self.kinds.push(kind);
         Edit {
             journal: self,
             id,
@@ -178,7 +144,7 @@ impl Journal {
     }
 
     fn kind_of(&self, edit: EditId) -> Option<EditKind> {
-        self.edits.get(edit.0).map(|record| record.kind)
+        self.kinds.get(edit.0).copied()
     }
 }
 
@@ -189,24 +155,12 @@ pub struct Edit<'j> {
 }
 
 impl Edit<'_> {
-    /// Remembers the state of a row before this edit first wrote to it, for `undo`.
-    fn touch(&mut self, column: usize, row: usize, before: usize) {
-        let touched = &mut self.journal.edits[self.id.0].touched;
-        if !touched.iter().any(|t| t.column == column && t.row == row) {
-            touched.push(Touched {
-                column,
-                row,
-                before,
-            });
-        }
-    }
-
     /// Appends a version carrying `source` and remembers the row for `undo`. Returns false if
     /// the row does not exist.
-    fn append<T: Copy + Eq>(
+    fn append<Id: Idx, T: Copy + Eq>(
         &mut self,
-        column: &mut Column<T>,
-        row: Row,
+        column: &mut Column<Id, T>,
+        row: Id,
         value: T,
         source: Source,
     ) -> bool {
@@ -220,12 +174,17 @@ impl Edit<'_> {
         if column.versions.append(row, value, meta).is_none() {
             return false;
         }
-        self.touch(column.id, row.index, before);
+        column.touch(self.id, row, before);
         true
     }
 
     /// Appends `value` unless it equals the current value. Returns whether it appended.
-    pub fn set<T: Copy + Eq>(&mut self, column: &mut Column<T>, row: Row, value: T) -> bool {
+    pub fn set<Id: Idx, T: Copy + Eq>(
+        &mut self,
+        column: &mut Column<Id, T>,
+        row: Id,
+        value: T,
+    ) -> bool {
         if column.current(row).is_none_or(|current| current == value) {
             return false;
         }
@@ -233,10 +192,10 @@ impl Edit<'_> {
     }
 
     /// Appends the value of an old version again. Returns false if there is no such version.
-    pub fn restore<T: Copy + Eq>(
+    pub fn restore<Id: Idx, T: Copy + Eq>(
         &mut self,
-        column: &mut Column<T>,
-        row: Row,
+        column: &mut Column<Id, T>,
+        row: Id,
         version: usize,
     ) -> bool {
         let Some(old) = column.versions.at(VersionRef { id: row, version }) else {
@@ -246,10 +205,10 @@ impl Edit<'_> {
     }
 
     /// Brings a value from the disk. The edit is expected to have the source `Source::DISK`.
-    pub fn reload<T: Copy + Eq>(
+    pub fn reload<Id: Idx, T: Copy + Eq>(
         &mut self,
-        column: &mut Column<T>,
-        row: Row,
+        column: &mut Column<Id, T>,
+        row: Id,
         theirs: T,
     ) -> ReloadOutcome {
         match column.base(self.journal, row, Source::DISK) {
@@ -284,7 +243,11 @@ impl Edit<'_> {
 
     /// Marks the current value as saved to the source of this edit. Returns whether it
     /// appended a marker.
-    pub fn mark_saved<T: Copy + Eq>(&mut self, column: &mut Column<T>, row: Row) -> bool {
+    pub fn mark_saved<Id: Idx, T: Copy + Eq>(
+        &mut self,
+        column: &mut Column<Id, T>,
+        row: Id,
+    ) -> bool {
         if !column.is_dirty(self.journal, row, self.source) {
             return false;
         }
@@ -310,36 +273,59 @@ impl Edit<'_> {
     }
 }
 
-/// A column of any value type that can take part in `Edit::undo`.
+/// A column of any id and value type that can take part in `Edit::undo`.
 pub trait Restorable {
     fn undo(&mut self, edit: &mut Edit<'_>, target: EditId);
 }
 
-pub struct Column<T> {
-    id: usize,
-    policy: Policy,
-    versions: HistoryColumn<Row, T, Meta>,
+/// A row and the index of its last version before an edit first wrote to it.
+#[derive(Debug, Clone, Copy)]
+struct Touch<Id> {
+    edit: EditId,
+    id: Id,
+    before: usize,
 }
 
-impl<T: Copy + Eq> Column<T> {
-    /// Adds a row with `initial` as version 0.
-    pub fn add_row(&mut self, edit: &mut Edit<'_>, initial: T) -> Row {
+pub struct Column<Id, T> {
+    policy: Policy,
+    versions: HistoryColumn<Id, T, Meta>,
+    touched: Vec<Touch<Id>>,
+}
+
+impl<Id: Idx, T: Copy + Eq> Column<Id, T> {
+    /// The generation of the journal that made this column; the owner makes ids with it.
+    pub fn generation(&self) -> Generation {
+        self.versions.generation()
+    }
+
+    /// Adds a row with `initial` as version 0 and returns its index. The owner of the table
+    /// makes the id from it.
+    pub fn push_row(&mut self, edit: &mut Edit<'_>, initial: T) -> usize {
         let meta = Meta {
             edit: edit.id,
             source: edit.source,
         };
-        let generation = self.versions.generation();
-        let index = self.versions.push_row(initial, meta);
-        Row { generation, index }
+        self.versions.push_row(initial, meta)
     }
 
-    pub fn current(&self, row: Row) -> Option<T> {
-        self.versions.current(row)
+    /// Remembers the state of a row before an edit first wrote to it, for `undo`.
+    fn touch(&mut self, edit: EditId, id: Id, before: usize) {
+        if !self
+            .touched
+            .iter()
+            .any(|t| t.edit == edit && t.id.idx() == id.idx())
+        {
+            self.touched.push(Touch { edit, id, before });
+        }
     }
 
-    pub fn versions(&self, journal: &Journal, row: Row) -> Vec<Version<T>> {
+    pub fn current(&self, id: Id) -> Option<T> {
+        self.versions.current(id)
+    }
+
+    pub fn versions(&self, journal: &Journal, id: Id) -> Vec<Version<T>> {
         self.versions
-            .versions(row)
+            .versions(id)
             .iter()
             .filter_map(|v| {
                 Some(Version {
@@ -353,35 +339,32 @@ impl<T: Copy + Eq> Column<T> {
     }
 
     /// The latest version from `source`, else version 0.
-    pub fn base(&self, _journal: &Journal, row: Row, source: Source) -> Option<T> {
+    pub fn base(&self, _journal: &Journal, id: Id, source: Source) -> Option<T> {
         self.versions
-            .latest_where(row, |meta| meta.source == source)
+            .latest_where(id, |meta| meta.source == source)
             .map(|(_, version)| version.value)
-            .or_else(|| self.initial(row))
+            .or_else(|| self.initial(id))
     }
 
-    fn initial(&self, row: Row) -> Option<T> {
+    fn initial(&self, id: Id) -> Option<T> {
         self.versions
-            .at(VersionRef {
-                id: row,
-                version: 0,
-            })
+            .at(VersionRef { id, version: 0 })
             .map(|v| v.value)
     }
 
     /// Whether the current value differs from the base of `source`.
-    pub fn is_dirty(&self, journal: &Journal, row: Row, source: Source) -> bool {
-        match (self.current(row), self.base(journal, row, source)) {
+    pub fn is_dirty(&self, journal: &Journal, id: Id, source: Source) -> bool {
+        match (self.current(id), self.base(journal, id, source)) {
             (Some(current), Some(base)) => current != base,
             _ => false,
         }
     }
 
-    pub fn status(&self, _journal: &Journal, row: Row) -> Status {
+    pub fn status(&self, _journal: &Journal, id: Id) -> Status {
         if self.policy == Policy::Precedence {
             return Status::Clean;
         }
-        let versions: &[RawVersion<T, Meta>] = self.versions.versions(row);
+        let versions: &[RawVersion<T, Meta>] = self.versions.versions(id);
         let Some(last) = versions.last() else {
             return Status::Clean;
         };
@@ -408,34 +391,23 @@ impl<T: Copy + Eq> Column<T> {
     }
 }
 
-impl<T: Copy + Eq> Restorable for Column<T> {
+impl<Id: Idx, T: Copy + Eq> Restorable for Column<Id, T> {
     fn undo(&mut self, edit: &mut Edit<'_>, target: EditId) {
-        let slots: Vec<Touched> = edit
-            .journal
-            .edits
-            .get(target.0)
-            .map(|record| {
-                record
-                    .touched
-                    .iter()
-                    .filter(|t| t.column == self.id)
-                    .copied()
-                    .collect()
-            })
-            .unwrap_or_default();
+        let slots: Vec<Touch<Id>> = self
+            .touched
+            .iter()
+            .filter(|t| t.edit == target)
+            .copied()
+            .collect();
         for slot in slots {
-            let row = Row {
-                generation: self.versions.generation(),
-                index: slot.row,
-            };
             let Some(old) = self.versions.at(VersionRef {
-                id: row,
+                id: slot.id,
                 version: slot.before,
             }) else {
                 continue;
             };
             let source = edit.source;
-            edit.append(self, row, old.value, source);
+            edit.append(self, slot.id, old.value, source);
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Specification of the generation of ids in the history (see `store::history`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use store::history::{Column, EditKind, Journal, Policy, ReloadOutcome, Row, Source, Status};
+use columns::{Generation, Idx};
+use store::history::{Column, EditKind, Journal, Policy, ReloadOutcome, Source, Status};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Enc {
@@ -11,13 +12,28 @@ enum Enc {
 }
 use Enc::{Latin1, Utf8, Win1252};
 
+/// The id of a row, made by the owner of the table (here: the tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RowId(Generation, usize);
+
+impl Idx for RowId {
+    fn idx(self) -> usize {
+        self.1
+    }
+
+    fn generation(self) -> Generation {
+        self.0
+    }
+}
+
 /// A journal with one column and one row, as a store makes after loading.
-fn world(initial: Enc) -> (Journal, Column<Enc>, Row) {
+fn world(initial: Enc) -> (Journal, Column<RowId, Enc>, RowId) {
     let mut journal = Journal::new();
-    let mut column = journal.column::<Enc>(Policy::Precedence);
+    let mut column = journal.column::<RowId, Enc>(Policy::Precedence);
     let mut edit = journal.edit(EditKind::Load, Source::DISK);
-    let row = column.add_row(&mut edit, initial);
+    let index = column.push_row(&mut edit, initial);
     edit.commit();
+    let row = RowId(column.generation(), index);
     (journal, column, row)
 }
 
