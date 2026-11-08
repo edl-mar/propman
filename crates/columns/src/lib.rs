@@ -3,13 +3,15 @@
 //! `Idx` lets a column address a row; the table that owns the columns is the only place that
 //! creates ids. Every id carries the `Generation` of the store it was made in, and a column
 //! only knows ids of its own generation. `HistoryColumn` keeps, for each row, an append-only
-//! stack of versions.
+//! stack of versions; `Pool` stores large values once, with stable ids.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod history_column;
+mod pool;
 
 pub use history_column::{HistoryColumn, Version, VersionRef};
+pub use pool::Pool;
 
 /// The number of one store. Every call to `Generation::next` returns a number that no other
 /// call has returned, so ids of different stores can never be mistaken for each other: not
