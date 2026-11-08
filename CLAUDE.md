@@ -74,8 +74,9 @@ propman -> tui -> app -> store -> columns
 
 Cargo enforces the directions through the `Cargo.toml` files; change the dependencies of a crate
 only when the task says so. `tui` reads through types that `app` re-exports and writes only
-through operations of `app`. The internals of `store` are not designed yet; nothing in the
-drafts about them is a rule.
+through operations of `app`; a test in `crates/tui/tests/boundary.rs` checks that the views
+never read the store. The decisions about `store` are in the decisions document; nothing in the
+drafts about it is a rule.
 
 ## Rust and comments
 
@@ -122,5 +123,3 @@ drafts about them is a rule.
 
 The filter system, the conflict UI, the UI for scopes, the format of the settings files, and
 the order of locales or bundles. The tree and fragment views are open as well.
-
-State: `disk` is complete for the first milestone (raw files). `store` is next.
