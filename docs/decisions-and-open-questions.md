@@ -6,23 +6,48 @@ not authoritative.
 
 ## Decisions
 
-### The first store: facts and choices (2026-11-08)
-The data is split in two kinds.
-- **Facts** come from the disk and belong to one load: the path where a file was found, its
-  detected encoding, its fingerprint, its lines (content and line ending) and the detected
-  bundle, locale and confidence. A reload replaces them; they do not change otherwise.
-- **Choices** are made by the user in the first view: an encoding per file, a bundle and locale
-  per file, a bundle excluded or not. They are columns that only hold a value where the user
-  deviates from the detection, so "save only the deviations" falls out of the model. The
-  effective value is the choice if there is one, otherwise the fact.
-- **History** applies first to the choices (small, changed by the user, and restoring an older
-  value is the undo). The lines need no history until entries can be edited.
-- Files are addressed by path and bundles by (folder, base name), not by IDs, which do not
-  survive a rebuild.
-- A move is a later structural choice, for example a `moved_to` column with history; the
-  effective path is `moved_to` if set, otherwise the path where the file was found. The disk is
-  only touched when saving. Moving across file systems is not a plain rename, and moving one
-  file of a bundle to another folder changes its bundle; both are left for when moves are built.
+### The store: one history per value, sources on edits (2026-11-08)
+This replaces the earlier split into facts and choices; both live in the same history now.
+- **Values.** Every value is a column of small, trivially copyable entries (ids, enums, flags).
+  Each row has a history of versions: the current value is the last one, version 0 is the initial
+  value (what the disk said, or the default, for example `false` for "excluded"). Facts from the
+  disk and choices of the user are versions of the same history.
+- **Pools.** Large values (raw file bytes, text, paths) live in append-only pools with stable
+  ids and deduplication, so equal content has the same id and comparing values is comparing
+  numbers. Pools are generic and free of the domain (in `columns`); the store instantiates them.
+  The original bytes of a file in the byte pool are the likely answer to "reinterpret with unsaved
+  changes"; that is decided together with the lines.
+- **Sources.** Every version belongs to an edit, and every edit has a kind and a **source**:
+  the disk, a settings layer (shared, local) or the user. A value comes from outside by an edit
+  of its source (loading the disk, reading a settings file, a reload) or from the user. Layers
+  are data (an ordered list of sources), so profiles later mean more sources, not a new
+  structure, and the store does not hold the form of the settings.
+- **Base is a query**, not stored: "the latest version from source S" (the disk, the shared file,
+  the local file), falling back to version 0. What goes into a settings file is the deviation
+  from the base below that layer, computed in `app`. There are no separate base histories.
+- **Marker.** Saving into a source appends the current value again, with that source and the
+  edit kind save, so that the base query reflects what was written. A reload that finds nothing
+  new appends nothing, because the value of the base stays the same.
+- **Precedence versus order.** The history is chronological; the effective value follows the
+  rank disk < shared < local < user. An edit that appends a version from a lower ranked source
+  (a reload) appends the latest value of each higher ranked source again if it differs from the
+  current value, so the highest ranked source wins.
+- **Reload rule, fixed per column.** *Precedence*: an outside value never beats a higher ranked
+  one (encoding, bundle assignment). *Conflict*: if both sides changed, the user decides (lines,
+  later entry values). If only one side changed, that change is taken automatically in both
+  cases. Automatic resolutions are ordinary edits: visible and undoable.
+- **IDs** carry the generation number of the store, and lookups return `Option`: a stale id gives
+  `None`, so "ids do not survive a rebuild" is enforced by the type and not only by discipline.
+  The integer types are a detail.
+- Files are addressed by path and bundles by (folder, base name), not by ids.
+- A move is a later structural change: a column `moved_to` with the same history; the effective
+  path is `moved_to` if set, otherwise the path where the file was found. The disk is only
+  touched when saving. Moving across file systems is not a plain rename, and moving one file of
+  a bundle to another folder changes its bundle; both are left for when moves are built.
+- A goal, not a requirement: the store need not be rebuilt when saving (a save only appends
+  markers), so that the history survives saving. To be checked along the way.
+- Order of work: first as a specification in tests (loading with layers, reload with precedence,
+  reload with conflict, saving with a marker), before the data layout is fixed.
 
 ### Shared value types live in a small crate `types` (2026-11-08)
 `disk` and `store` must not know each other, but `store` has to keep the encoding, the line
@@ -35,8 +60,8 @@ beyond what defines the value (for example `LineEnding::as_str`); anything with 
 `app` does all mapping between the sides, and no value type needs mapping any more: loading
 turns the results of `disk` into rows of the store (borrowed lines are copied into owned ones),
 saving builds borrowed line views from the store for `disk`, and settings files are read and
-written by `disk` as text while `app` parses them and turns them into choices. `tui` only sees
-what `app` passes on.
+written by `disk` as text while `app` parses them and turns them into edits from the settings
+sources. `tui` only sees what `app` passes on.
 
 ### Everything is non-destructive; history instead of undo (2026-11-08)
 Nothing the user does destroys information. Instead of a classic undo built from commands,
@@ -45,8 +70,8 @@ edit that puts the old value at the end, and nothing is removed from the history
 session. Several writes that belong to one user action are grouped into one edit. External
 changes (for example new file versions after a `git pull`) are handled with the same history
 and changes: they are added as new versions and never overwrite local ones. How conflicts are
-classified and resolved, and what the data structures look like, is open (see below) and is
-designed together with the store.
+resolved is described in the decision on the store (sources, precedence, a rule per column); the
+conflict UI is still open.
 
 ### Project root and settings files (2026-11-08)
 Only the user knows where the project root is, so propman never guesses and never assumes
@@ -148,16 +173,24 @@ TOML dependency are open; ask before adding a dependency. Concurrent writers can
 ### History and the store: what is open
 - **Shape of tables and IDs.** `main17.rs` and `blueprint_v3.rs` (drafts) were experiments about
   *visibility* (owner in a private module, reader, writer), not about how the data is stored.
-  Row or column (SoA) storage, the ID type (`u32` or `usize`), access that returns `Option`,
-  and a macro for tables are all open.
+  Row or column (SoA) storage, the integer types of the ids, the interface through which `app`
+  writes without breaking invariants, and a macro for tables are open. Lines probably become
+  rows of their own, each with its own history.
 - **Concept notes in the drafts** (`propman-v2-architektur.md`: version stack per row, edits,
   saving as atomic write followed by a rebuild from disk with domain-stable identity, string
   pool; `propman-architecture-notes.md`: a fragment model in which comments and blank lines are
   addressable units). Not authoritative and partly outdated (see their headers).
-- **Conflicts with history** (`propman-v2-konfliktaufloesung.md`: reload as an edit, a table
-  that compares base, own and external value). The draft has a gap: its base ("version 0")
-  would be stale after a first reload, so the base must follow what the disk had at the last
-  sync. Details later.
+- **Structural conflicts** (a key renamed or split outside): not solvable on the level of values.
+  `propman-v2-konfliktaufloesung.md` sketches a line diff and a manual way out; open.
+
+### Saving into a layer can be shadowed
+If the user may choose where a setting is saved, saving into the shared file while the local file
+holds a different value for it leaves the local value effective after a reload, so the change
+seems lost. The UI has to warn or remove the local entry as well.
+
+### Confirmation by the user
+Confirming a detected assignment does not change its value, only its origin. To count as a
+deviation it needs a third state next to certain and uncertain (`Manual`) in `types::Confidence`.
 
 ### Reinterpret versus convert
 "Reinterpret" (read a file again with another encoding) and "convert" (change the encoding
