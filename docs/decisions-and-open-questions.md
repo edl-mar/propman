@@ -6,6 +6,25 @@ not authoritative.
 
 ## Decisions
 
+### Saving is: write, read back, take the snapshot; whether to save is decided by the bytes (2026-11-08)
+A session loads a folder into the store (`Session::open`): discover the files, classify them,
+read each one, one edit of the kind `Load` per file; problems are collected and do not stop the
+rest. Saving a file (`Session::save_file`) writes its lines with the current encoding, expecting
+the file on the disk to be the one that was read (else it is refused as changed or deleted),
+then **reads the file again** with the encoding it was written in and lets the store take what is
+now on the disk as a new snapshot (`reload_file`). One mechanism serves load, reload and save,
+and the store always shows what is on the disk.
+
+A character that the chosen encoding cannot hold is written as an escape (`\u20AC`); the new
+snapshot then holds the escape as text and the old snapshot still holds the character. Both mean
+the same for Java; on the level of values (later) they will compare equal after unescaping.
+
+Whether a file has to be written is decided by comparing the bytes that its lines would give with
+the bytes of the disk, not by the chosen encoding: a choice can be invisible on the disk (a file
+with only ASCII looks the same in every encoding), and then it only lives in the settings.
+Reinterpreting (read the same bytes differently) and converting (change what is written) stay
+two different actions.
+
 ### The raw unit: what is on the disk, one way in (2026-11-08)
 The raw unit (`store::raw`, a module of the crate `store`) represents what is on the disk, with
 its interpretation (encoding, line ending, bundle assignment). It is read-only for the user: it
@@ -69,6 +88,9 @@ saving a file writes its raw lines unchanged (in the chosen encoding).
   store level edit with fixed operations (add a file, set the encoding, set the assignment,
   exclude a bundle, reload, mark saved, undo). There is no way past the invariants, and the
   visibility tricks of the draft sketches are not needed.
+- A reload (`reload_file`) brings the bytes, the fingerprint, the detected encoding and, if the
+  lines differ, a new span, all from the source disk in one edit. It keeps the encoding the user
+  chose, leaves the assignment alone and appends nothing if the disk says the same as before.
 - The bundle lives in the raw unit as long as it only groups files. When the tree comes, it
   refers to the `BundleId` of the raw unit.
 
