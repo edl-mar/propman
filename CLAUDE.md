@@ -74,24 +74,19 @@ drafts about them is a rule.
 
 ## Rust and comments
 
-- No `unsafe` (workspace lint `forbid`).
-- No `unwrap()` or `expect()` in library code (tests may use them).
-- Paths are `&Path` / `PathBuf`, never `String`; print them with `.display()`.
-- No `todo!()` and no `dbg!` in committed code.
+- No `unsafe`, `unwrap()`, `expect()`, `todo!()` or `dbg!`: enforced by the workspace lints in
+  `Cargo.toml`. Test files opt out of `unwrap` and `expect` explicitly with
+  `#![allow(clippy::unwrap_used, clippy::expect_used)]`.
 - New dependencies go into `[workspace.dependencies]` and are used with `.workspace = true`.
   Ask before adding any external dependency.
 - A comment explains why, never what. When in doubt, no comment.
 - Every module that forms a boundary has a `//!` doc with its responsibility and invariants
   (2 to 5 lines). `///` only where name and signature are not enough.
-- No banners, no changelog comments, no commented-out code.
-- When you change code, check and update the comments and module docs around it.
 
 ## Working method
 
 - Design first: discuss before building. For each step, write the tests as the specification
   first (they must compile and fail for the right reason), get the go-ahead, then implement.
-- One concern per commit.
-- Commit and push only when asked.
 - Before every commit all three must pass:
   ```
   cargo fmt --all --check
