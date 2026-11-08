@@ -51,6 +51,8 @@ unreviewed notes from earlier sessions: they can contradict each other and are n
 turn a remark made in passing into a rule; if unsure whether something is decided, ask. Record a
 decision in the decisions document when it is made.
 
+Use the words of `docs/nomenclature.md` in code, docs and commit messages.
+
 ## Crates
 
 ```
