@@ -298,6 +298,15 @@ impl<Id: Idx, T: Copy + Eq> Column<Id, T> {
         self.versions.generation()
     }
 
+    /// The number of rows; also the index that the next `push_row` returns.
+    pub fn len(&self) -> usize {
+        self.versions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.versions.is_empty()
+    }
+
     /// Adds a row with `initial` as version 0 and returns its index. The owner of the table
     /// makes the id from it.
     pub fn push_row(&mut self, edit: &mut Edit<'_>, initial: T) -> usize {
