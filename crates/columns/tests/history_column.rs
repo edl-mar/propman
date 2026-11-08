@@ -1,15 +1,19 @@
 //! Specification of the generic history column (see `columns::HistoryColumn`).
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use columns::{HistoryColumn, Idx, Version, VersionRef};
+use columns::{Generation, HistoryColumn, Idx, Version, VersionRef};
 
 // ── A table that owns its ids, as the store will ─────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct FileId(usize);
+struct FileId(Generation, usize);
 
 impl Idx for FileId {
     fn idx(self) -> usize {
+        self.1
+    }
+
+    fn generation(self) -> Generation {
         self.0
     }
 }
@@ -42,23 +46,28 @@ fn by_user(edit: u32) -> Meta {
 
 type Column = HistoryColumn<FileId, Enc, Meta>;
 
+fn new_column() -> Column {
+    Column::new(Generation::next())
+}
+
 /// The owner of the ids: only it turns an index into a `FileId`.
 fn add(column: &mut Column, initial: Enc) -> FileId {
-    FileId(column.push_row(initial, LOAD))
+    let generation = column.generation();
+    FileId(generation, column.push_row(initial, LOAD))
 }
 
 // ── Rows and versions ────────────────────────────────────────────────────────
 
 #[test]
 fn a_new_column_has_no_rows() {
-    let column = Column::new();
+    let column = new_column();
     assert_eq!(column.len(), 0);
     assert!(column.is_empty());
 }
 
 #[test]
 fn a_new_row_starts_with_its_initial_value_as_version_0() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let first = add(&mut column, Enc::Latin1);
     let second = add(&mut column, Enc::Utf8);
 
@@ -78,7 +87,7 @@ fn a_new_row_starts_with_its_initial_value_as_version_0() {
 
 #[test]
 fn appending_adds_a_version_and_makes_it_current() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
 
     assert_eq!(column.append(id, Enc::Utf8, by_user(1)), Some(1));
@@ -94,7 +103,7 @@ fn appending_adds_a_version_and_makes_it_current() {
 #[test]
 fn appending_the_same_value_again_is_still_a_version() {
     // The column does not judge values; the rules above it decide what is worth appending.
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
     assert_eq!(column.append(id, Enc::Latin1, by_user(1)), Some(1));
     assert_eq!(column.version_count(id), 2);
@@ -102,7 +111,7 @@ fn appending_the_same_value_again_is_still_a_version() {
 
 #[test]
 fn rows_are_independent() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let first = add(&mut column, Enc::Latin1);
     let second = add(&mut column, Enc::Latin1);
 
@@ -115,9 +124,9 @@ fn rows_are_independent() {
 
 #[test]
 fn an_unknown_row_gives_nothing_and_changes_nothing() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let known = add(&mut column, Enc::Latin1);
-    let unknown = FileId(7);
+    let unknown = FileId(column.generation(), 7);
 
     assert_eq!(column.current(unknown), None);
     assert_eq!(column.version_count(unknown), 0);
@@ -131,7 +140,7 @@ fn an_unknown_row_gives_nothing_and_changes_nothing() {
 
 #[test]
 fn nothing_is_ever_removed() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
     let mut counts = vec![column.version_count(id)];
     for edit in 1..=20 {
@@ -146,7 +155,7 @@ fn nothing_is_ever_removed() {
 
 #[test]
 fn a_reference_addresses_one_version_of_one_row() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
     column.append(id, Enc::Utf8, by_user(1));
 
@@ -170,7 +179,7 @@ fn a_reference_addresses_one_version_of_one_row() {
     assert_eq!(column.at(VersionRef { id, version: 2 }), None);
     assert_eq!(
         column.at(VersionRef {
-            id: FileId(9),
+            id: FileId(column.generation(), 9),
             version: 0
         }),
         None
@@ -179,7 +188,7 @@ fn a_reference_addresses_one_version_of_one_row() {
 
 #[test]
 fn a_reference_to_the_current_version_keeps_pointing_at_that_version() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
 
     let reference = column.current_ref(id).unwrap();
@@ -195,7 +204,7 @@ fn a_reference_to_the_current_version_keeps_pointing_at_that_version() {
 
 #[test]
 fn the_latest_matching_version_is_found_with_its_number() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1); // version 0, not by the user
     column.append(id, Enc::Utf8, by_user(1)); // 1
     column.append(id, Enc::Windows1252, by_user(2)); // 2
@@ -218,7 +227,7 @@ fn the_latest_matching_version_is_found_with_its_number() {
 
 #[test]
 fn a_criterion_can_use_any_part_of_the_metadata() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
     column.append(id, Enc::Utf8, by_user(5));
     column.append(id, Enc::Windows1252, by_user(6));
@@ -230,7 +239,7 @@ fn a_criterion_can_use_any_part_of_the_metadata() {
 
 #[test]
 fn no_matching_version_gives_none() {
-    let mut column = Column::new();
+    let mut column = new_column();
     let id = add(&mut column, Enc::Latin1);
     assert_eq!(column.latest_where(id, |m| m.from_user), None);
 }
@@ -238,15 +247,18 @@ fn no_matching_version_gives_none() {
 // ── Several columns of one table share one id ────────────────────────────────
 
 struct FileTable {
+    generation: Generation,
     encoding: HistoryColumn<FileId, Enc, Meta>,
     excluded: HistoryColumn<FileId, bool, Meta>,
 }
 
 impl FileTable {
     fn new() -> Self {
+        let generation = Generation::next();
         Self {
-            encoding: HistoryColumn::new(),
-            excluded: HistoryColumn::new(),
+            generation,
+            encoding: HistoryColumn::new(generation),
+            excluded: HistoryColumn::new(generation),
         }
     }
 
@@ -255,7 +267,7 @@ impl FileTable {
         let index = self.encoding.push_row(encoding, LOAD);
         let same = self.excluded.push_row(false, LOAD);
         assert_eq!(index, same);
-        FileId(index)
+        FileId(self.generation, index)
     }
 }
 
@@ -271,4 +283,73 @@ fn the_columns_of_one_table_share_the_id_of_a_row() {
     assert_eq!(table.excluded.current(first), Some(false));
     assert_eq!(table.excluded.current(second), Some(true));
     assert_eq!(table.encoding.current(second), Some(Enc::Windows1252));
+}
+
+// ── Generations ──────────────────────────────────────────────────────────────
+
+#[test]
+fn every_generation_is_new() {
+    let numbers: Vec<Generation> = (0..1000).map(|_| Generation::next()).collect();
+    let distinct: std::collections::HashSet<Generation> = numbers.iter().copied().collect();
+    assert_eq!(distinct.len(), numbers.len());
+}
+
+#[test]
+fn a_column_has_the_generation_it_was_made_with() {
+    let generation = Generation::next();
+    let column = Column::new(generation);
+    assert_eq!(column.generation(), generation);
+}
+
+#[test]
+fn an_id_of_another_generation_is_unknown_to_every_read() {
+    let mut mine = new_column();
+    let mut other = new_column();
+    // same index 0 in both columns: only the generation tells them apart
+    let _own = add(&mut mine, Enc::Latin1);
+    let foreign = add(&mut other, Enc::Utf8);
+    assert_eq!(foreign.idx(), 0);
+
+    assert_eq!(mine.current(foreign), None);
+    assert!(mine.versions(foreign).is_empty());
+    assert_eq!(mine.version_count(foreign), 0);
+    assert_eq!(mine.current_ref(foreign), None);
+    assert_eq!(
+        mine.at(VersionRef {
+            id: foreign,
+            version: 0
+        }),
+        None
+    );
+    assert_eq!(mine.latest_where(foreign, |_| true), None);
+}
+
+#[test]
+fn an_id_of_another_generation_cannot_be_appended_to_and_nothing_changes() {
+    let mut mine = new_column();
+    let mut other = new_column();
+    let own = add(&mut mine, Enc::Latin1);
+    let foreign = add(&mut other, Enc::Utf8);
+
+    assert_eq!(mine.append(foreign, Enc::Windows1252, by_user(1)), None);
+
+    assert_eq!(mine.version_count(own), 1);
+    assert_eq!(mine.current(own), Some(Enc::Latin1));
+    assert_eq!(other.version_count(foreign), 1);
+}
+
+#[test]
+fn after_a_rebuild_the_old_ids_do_not_match_the_new_rows() {
+    // A rebuild makes a new column with a new generation. The old id has an index that
+    // exists in the new column, but it must not find the new row.
+    let mut before = new_column();
+    let old = add(&mut before, Enc::Latin1);
+
+    let mut after = new_column();
+    let new = add(&mut after, Enc::Utf8);
+    assert_eq!(old.idx(), new.idx());
+
+    assert_eq!(after.current(old), None);
+    assert_eq!(after.current(new), Some(Enc::Utf8));
+    assert_ne!(old.generation(), new.generation());
 }

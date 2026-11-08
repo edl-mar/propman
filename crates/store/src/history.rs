@@ -28,7 +28,7 @@
 //!
 //! Ids carrying the generation of the store are a later step and not part of this module yet.
 
-use columns::{HistoryColumn, Idx, Version as RawVersion, VersionRef};
+use columns::{Generation, HistoryColumn, Idx, Version as RawVersion, VersionRef};
 
 /// Where a change comes from. The number is the rank: a higher number wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -61,12 +61,20 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditId(usize);
 
+/// The id of a row. It carries the generation of the journal whose column made it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Row(usize);
+pub struct Row {
+    generation: Generation,
+    index: usize,
+}
 
 impl Idx for Row {
     fn idx(self) -> usize {
-        self.0
+        self.index
+    }
+
+    fn generation(self) -> Generation {
+        self.generation
     }
 }
 
@@ -117,16 +125,32 @@ struct EditRecord {
     touched: Vec<Touched>,
 }
 
-/// The log of edits; it knows the kind of each and what each one touched.
-#[derive(Debug, Default)]
+/// The log of edits; it knows the kind of each and what each one touched. It also has the
+/// generation that all its columns, and so all their row ids, belong to.
+#[derive(Debug)]
 pub struct Journal {
+    generation: Generation,
     edits: Vec<EditRecord>,
     columns: usize,
 }
 
+impl Default for Journal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Journal {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            generation: Generation::next(),
+            edits: Vec::new(),
+            columns: 0,
+        }
+    }
+
+    pub fn generation(&self) -> Generation {
+        self.generation
     }
 
     pub fn column<T: Copy + Eq>(&mut self, policy: Policy) -> Column<T> {
@@ -135,7 +159,7 @@ impl Journal {
         Column {
             id,
             policy,
-            versions: HistoryColumn::new(),
+            versions: HistoryColumn::new(self.generation),
         }
     }
 
@@ -196,7 +220,7 @@ impl Edit<'_> {
         if column.versions.append(row, value, meta).is_none() {
             return false;
         }
-        self.touch(column.id, row.0, before);
+        self.touch(column.id, row.index, before);
         true
     }
 
@@ -304,7 +328,9 @@ impl<T: Copy + Eq> Column<T> {
             edit: edit.id,
             source: edit.source,
         };
-        Row(self.versions.push_row(initial, meta))
+        let generation = self.versions.generation();
+        let index = self.versions.push_row(initial, meta);
+        Row { generation, index }
     }
 
     pub fn current(&self, row: Row) -> Option<T> {
@@ -398,7 +424,10 @@ impl<T: Copy + Eq> Restorable for Column<T> {
             })
             .unwrap_or_default();
         for slot in slots {
-            let row = Row(slot.row);
+            let row = Row {
+                generation: self.versions.generation(),
+                index: slot.row,
+            };
             let Some(old) = self.versions.at(VersionRef {
                 id: row,
                 version: slot.before,
