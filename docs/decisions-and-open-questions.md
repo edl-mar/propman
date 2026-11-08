@@ -6,6 +6,16 @@ not authoritative.
 
 ## Decisions
 
+### Everything is non-destructive; history instead of undo (2026-11-08)
+Nothing the user does destroys information. Instead of a classic undo built from commands,
+every value keeps a history of its versions: restoring an older version is an ordinary new
+edit that puts the old value at the end, and nothing is removed from the history during a
+session. Several writes that belong to one user action are grouped into one edit. External
+changes (for example new file versions after a `git pull`) are handled with the same history
+and changes: they are added as new versions and never overwrite local ones. How conflicts are
+classified and resolved, and what the data structures look like, is open (see below) and is
+designed together with the store.
+
 ### Project root and settings files (2026-11-08)
 Only the user knows where the project root is, so propman never guesses and never assumes
 version control.
@@ -107,3 +117,47 @@ shared types crate; `store` generic over file metadata.
 Exact format, which crate reads and writes them, and the handling of the (probably needed)
 TOML dependency are open; ask before adding a dependency. Concurrent writers can reuse
 `atomic_write` and the fingerprint.
+
+### History and the store: what is open
+- **Shape of tables and IDs.** `main17.rs` and `blueprint_v3.rs` (drafts) were experiments about
+  *visibility* (owner in a private module, reader, writer), not about how the data is stored.
+  Row or column (SoA) storage, the ID type (`u32` or `usize`), access that returns `Option`,
+  and a macro for tables are all open.
+- **Concept notes in the drafts** (`propman-v2-architektur.md`: version stack per row, edits,
+  saving as atomic write followed by a rebuild from disk with domain-stable identity, string
+  pool; `propman-architecture-notes.md`: a fragment model in which comments and blank lines are
+  addressable units). Not authoritative and partly outdated (see their headers).
+- **Conflicts with history** (`propman-v2-konfliktaufloesung.md`: reload as an edit, a table
+  that compares base, own and external value). The draft has a gap: its base ("version 0")
+  would be stale after a first reload, so the base must follow what the disk had at the last
+  sync. Details later.
+
+### Reinterpret versus convert
+"Reinterpret" (read a file again with another encoding) and "convert" (change the encoding
+used for saving) are separate actions. `decode` already accepts a hint. Reinterpreting with
+unsaved changes: ask first, or keep the original bytes as an immutable base.
+
+### Encoding for non-ASCII characters in pure ASCII files
+A pure ASCII file is valid UTF-8 and valid Latin-1; it is detected as UTF-8, so typing an `ü`
+writes UTF-8. Alternatives: the encoding of the neighbouring locale files, a folder default, or
+asking. To be decided with the saving UI.
+
+### Escapes in comment lines
+`encode` works on text and escapes unrepresentable characters everywhere, including comment
+lines, where Java does not process escapes (a `€` stays literal there). Options: do not
+escape in comments and warn or fail. This needs to know which line is a comment, so it belongs
+after the parse layer.
+
+### Showing escapes
+Showing `ü` as `ü` belongs to the parse layer and is independent of the encoding.
+
+### Further topics from the notes (undecided)
+- Order of entries per locale or per bundle (a product question), with the entry milestone.
+- Filter system: needs the tree and entries; a hint from v1 is one central `semantics()`
+  instead of duplicated classification.
+- Conflict UI: uses history and changes (see the decision above); details later.
+- First view: an overview of bundles with their confidence, shown by colour *and* a symbol,
+  not by colour alone (a note from the drafts, not confirmed).
+- A command line check without the UI (`propman check`).
+- Possible dependencies, each to be asked first: `similar` (line diff for structural changes
+  from outside), `toml` and `serde` (settings files).
