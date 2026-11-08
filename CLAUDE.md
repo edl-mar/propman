@@ -58,9 +58,12 @@ propman -> tui -> app -> store -> columns
                     \-> disk
 ```
 
+`disk` and `store` both use `types`, and never each other.
+
 | Crate | Task | Must not |
 |---|---|---|
 | `columns` | generic index and column primitives | know anything about the project |
+| `types` | plain value types shared by `disk` and `store` (`Encoding`, `LineEnding`, `Confidence`, `Fingerprint`) | contain logic beyond what defines a value, depend on another crate |
 | `store` | the in-memory data, single source of truth | do IO or UI, depend on `disk` |
 | `disk` | stateless file adapter: discovery, decoding, lines, atomic save, change detection | know `store` types |
 | `app` | connects `store` and `disk`: load, save, conflicts, state, operations | depend on ratatui or crossterm |
@@ -102,7 +105,7 @@ drafts about them is a rule.
 
 ## Layout of the repository
 
-- `crates/`: the six crates. Integration tests are in `crates/<crate>/tests/`, shared helpers
+- `crates/`: the seven crates. Integration tests are in `crates/<crate>/tests/`, shared helpers
   (a temp dir without an extra dependency) in `tests/common/mod.rs`.
 - `fixtures/`: static input for tests, compared byte for byte (`.gitattributes` sets `-text`).
   `edge/` holds minimal cases, one property per file; `project/` a realistic multi-bundle layout.

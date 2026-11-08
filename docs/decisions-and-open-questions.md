@@ -6,6 +6,38 @@ not authoritative.
 
 ## Decisions
 
+### The first store: facts and choices (2026-11-08)
+The data is split in two kinds.
+- **Facts** come from the disk and belong to one load: the path where a file was found, its
+  detected encoding, its fingerprint, its lines (content and line ending) and the detected
+  bundle, locale and confidence. A reload replaces them; they do not change otherwise.
+- **Choices** are made by the user in the first view: an encoding per file, a bundle and locale
+  per file, a bundle excluded or not. They are columns that only hold a value where the user
+  deviates from the detection, so "save only the deviations" falls out of the model. The
+  effective value is the choice if there is one, otherwise the fact.
+- **History** applies first to the choices (small, changed by the user, and restoring an older
+  value is the undo). The lines need no history until entries can be edited.
+- Files are addressed by path and bundles by (folder, base name), not by IDs, which do not
+  survive a rebuild.
+- A move is a later structural choice, for example a `moved_to` column with history; the
+  effective path is `moved_to` if set, otherwise the path where the file was found. The disk is
+  only touched when saving. Moving across file systems is not a plain rename, and moving one
+  file of a bundle to another folder changes its bundle; both are left for when moves are built.
+
+### Shared value types live in a small crate `types` (2026-11-08)
+`disk` and `store` must not know each other, but `store` has to keep the encoding, the line
+endings, the confidence and the fingerprint to save a file again. They are defined once in the
+crate `types` (`Encoding`, `LineEnding`, `Confidence`, `Fingerprint`), used by both, and `disk`
+re-exports them under their old paths. The crate only holds plain value types, with no behavior
+beyond what defines the value (for example `LineEnding::as_str`); anything with logic stays in
+`disk` or `store`, so that it does not become a dumping ground.
+
+`app` does all mapping between the sides, and no value type needs mapping any more: loading
+turns the results of `disk` into rows of the store (borrowed lines are copied into owned ones),
+saving builds borrowed line views from the store for `disk`, and settings files are read and
+written by `disk` as text while `app` parses them and turns them into choices. `tui` only sees
+what `app` passes on.
+
 ### Everything is non-destructive; history instead of undo (2026-11-08)
 Nothing the user does destroys information. Instead of a classic undo built from commands,
 every value keeps a history of its versions: restoring an older version is an ordinary new
@@ -107,11 +139,6 @@ returns everything at the end, so it will need a progress hook (for example a ca
 shared linked file silently becomes a copy. Proposal: do not follow symlinks in `discover`
 and report them as skipped. No real use case is known yet. Hard links are broken by
 rename-based replacement either way; document that.
-
-### Where do `Encoding` and `LineEnding` live between `disk` and `store`?
-`disk` and `store` must not know each other, but `store` has to keep both (and the
-`Fingerprint`) to save a file again. Options: own types in both with conversion in `app`; a tiny
-shared types crate; `store` generic over file metadata.
 
 ### Format of the settings files
 Exact format, which crate reads and writes them, and the handling of the (probably needed)
