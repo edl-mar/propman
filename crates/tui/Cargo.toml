@@ -8,3 +8,4 @@ workspace = true
 
 [dependencies]
 app = { path = "../app" }
+ratatui.workspace = true
