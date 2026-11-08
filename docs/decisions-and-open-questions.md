@@ -36,12 +36,21 @@ saving a file writes its raw lines unchanged (in the chosen encoding).
 | | `encoding` | `Encoding` |
 | | `fingerprint` | `Fingerprint` |
 | | `bytes` | `BytesId` (the original bytes) |
-| Line (`LineId`) | `file` | `FileId` |
-| | `content` | `TextId` (without the line ending) |
+| | `lines` | `LineSpan` (the lines of the current load, see below) |
+| Line (`LineId`) | `content` | `TextId` (without the line ending) |
 | | `ending` | `LineEnding` |
 
 - All columns are history columns, also those that never change; the identity columns just never
   get a second version.
+- **The lines of a file are one value of the file**, a `LineSpan` (first row, count) in the line
+  table, with a history. Every load of a file creates its lines as consecutive new rows and a
+  new span; the current lines of a file are those of the last span, in the order inside the
+  span. A reload therefore never changes old lines and is simply a new snapshot of the disk: the
+  raw unit has no local changes, so nothing can conflict there, and a changed order in the file
+  is just a different order in the new span. The old spans stay as versions and are the basis
+  of the line diff. A raw line does not know its file; that is derived from the spans. The
+  conflict only appears one level up, when fragments and entries of the user have to be mapped
+  onto the new snapshot (by the identity of an entry, not by the position of a line).
 - `BundleAssignment` is one value: the bundle, the locale (`Option<TextId>`) and the confidence.
   They always change together, and a confirmation by the user changes only the confidence,
   which counts as a deviation.
