@@ -6,6 +6,38 @@ not authoritative.
 
 ## Decisions
 
+### The user interface: structure and the first slice (2026-11-08)
+The structure is inspired by The Elm Architecture (message, update, view), not a strict copy.
+The state, the messages and `update` live in `app` (no terminal crate); the views, the mapping of
+keys to messages and the event loop live in `tui`; `propman` reads the argument and starts it.
+`tui` depends on `app` and the terminal library only, never on `store` or `disk`.
+
+- **View and overlay are two orthogonal axes**, not one mode enum: a view is exclusive, an
+  overlay lies over any view. This keeps the state space additive instead of multiplicative.
+- **Views are an enum, not trait objects**, so the compiler reports every view that was not
+  handled. `update` hands a message to small functions, one per view, that take the state by
+  value and return it; a transition is a change of the current view. No `handle_op` with a
+  context object, which would be impure and tends to become a bag of everything.
+- **Narrow capability traits** only for operations that mean the same in several views (for
+  example copy and paste); no universal address model for all views.
+- **UI state** (selection, navigation, current view) lives in the app state and never in the
+  store. A view is derived from the store each time. The UI may keep ids, because they carry a
+  generation: a stale id gives `None` and cannot hit another row.
+- "Introduce it when needed" is a hint, not a rule. The view enum comes around the second view,
+  an overlay with the first dialog, a trait when two views share an operation; any of them may
+  come earlier where that clearly saves a rebuild.
+- **Keys:** only the press of a key counts, not the release (on Windows both arrive), and a
+  character with Ctrl and Alt (what AltGr sends) counts as a plain character.
+- **The first slice, in four steps:** a skeleton (loop, update, a small real view with the
+  folder, the number of files and bundles, the problems and the key to quit); the bundle
+  overview as the first view; the raw lines of a file; the first operations (change the
+  encoding, exclude a bundle, save, quit). No filters, entries or conflict display yet.
+- The only new external dependency is `ratatui`; `crossterm` is used through its re-export.
+- **Open, a possible deviation from Elm:** in pure Elm `update` has no side effects and returns
+  commands that the loop executes. For now `update` is pure and there are no side effects. When
+  saving arrives (step 4) it has to be decided whether `update` calls the session directly or
+  returns commands.
+
 ### Saving is: write, read back, take the snapshot; whether to save is decided by the bytes (2026-11-08)
 A session loads a folder into the store (`Session::open`): discover the files, classify them,
 read each one, one edit of the kind `Load` per file; problems are collected and do not stop the
