@@ -23,9 +23,12 @@
 //! - `restore` appends an old value again; `undo` restores what an edit changed. Both only
 //!   append.
 //!
+//! The versions live in a `columns::HistoryColumn`; this module adds the sources, the edits and
+//! the rules on top.
+//!
 //! Ids carrying the generation of the store are a later step and not part of this module yet.
 
-use std::marker::PhantomData;
+use columns::{HistoryColumn, Idx, Version as RawVersion, VersionRef};
 
 /// Where a change comes from. The number is the rank: a higher number wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -60,6 +63,19 @@ pub struct EditId(usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Row(usize);
+
+impl Idx for Row {
+    fn idx(self) -> usize {
+        self.0
+    }
+}
+
+/// The metadata of one version: the edit that created it and the source it carries.
+#[derive(Debug, Clone, Copy)]
+struct Meta {
+    edit: EditId,
+    source: Source,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -119,8 +135,7 @@ impl Journal {
         Column {
             id,
             policy,
-            rows: Vec::new(),
-            _marker: PhantomData,
+            versions: HistoryColumn::new(),
         }
     }
 
@@ -162,25 +177,35 @@ impl Edit<'_> {
         }
     }
 
-    /// Appends `value` unless it equals the current value. Returns whether it appended.
-    pub fn set<T: Copy + Eq>(&mut self, column: &mut Column<T>, row: Row, value: T) -> bool {
-        let Some(entries) = column.rows.get_mut(row.0) else {
+    /// Appends a version carrying `source` and remembers the row for `undo`. Returns false if
+    /// the row does not exist.
+    fn append<T: Copy + Eq>(
+        &mut self,
+        column: &mut Column<T>,
+        row: Row,
+        value: T,
+        source: Source,
+    ) -> bool {
+        let Some(before) = column.versions.version_count(row).checked_sub(1) else {
             return false;
         };
-        let Some(last) = entries.last() else {
-            return false;
+        let meta = Meta {
+            edit: self.id,
+            source,
         };
-        if last.value == value {
+        if column.versions.append(row, value, meta).is_none() {
             return false;
         }
-        let before = entries.len() - 1;
-        entries.push(Entry {
-            value,
-            edit: self.id,
-            source: self.source,
-        });
         self.touch(column.id, row.0, before);
         true
+    }
+
+    /// Appends `value` unless it equals the current value. Returns whether it appended.
+    pub fn set<T: Copy + Eq>(&mut self, column: &mut Column<T>, row: Row, value: T) -> bool {
+        if column.current(row).is_none_or(|current| current == value) {
+            return false;
+        }
+        self.append(column, row, value, self.source)
     }
 
     /// Appends the value of an old version again. Returns false if there is no such version.
@@ -190,20 +215,10 @@ impl Edit<'_> {
         row: Row,
         version: usize,
     ) -> bool {
-        let Some(entries) = column.rows.get_mut(row.0) else {
+        let Some(old) = column.versions.at(VersionRef { id: row, version }) else {
             return false;
         };
-        let Some(old) = entries.get(version).map(|e| e.value) else {
-            return false;
-        };
-        let before = entries.len() - 1;
-        entries.push(Entry {
-            value: old,
-            edit: self.id,
-            source: self.source,
-        });
-        self.touch(column.id, row.0, before);
-        true
+        self.append(column, row, old.value, self.source)
     }
 
     /// Brings a value from the disk. The edit is expected to have the source `Source::DISK`.
@@ -217,33 +232,21 @@ impl Edit<'_> {
             Some(base) if base != theirs => {}
             _ => return ReloadOutcome::Unchanged,
         }
-        let Some(entries) = column.rows.get_mut(row.0) else {
-            return ReloadOutcome::Unchanged;
-        };
-        let before = entries.len() - 1;
         // The version that a higher ranked source has to win with, found before appending.
-        let top = entries
+        let top = column
+            .versions
+            .versions(row)
             .iter()
-            .filter(|e| e.source > Source::DISK)
-            .max_by_key(|e| e.source)
+            .filter(|v| v.meta.source > Source::DISK)
+            .max_by_key(|v| v.meta.source)
             .copied();
-        entries.push(Entry {
-            value: theirs,
-            edit: self.id,
-            source: Source::DISK,
-        });
-        self.touch(column.id, row.0, before);
-
+        if !self.append(column, row, theirs, Source::DISK) {
+            return ReloadOutcome::Unchanged;
+        }
         match column.policy {
             Policy::Precedence => match top {
                 Some(top) if top.value != theirs => {
-                    if let Some(entries) = column.rows.get_mut(row.0) {
-                        entries.push(Entry {
-                            value: top.value,
-                            edit: self.id,
-                            source: top.source,
-                        });
-                    }
+                    self.append(column, row, top.value, top.meta.source);
                     ReloadOutcome::Kept
                 }
                 _ => ReloadOutcome::Taken,
@@ -261,18 +264,14 @@ impl Edit<'_> {
         if !column.is_dirty(self.journal, row, self.source) {
             return false;
         }
-        let Some(entries) = column.rows.get_mut(row.0) else {
+        let Some(current) = column.current(row) else {
             return false;
         };
-        let Some(current) = entries.last().map(|e| e.value) else {
-            return false;
-        };
-        entries.push(Entry {
-            value: current,
+        let meta = Meta {
             edit: self.id,
             source: self.source,
-        });
-        true
+        };
+        column.versions.append(row, current, meta).is_some()
     }
 
     /// Restores what the edit `target` changed, in all given columns, by appending.
@@ -292,47 +291,36 @@ pub trait Restorable {
     fn undo(&mut self, edit: &mut Edit<'_>, target: EditId);
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Entry<T> {
-    value: T,
-    edit: EditId,
-    source: Source,
-}
-
 pub struct Column<T> {
     id: usize,
     policy: Policy,
-    rows: Vec<Vec<Entry<T>>>,
-    _marker: PhantomData<T>,
+    versions: HistoryColumn<Row, T, Meta>,
 }
 
 impl<T: Copy + Eq> Column<T> {
     /// Adds a row with `initial` as version 0.
     pub fn add_row(&mut self, edit: &mut Edit<'_>, initial: T) -> Row {
-        self.rows.push(vec![Entry {
-            value: initial,
+        let meta = Meta {
             edit: edit.id,
             source: edit.source,
-        }]);
-        Row(self.rows.len() - 1)
+        };
+        Row(self.versions.push_row(initial, meta))
     }
 
     pub fn current(&self, row: Row) -> Option<T> {
-        self.rows.get(row.0)?.last().map(|e| e.value)
+        self.versions.current(row)
     }
 
     pub fn versions(&self, journal: &Journal, row: Row) -> Vec<Version<T>> {
-        let Some(entries) = self.rows.get(row.0) else {
-            return Vec::new();
-        };
-        entries
+        self.versions
+            .versions(row)
             .iter()
-            .filter_map(|e| {
+            .filter_map(|v| {
                 Some(Version {
-                    value: e.value,
-                    edit: e.edit,
-                    source: e.source,
-                    kind: journal.kind_of(e.edit)?,
+                    value: v.value,
+                    edit: v.meta.edit,
+                    source: v.meta.source,
+                    kind: journal.kind_of(v.meta.edit)?,
                 })
             })
             .collect()
@@ -340,13 +328,19 @@ impl<T: Copy + Eq> Column<T> {
 
     /// The latest version from `source`, else version 0.
     pub fn base(&self, _journal: &Journal, row: Row, source: Source) -> Option<T> {
-        let entries = self.rows.get(row.0)?;
-        entries
-            .iter()
-            .rev()
-            .find(|e| e.source == source)
-            .or_else(|| entries.first())
-            .map(|e| e.value)
+        self.versions
+            .latest_where(row, |meta| meta.source == source)
+            .map(|(_, version)| version.value)
+            .or_else(|| self.initial(row))
+    }
+
+    fn initial(&self, row: Row) -> Option<T> {
+        self.versions
+            .at(VersionRef {
+                id: row,
+                version: 0,
+            })
+            .map(|v| v.value)
     }
 
     /// Whether the current value differs from the base of `source`.
@@ -361,27 +355,25 @@ impl<T: Copy + Eq> Column<T> {
         if self.policy == Policy::Precedence {
             return Status::Clean;
         }
-        let Some(entries) = self.rows.get(row.0) else {
+        let versions: &[RawVersion<T, Meta>] = self.versions.versions(row);
+        let Some(last) = versions.last() else {
             return Status::Clean;
         };
-        let Some(last) = entries.last() else {
-            return Status::Clean;
-        };
-        if last.source != Source::DISK {
+        if last.meta.source != Source::DISK {
             return Status::Clean;
         }
         // P: the nearest earlier version from another source
-        let Some(p) = entries.iter().rposition(|e| e.source != Source::DISK) else {
+        let Some(p) = versions.iter().rposition(|v| v.meta.source != Source::DISK) else {
             return Status::Clean;
         };
         // B: the latest disk version before P, else version 0
-        let base = entries[..p]
+        let base = versions[..p]
             .iter()
             .rev()
-            .find(|e| e.source == Source::DISK)
-            .or_else(|| entries.first())
-            .map(|e| e.value);
-        let ours = entries[p].value;
+            .find(|v| v.meta.source == Source::DISK)
+            .or_else(|| versions.first())
+            .map(|v| v.value);
+        let ours = versions[p].value;
         if Some(ours) != base && ours != last.value {
             Status::Conflict
         } else {
@@ -406,19 +398,15 @@ impl<T: Copy + Eq> Restorable for Column<T> {
             })
             .unwrap_or_default();
         for slot in slots {
-            let Some(entries) = self.rows.get_mut(slot.row) else {
+            let row = Row(slot.row);
+            let Some(old) = self.versions.at(VersionRef {
+                id: row,
+                version: slot.before,
+            }) else {
                 continue;
             };
-            let Some(old) = entries.get(slot.before).map(|e| e.value) else {
-                continue;
-            };
-            let before = entries.len() - 1;
-            entries.push(Entry {
-                value: old,
-                edit: edit.id,
-                source: edit.source,
-            });
-            edit.touch(self.id, slot.row, before);
+            let source = edit.source;
+            edit.append(self, row, old.value, source);
         }
     }
 }
