@@ -353,3 +353,46 @@ fn a_touch_without_a_change_does_not_block_saving() {
     assert!(session.save_file(id).is_ok());
     assert_eq!(std::fs::read(dir.path().join(path)).unwrap(), content);
 }
+
+// ── Excluding a bundle ───────────────────────────────────────────────────────
+
+#[test]
+fn a_bundle_can_be_excluded_and_included_again() {
+    let dir = project();
+    let mut session = open(&dir);
+    let bundle = session.store().bundles()[0];
+    assert_eq!(session.store().bundle_excluded(bundle), Some(false));
+
+    assert!(session.exclude_bundle(bundle, true));
+    assert_eq!(session.store().bundle_excluded(bundle), Some(true));
+    assert!(!session.exclude_bundle(bundle, true));
+    assert!(session.exclude_bundle(bundle, false));
+    assert_eq!(session.store().bundle_excluded(bundle), Some(false));
+}
+
+#[test]
+fn excluding_a_bundle_does_not_touch_the_disk_or_make_files_dirty() {
+    let dir = project();
+    let before = snapshot(dir.path());
+    let mut session = open(&dir);
+    let bundle = session.store().bundles()[0];
+
+    session.exclude_bundle(bundle, true);
+
+    assert!(session.dirty_files().is_empty());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[test]
+fn a_bundle_of_another_session_cannot_be_excluded() {
+    let dir = project();
+    let mut session = open(&dir);
+    let other_dir = project();
+    let other = open(&other_dir);
+    let foreign = other.store().bundles()[0];
+
+    assert!(!session.exclude_bundle(foreign, true));
+    for bundle in session.store().bundles() {
+        assert_eq!(session.store().bundle_excluded(bundle), Some(false));
+    }
+}

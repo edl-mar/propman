@@ -23,7 +23,7 @@ use disk::encoding::encode;
 use disk::file::{Loaded, ReadError, WriteError, read_file, write_file};
 use disk::lines::{Line, join_lines, split_lines};
 use store::history::{EditKind, Source};
-use store::{FileId, FileInput, FileReload, LineInput, Store};
+use store::{BundleId, FileId, FileInput, FileReload, LineInput, Store};
 use types::Encoding;
 
 /// Something that went wrong while loading, without stopping the rest.
@@ -129,6 +129,15 @@ impl Session {
     pub fn set_encoding(&mut self, file: FileId, encoding: Encoding) -> bool {
         let mut edit = self.store.edit(EditKind::User, Source::USER);
         let changed = edit.set_encoding(file, encoding);
+        edit.commit();
+        changed
+    }
+
+    /// The user excludes a bundle from the session, or includes it again. Returns whether it
+    /// changed anything.
+    pub fn exclude_bundle(&mut self, bundle: BundleId, excluded: bool) -> bool {
+        let mut edit = self.store.edit(EditKind::User, Source::USER);
+        let changed = edit.exclude_bundle(bundle, excluded);
         edit.commit();
         changed
     }
