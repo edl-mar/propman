@@ -1,4 +1,5 @@
 //! Specification of atomic file replacement (see `disk::atomic`).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 

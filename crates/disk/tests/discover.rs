@@ -1,4 +1,5 @@
 //! Specification of file discovery (see `disk::discover`).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 

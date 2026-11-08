@@ -1,5 +1,5 @@
 //! Helpers shared by the integration tests. Each test binary uses only a part of them.
-#![allow(dead_code)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

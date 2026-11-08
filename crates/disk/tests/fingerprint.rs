@@ -1,5 +1,6 @@
 //! Specification of change detection (see `disk::fingerprint`) and of how `read_file` and
 //! `write_file` use it.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 

@@ -1,5 +1,6 @@
 //! Specification of whole-file reading and writing (see `disk::file`), including the golden
 //! roundtrip over all fixtures.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod common;
 

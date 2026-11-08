@@ -1,4 +1,5 @@
 //! Specification of encoding detection, decoding and encoding (see `disk::encoding`).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use Encoding::{Latin1, Utf8, Utf8Bom, Windows1252};
 use disk::encoding::{DecodeError, Decoded, Encoding, decode, encode};

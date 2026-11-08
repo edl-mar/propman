@@ -1,4 +1,5 @@
 //! Specification of the physical line model (see `disk::lines`).
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use LineEnding::{Cr, CrLf, Lf, None as NoEnd};
 use disk::lines::{Line, LineEnding, join_lines, split_lines};
