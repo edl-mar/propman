@@ -7,8 +7,9 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::TempDir;
-use disk::encoding::{DecodeError, Decoded, Encoding};
+use disk::encoding::{DecodeError, Decoded, Encoding, decode};
 use disk::file::{ReadError, WriteError};
+use disk::fingerprint::hash_bytes;
 use disk::lines::{Line, split_lines};
 
 // These tests are about content. The fingerprint part of the API is specified in
@@ -241,4 +242,64 @@ fn write_file_into_a_missing_directory_is_an_error() {
         .is_err()
     );
     assert!(dir.entries().is_empty());
+}
+
+// ── The original bytes ───────────────────────────────────────────────────────
+
+#[test]
+fn read_file_returns_the_original_bytes_including_a_bom() {
+    let path = fixtures("edge/encodings/messages_de.properties");
+    let loaded = disk::file::read_file(&path, None).unwrap();
+    let on_disk = std::fs::read(&path).unwrap();
+
+    assert_eq!(loaded.bytes, on_disk);
+    assert!(loaded.bytes.starts_with(b"\xef\xbb\xbf"));
+    // the text has no BOM, the bytes do
+    assert!(!loaded.decoded.text.starts_with('\u{feff}'));
+}
+
+#[test]
+fn read_file_returns_the_original_bytes_of_every_fixture() {
+    let mut files = Vec::new();
+    files_under(&fixtures(""), &mut files);
+    assert!(files.len() >= 10, "fixtures not found, got {files:?}");
+    for path in files {
+        let loaded = disk::file::read_file(&path, None).unwrap();
+        assert_eq!(
+            loaded.bytes,
+            std::fs::read(&path).unwrap(),
+            "{}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn the_bytes_do_not_depend_on_a_hint() {
+    let path = fixtures("edge/encodings/messages_it.properties");
+    let detected = disk::file::read_file(&path, None).unwrap();
+    let forced = disk::file::read_file(&path, Some(Encoding::Latin1)).unwrap();
+    assert_eq!(detected.bytes, std::fs::read(&path).unwrap());
+    assert_eq!(detected.bytes, forced.bytes);
+    assert_ne!(detected.decoded.text, forced.decoded.text);
+}
+
+#[test]
+fn the_fingerprint_describes_exactly_these_bytes() {
+    let path = fixtures("edge/encodings/messages_pl.properties");
+    let loaded = disk::file::read_file(&path, None).unwrap();
+    assert_eq!(loaded.fingerprint.len, loaded.bytes.len() as u64);
+    assert_eq!(loaded.fingerprint.hash, hash_bytes(&loaded.bytes));
+}
+
+#[test]
+fn decoding_the_returned_bytes_gives_the_same_text_again() {
+    // so that a store can decode again from the bytes, for example with another encoding
+    let mut files = Vec::new();
+    files_under(&fixtures(""), &mut files);
+    for path in files {
+        let loaded = disk::file::read_file(&path, None).unwrap();
+        let again = decode(&loaded.bytes, None).unwrap();
+        assert_eq!(again, loaded.decoded, "{}", path.display());
+    }
 }

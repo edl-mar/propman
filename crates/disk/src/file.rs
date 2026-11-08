@@ -24,6 +24,9 @@ use crate::lines::{Line, join_lines};
 pub struct Loaded {
     pub decoded: Decoded,
     pub fingerprint: Fingerprint,
+    /// The bytes of the file exactly as they were read, including a BOM. The decoded text and the
+    /// fingerprint both describe these bytes.
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,7 @@ pub fn read_file(path: &Path, hint: Option<Encoding>) -> Result<Loaded, ReadErro
     Ok(Loaded {
         decoded,
         fingerprint,
+        bytes,
     })
 }
 
