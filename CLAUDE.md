@@ -108,16 +108,11 @@ drafts about it is a rule.
 
 ## Layout of the repository
 
-- `crates/`: the seven crates. Integration tests are in `crates/<crate>/tests/`, shared helpers
-  (a temp dir without an extra dependency) in `tests/common/mod.rs`.
 - `fixtures/`: static input for tests, compared byte for byte (`.gitattributes` sets `-text`).
   `edge/` holds minimal cases, one property per file; `project/` a realistic multi-bundle layout.
   Tests read only `fixtures/`.
 - `playground/`: the user's sandbox, committed on purpose so that `git diff` after a save shows
   roundtrip bugs. Tests never read it; do not change it unasked.
-- `tools/`: helpers outside the build, for example `Codes.java`, which regenerates the language
-  and country code lists from a JDK.
-- `docs/`: see above.
 
 ## Still open: do not design or anticipate
 
