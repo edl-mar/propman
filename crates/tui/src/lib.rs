@@ -486,11 +486,9 @@ pub fn run(ui: &Ui, state: AppState) -> io::Result<AppState> {
         state,
         ratatui::crossterm::event::read,
         edit,
+        // F12 writes the screen as text to a file; failing to write it is of no consequence
         &mut |text| {
-            // with PROPMAN_DEBUG set, F12 writes the screen as text to a file
-            if std::env::var_os("PROPMAN_DEBUG").is_some() {
-                let _ = std::fs::write("propman-screen.txt", text);
-            }
+            let _ = std::fs::write("propman-screen.txt", text);
         },
     );
     ratatui::restore();
