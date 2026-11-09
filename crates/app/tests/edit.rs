@@ -7,7 +7,8 @@ mod common;
 use std::path::PathBuf;
 
 use app::{
-    AppState, EditorOutcome, Effect, Message, ReloadError, Session, perform, preview, update,
+    AppState, EditorOutcome, Effect, Message, OverviewState, ReloadError, Session, View, perform,
+    preview, update,
 };
 use common::{TempDir, fixtures};
 use store::FileId;
@@ -36,6 +37,12 @@ fn on_the_file(state: AppState) -> AppState {
 
 fn the_file(state: &AppState) -> FileId {
     state.session().store().files()[0]
+}
+
+fn overview_state(state: &AppState) -> OverviewState {
+    match state.view() {
+        View::Overview(overview) => *overview,
+    }
 }
 
 fn path_of(dir: &TempDir) -> PathBuf {
@@ -83,7 +90,7 @@ fn a_closed_editor_asks_to_read_the_file_again() {
         },
     );
     assert_eq!(effect, Some(Effect::Reload(file)));
-    assert_eq!(state.notice(), None);
+    assert_eq!(state.alert(), None);
 }
 
 #[test]
@@ -103,9 +110,9 @@ fn an_editor_that_did_not_work_is_told_to_the_user_and_the_file_is_not_read_agai
         let (state, effect) = update(state, Message::EditorClosed { file, outcome });
         assert_eq!(effect, None, "{outcome:?}");
         assert!(
-            state.notice().is_some_and(|notice| notice.contains(text)),
+            state.alert().is_some_and(|alert| alert.contains(text)),
             "{outcome:?}: {:?}",
-            state.notice()
+            state.alert()
         );
     }
 }
@@ -122,7 +129,7 @@ fn a_file_that_was_read_again_says_nothing() {
         },
     );
     assert_eq!(effect, None);
-    assert_eq!(state.notice(), None);
+    assert_eq!(state.alert(), None);
 }
 
 #[test]
@@ -145,16 +152,16 @@ fn a_file_that_could_not_be_read_again_is_told_to_the_user() {
         );
         assert_eq!(effect, None, "{error:?}");
         assert!(
-            state.notice().is_some_and(|notice| notice.contains(text)),
+            state.alert().is_some_and(|alert| alert.contains(text)),
             "{error:?}: {:?}",
-            state.notice()
+            state.alert()
         );
     }
 }
 
-// ── The notice ───────────────────────────────────────────────────────────────
+// ── The alert ───────────────────────────────────────────────────────────────
 
-fn with_a_notice() -> (AppState, TempDir) {
+fn with_an_alert() -> (AppState, TempDir) {
     let (state, dir) = one_file(b"a=1\n");
     let file = the_file(&state);
     let state = send(
@@ -164,37 +171,104 @@ fn with_a_notice() -> (AppState, TempDir) {
             outcome: EditorOutcome::NoEditor,
         }],
     );
-    assert!(state.notice().is_some());
+    assert!(state.alert().is_some());
     (state, dir)
 }
 
-#[test]
-fn a_notice_stays_while_only_the_size_of_the_screen_changes() {
-    let (state, _dir) = with_a_notice();
-    let state = send(state, &[Message::Viewport(20)]);
-    assert!(state.notice().is_some());
+/// What the selection and the preview are, to see that nothing moved.
+fn looks_like(state: &AppState) -> (usize, usize, bool, usize) {
+    let overview = overview_state(state);
+    (
+        overview.selected(),
+        overview.scroll(),
+        overview.preview_on(),
+        overview.preview_scroll(),
+    )
 }
 
 #[test]
-fn the_next_key_takes_the_notice_away() {
-    for message in [
+fn an_alert_blocks_what_the_keys_of_the_view_do() {
+    let blocked = [
         Message::Down,
         Message::Up,
+        Message::PageDown,
         Message::First,
+        Message::Last,
         Message::TogglePreview,
         Message::PreviewDown,
+        Message::PreviewHalfPageDown,
         Message::Edit,
-        Message::Quit,
-    ] {
-        let (state, _dir) = with_a_notice();
-        let state = send(state, &[message]);
-        assert_eq!(state.notice(), None, "{message:?}");
+    ];
+    for message in blocked {
+        let (state, _dir) = with_an_alert();
+        let before = looks_like(&state);
+        let text = state.alert().map(str::to_owned);
+        let (state, effect) = update(state, message);
+        assert_eq!(effect, None, "{message:?}");
+        assert_eq!(looks_like(&state), before, "{message:?}");
+        assert_eq!(state.alert().map(str::to_owned), text, "{message:?}");
     }
 }
 
 #[test]
-fn a_new_notice_replaces_the_old_one() {
-    let (state, _dir) = with_a_notice();
+fn edit_on_a_file_is_blocked_by_an_alert_and_gives_no_effect() {
+    let (state, _dir) = one_file(
+        b"a=1
+",
+    );
+    let state = on_the_file(state);
+    let file = the_file(&state);
+    let state = send(
+        state,
+        &[Message::EditorClosed {
+            file,
+            outcome: EditorOutcome::NoEditor,
+        }],
+    );
+    assert_eq!(update(state, Message::Edit).1, None);
+}
+
+#[test]
+fn the_size_of_the_screen_still_reaches_the_state_while_an_alert_is_shown() {
+    let (state, _dir) = with_an_alert();
+    let state = send(state, &[Message::Viewport(20)]);
+    assert_eq!(overview_state(&state).height(), 20);
+    assert!(state.alert().is_some());
+}
+
+#[test]
+fn dismissing_closes_the_alert_and_the_keys_of_the_view_work_again() {
+    let (state, _dir) = with_an_alert();
+    let state = send(state, &[Message::DismissAlert]);
+    assert_eq!(state.alert(), None);
+    let state = send(state, &[Message::Down]);
+    assert_eq!(overview_state(&state).selected(), 1);
+}
+
+#[test]
+fn dismissing_without_an_alert_does_nothing() {
+    let (state, _dir) = one_file(
+        b"a=1
+",
+    );
+    let state = send(state, &[Message::Viewport(10), Message::Down]);
+    let before = looks_like(&state);
+    let (state, effect) = update(state, Message::DismissAlert);
+    assert_eq!(effect, None);
+    assert_eq!(looks_like(&state), before);
+    assert_eq!(state.alert(), None);
+}
+
+#[test]
+fn an_alert_does_not_keep_the_program_from_quitting() {
+    let (state, _dir) = with_an_alert();
+    let state = send(state, &[Message::Quit]);
+    assert!(state.should_quit());
+}
+
+#[test]
+fn a_new_alert_replaces_the_old_one() {
+    let (state, _dir) = with_an_alert();
     let file = the_file(&state);
     let state = send(
         state,
@@ -203,7 +277,7 @@ fn a_new_notice_replaces_the_old_one() {
             outcome: EditorOutcome::CouldNotStart,
         }],
     );
-    assert!(state.notice().unwrap().contains("could not start"));
+    assert!(state.alert().unwrap().contains("could not start"));
 }
 
 // ── Performing ───────────────────────────────────────────────────────────────
@@ -231,7 +305,7 @@ fn performing_edit_runs_the_editor_on_the_path_and_tells_how_it_ended() {
         );
         assert_eq!(called_with, Some(path_of(&dir)));
         assert_eq!(message, Message::EditorClosed { file, outcome });
-        assert_eq!(state.notice(), None, "update tells the user, not perform");
+        assert_eq!(state.alert(), None, "update tells the user, not perform");
     }
 }
 
@@ -305,7 +379,7 @@ fn a_file_that_the_editor_changed_shows_its_new_lines() {
     let shown = preview(&state).unwrap();
     assert_eq!(shown.total, 3);
     assert_eq!(shown.lines[2].text, "c=3");
-    assert_eq!(state.notice(), None);
+    assert_eq!(state.alert(), None);
 }
 
 #[test]
@@ -317,7 +391,7 @@ fn an_editor_that_failed_leaves_the_lines_and_says_so() {
         EditorOutcome::Failed(Some(1))
     });
     assert_eq!(preview(&state).unwrap().lines[0].text, "a=1");
-    assert!(state.notice().unwrap().contains("exit code 1"));
+    assert!(state.alert().unwrap().contains("exit code 1"));
 }
 
 #[test]
@@ -328,7 +402,7 @@ fn an_editor_that_deleted_the_file_says_so() {
         std::fs::remove_file(path).unwrap();
         EditorOutcome::Done
     });
-    assert!(state.notice().unwrap().contains("deleted"));
+    assert!(state.alert().unwrap().contains("deleted"));
 }
 
 #[test]

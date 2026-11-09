@@ -5,7 +5,7 @@
 //! and one layer per context (the current view); a key of the context wins over the same key of
 //! the global layer. Nothing else in the program names a key.
 
-use app::{Message, View};
+use app::{AppState, Message, View};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,15 +139,20 @@ impl std::fmt::Display for Key {
     }
 }
 
-/// Where a key is looked up besides the global layer: what the user is looking at.
+/// Where a key is looked up besides the global layer: what the user is looking at. An alert is
+/// in front of the view and takes the keys, so the keys of the view do not work meanwhile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Context {
     Overview,
+    Alert,
 }
 
 impl Context {
-    pub fn of(view: &View) -> Context {
-        match view {
+    pub fn of(state: &AppState) -> Context {
+        if state.alert().is_some() {
+            return Context::Alert;
+        }
+        match state.view() {
             View::Overview(_) => Context::Overview,
         }
     }
@@ -219,7 +224,7 @@ impl Keymap {
 }
 
 impl Default for Keymap {
-    /// `q` and `ctrl+c` quit; in the overview `up`/`k` and `down`/`j` move, `pgup` and `pgdn`
+    /// `q` and `ctrl+c` quit; an alert is dismissed by `esc`, `enter` and `space`; in the overview `up`/`k` and `down`/`j` move, `pgup` and `pgdn`
     /// page, `home` and `end` go to the ends, `enter` edits the file, `space` switches the
     /// preview and `ctrl+up`, `ctrl+down`, `ctrl+u` and `ctrl+d` scroll it.
     fn default() -> Keymap {
@@ -236,6 +241,9 @@ impl Default for Keymap {
             .bind(overview, Key::new(Code::Home), Message::First)
             .bind(overview, Key::new(Code::End), Message::Last)
             .bind(overview, Key::new(Code::Enter), Message::Edit)
+            .bind(Context::Alert, Key::new(Code::Esc), Message::DismissAlert)
+            .bind(Context::Alert, Key::new(Code::Enter), Message::DismissAlert)
+            .bind(Context::Alert, Key::char(' '), Message::DismissAlert)
             .bind(overview, Key::char(' '), Message::TogglePreview)
             .bind(overview, Key::new(Code::Up).ctrl(), Message::PreviewUp)
             .bind(overview, Key::new(Code::Down).ctrl(), Message::PreviewDown)

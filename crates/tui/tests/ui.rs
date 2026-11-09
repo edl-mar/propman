@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use app::{AppState, EditorOutcome, Message, OverviewState, Session, View, preview, update};
+use app::{AppState, EditorOutcome, Message, Session, View, preview, update};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -91,13 +91,9 @@ fn render(state: &AppState, frame: &mut ratatui::Frame) {
     render_with(&Ui::default(), state, frame);
 }
 
-fn overview_view() -> View {
-    View::Overview(OverviewState::default())
-}
-
 /// The message of an event with the standard keymap, in the overview.
 fn message_for(event: &Event) -> Option<Message> {
-    message_with(&Ui::default(), &overview_view(), event)
+    message_with(&Ui::default(), Context::Overview, event)
 }
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -680,15 +676,15 @@ fn the_messages_come_from_the_keymap_of_the_ui() {
             .bind(OVERVIEW, Key::char('x'), Message::Down)
             .bind(OVERVIEW, Key::new(Code::Esc), Message::Quit),
     );
-    let view = overview_view();
-    assert_eq!(message_with(&ui, &view, &press('x')), Some(Message::Down));
+    let view = Context::Overview;
+    assert_eq!(message_with(&ui, view, &press('x')), Some(Message::Down));
     assert_eq!(
-        message_with(&ui, &view, &key(KeyCode::Esc, KeyModifiers::NONE)),
+        message_with(&ui, view, &key(KeyCode::Esc, KeyModifiers::NONE)),
         Some(Message::Quit)
     );
     // the standard keys are gone, the keymap is the only place that knows them
-    assert_eq!(message_with(&ui, &view, &press('q')), None);
-    assert_eq!(message_with(&ui, &view, &press('j')), None);
+    assert_eq!(message_with(&ui, view, &press('q')), None);
+    assert_eq!(message_with(&ui, view, &press('j')), None);
 }
 
 #[test]
@@ -699,8 +695,11 @@ fn only_the_press_of_a_bound_key_gives_a_message() {
         KeyModifiers::NONE,
         KeyEventKind::Release,
     ));
-    assert_eq!(message_with(&ui, &overview_view(), &release), None);
-    assert_eq!(message_with(&ui, &overview_view(), &Event::FocusLost), None);
+    assert_eq!(message_with(&ui, Context::Overview, &release), None);
+    assert_eq!(
+        message_with(&ui, Context::Overview, &Event::FocusLost),
+        None
+    );
 }
 
 #[test]
@@ -708,7 +707,7 @@ fn altgr_still_gives_the_plain_character_with_a_custom_keymap() {
     let ui = ui_with(Keymap::empty().bind_global(Key::char('@'), Message::Down));
     let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
     assert_eq!(
-        message_with(&ui, &overview_view(), &key(KeyCode::Char('@'), altgr)),
+        message_with(&ui, Context::Overview, &key(KeyCode::Char('@'), altgr)),
         Some(Message::Down)
     );
 }
@@ -786,6 +785,7 @@ fn loud_theme() -> Theme {
         uncertain: Style::new().fg(Color::Magenta),
         excluded: Style::new().fg(Color::Cyan),
         selected: Style::new().add_modifier(Modifier::UNDERLINED),
+        alert: Style::new().fg(Color::LightRed),
         line_number: Style::new().fg(Color::Yellow),
         ending: Style::new().fg(Color::LightBlue),
     }
@@ -1167,8 +1167,173 @@ fn enter_on_a_folder_does_not_run_the_editor() {
     assert_eq!(calls, 0, "the folder and then the bundle");
 }
 
+// ── The alert ────────────────────────────────────────────────────────────────
+
+/// The state, with an alert about the outcome of an editor. Any file id will do for an outcome
+/// that only brings an alert: the id is not looked at.
+fn with_alert(state: AppState, outcome: EditorOutcome) -> AppState {
+    let file = state.session().store().files()[0];
+    update(state, Message::EditorClosed { file, outcome }).0
+}
+
+fn rows(screen: &str) -> Vec<&str> {
+    screen.lines().collect()
+}
+
 #[test]
-fn an_editor_that_could_not_run_is_told_on_the_screen_and_the_list_makes_room() {
+fn the_context_is_the_alert_as_long_as_there_is_one() {
+    let state = state_for(&fixtures("project"));
+    assert_eq!(Context::of(&state), Context::Overview);
+    let state = with_alert(state, EditorOutcome::NoEditor);
+    assert_eq!(Context::of(&state), Context::Alert);
+    let state = update(state, Message::DismissAlert).0;
+    assert_eq!(Context::of(&state), Context::Overview);
+}
+
+#[test]
+fn an_alert_is_a_box_at_the_top_with_the_title_error_and_the_text() {
+    let state = with_alert(state_for(&fixtures("project")), EditorOutcome::NoEditor);
+    let screen = drawn(&state, 110, 12);
+    let rows = rows(&screen);
+    assert!(rows[0].contains("error"), "{screen}");
+    assert!(
+        rows[1].contains("no editor: set VISUAL or EDITOR"),
+        "{screen}"
+    );
+    assert!(
+        rows[0].starts_with(|c: char| !c.is_whitespace()),
+        "the box starts at the left edge: {screen}"
+    );
+    // the box is as high as its text and its border: the third row is the bottom border
+    assert!(!rows[2].contains("bundle"), "{screen}");
+    assert!(
+        rows[3].contains("files"),
+        "the list goes on below the box: {screen}"
+    );
+}
+
+#[test]
+fn a_long_alert_is_wrapped_inside_the_box() {
+    let state = with_alert(
+        state_for(&fixtures("project")),
+        EditorOutcome::Failed(Some(1)),
+    );
+    let screen = drawn(&state, 24, 12);
+    let rows = rows(&screen);
+    let first = rows
+        .iter()
+        .position(|row| row.contains("the editor"))
+        .unwrap();
+    let last = rows.iter().position(|row| row.contains("code 1")).unwrap();
+    assert!(first < last, "{screen}");
+    assert!(
+        last <= 4,
+        "the box is not higher than its text needs: {screen}"
+    );
+}
+
+#[test]
+fn an_alert_does_not_move_the_list() {
+    let plain = state_for(&fixtures("project"));
+    let plain_screen = drawn(&plain, 110, 14);
+    let alert_screen = drawn(&with_alert(plain, EditorOutcome::NoEditor), 110, 14);
+    let plain_rows = rows(&plain_screen);
+    let alert_rows = rows(&alert_screen);
+    let last = plain_rows.len() - 1;
+    // below the box and above the line with the keys, the screen is the same
+    assert_eq!(plain_rows[3..last], alert_rows[3..last]);
+}
+
+#[test]
+fn the_line_with_the_keys_names_only_what_works_while_there_is_an_alert() {
+    let state = with_alert(
+        state_with_preview(&fixtures("project")),
+        EditorOutcome::NoEditor,
+    );
+    let footer = last_line(&drawn(&state, 140, 10));
+    assert!(footer.contains("esc/enter/space: dismiss"), "{footer}");
+    assert!(footer.contains("q/ctrl+c: quit"), "{footer}");
+    for not_there in ["move", "edit", "page", "preview"] {
+        assert!(!footer.contains(not_there), "{not_there}: {footer}");
+    }
+}
+
+#[test]
+fn the_theme_styles_the_alert_and_never_changes_its_text() {
+    let state = with_alert(state_for(&fixtures("project")), EditorOutcome::NoEditor);
+    let ui = themed(loud_theme());
+    let terminal = drawn_terminal(&ui, &state);
+    assert_eq!(
+        style_at(&terminal, "no editor: set VISUAL").fg,
+        Some(Color::LightRed)
+    );
+    assert_eq!(style_at(&terminal, "error").fg, Some(Color::LightRed));
+    assert_eq!(
+        drawn_with(&ui, &state, 110, 30),
+        drawn(&state, 110, 30),
+        "a theme never changes the text"
+    );
+}
+
+#[test]
+fn drawing_an_alert_survives_a_tiny_area() {
+    let state = with_alert(
+        state_with_preview(&fixtures("project")),
+        EditorOutcome::Failed(Some(1)),
+    );
+    for (width, height) in [
+        (0, 0),
+        (1, 1),
+        (5, 1),
+        (20, 3),
+        (100, 2),
+        (110, 40),
+        (3, 30),
+    ] {
+        let mut terminal = terminal(width, height);
+        terminal
+            .draw(|frame| render_with(&Ui::default(), &state, frame))
+            .unwrap();
+    }
+}
+
+#[test]
+fn while_an_alert_is_shown_the_loop_leaves_the_selection_alone_until_it_is_dismissed() {
+    for dismiss in [
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Enter, KeyModifiers::NONE),
+        press(' '),
+    ] {
+        let dir = TempDir::new();
+        write(&dir, "a.properties", b"a=1\n");
+        write(&dir, "b.properties", b"b=1\n");
+        let mut terminal = terminal(100, 20);
+        let state = run_with_editor(
+            &mut terminal,
+            state_with_preview(&dir.0),
+            // the list: folder, bundle a, a, bundle b, b; the editor fails on a, `j` is blocked,
+            // and only after the dismissal it moves on
+            vec![
+                press('j'),
+                press('j'),
+                enter(),
+                press('j'),
+                dismiss.clone(),
+                press('j'),
+                press('q'),
+            ],
+            |_| EditorOutcome::NoEditor,
+        )
+        .unwrap();
+        match state.view() {
+            View::Overview(overview) => assert_eq!(overview.selected(), 3, "{dismiss:?}"),
+        }
+        assert_eq!(state.alert(), None, "{dismiss:?}");
+    }
+}
+
+#[test]
+fn an_editor_that_could_not_run_is_shown_in_the_box_and_the_list_keeps_its_height() {
     let lines: Vec<u8> = (1..=30)
         .flat_map(|n| format!("l{n:02}=1\n").into_bytes())
         .collect();
@@ -1187,63 +1352,12 @@ fn an_editor_that_could_not_run_is_told_on_the_screen_and_the_list_makes_room() 
 
     let screen = screen(&terminal);
     assert!(
-        row_with(&screen, "no editor: set VISUAL or EDITOR").starts_with("no editor"),
+        row_with(&screen, "no editor: set VISUAL or EDITOR").contains("no editor"),
         "{screen}"
     );
-    // 10 rows: the title, the count, the notice, the keys; 6 for the list, 5 lines of the file
-    assert!(screen.contains("l05=1"), "{screen}");
-    assert!(!screen.contains("l06=1"), "{screen}");
-}
-
-#[test]
-fn the_notice_and_the_count_of_problems_share_the_line() {
-    let dir = TempDir::new();
-    let state = state_for(&dir.0.join("does_not_exist"));
-    let state = update(
-        state,
-        Message::EditorClosed {
-            file: state_file_for_notice(),
-            outcome: EditorOutcome::NoEditor,
-        },
-    )
-    .0;
-    let screen = drawn(&state, 110, 10);
-    let row = row_with(&screen, "1 problem");
-    assert!(row.contains("no editor: set VISUAL or EDITOR"), "{screen}");
-}
-
-/// Any file id will do for a message that only brings a notice: the id is not looked at.
-fn state_file_for_notice() -> app::FileId {
-    let dir = TempDir::new();
-    write(&dir, "a.properties", b"a=1\n");
-    let state = state_for(&dir.0);
-    state.session().store().files()[0]
-}
-
-#[test]
-fn a_notice_is_drawn_below_the_count_and_a_state_without_one_has_no_such_line() {
-    let dir = TempDir::new();
-    write(&dir, "a.properties", b"a=1\n");
-    let state = state_for(&dir.0);
-    let file = state.session().store().files()[0];
-    let plain = drawn(&state, 110, 10);
-    assert!(!plain.contains("no editor"), "{plain}");
-
-    let state = update(
-        state,
-        Message::EditorClosed {
-            file,
-            outcome: EditorOutcome::NoEditor,
-        },
-    )
-    .0;
-    let screen = drawn(&state, 110, 10);
-    let rows: Vec<&str> = screen.lines().collect();
-    assert!(
-        rows[2].starts_with("no editor: set VISUAL or EDITOR"),
-        "{screen}"
-    );
-    assert!(rows[3].starts_with("> "), "the list follows: {screen}");
+    // 10 rows: the title, the count, the keys and 7 for the list: 6 lines of the file, as always
+    assert!(screen.contains("l06=1"), "{screen}");
+    assert!(!screen.contains("l07=1"), "{screen}");
 }
 
 #[test]

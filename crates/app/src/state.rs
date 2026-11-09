@@ -25,7 +25,7 @@ pub struct AppState {
     session: Session,
     problems: Vec<LoadProblem>,
     quit: bool,
-    notice: Option<String>,
+    alert: Option<String>,
     view: View,
 }
 
@@ -35,7 +35,7 @@ impl AppState {
             session,
             problems,
             quit: false,
-            notice: None,
+            alert: None,
             view: View::Overview(OverviewState::default()),
         }
     }
@@ -53,9 +53,9 @@ impl AppState {
         &self.problems
     }
 
-    /// A short text about what just happened that the user should see, until the next key.
-    pub fn notice(&self) -> Option<&str> {
-        self.notice.as_deref()
+    /// What went wrong, as a text that the user has to dismiss before going on.
+    pub fn alert(&self) -> Option<&str> {
+        self.alert.as_deref()
     }
 
     pub fn should_quit(&self) -> bool {
@@ -121,6 +121,7 @@ impl OverviewState {
             }
             Message::PreviewHalfPageDown => self.preview_scroll += half,
             Message::Quit
+            | Message::DismissAlert
             | Message::Edit
             | Message::EditorClosed { .. }
             | Message::Reloaded { .. } => {}
@@ -207,6 +208,8 @@ pub enum Message {
     /// Scrolls the preview by half of its height.
     PreviewHalfPageUp,
     PreviewHalfPageDown,
+    /// Closes the alert.
+    DismissAlert,
     /// Edits the selected file in the editor of the user.
     Edit,
     /// The editor of the user was closed, or could not be run.
@@ -221,34 +224,39 @@ pub enum Message {
     },
 }
 
-/// The new state for a message, and the effect that is to be performed, if there is one. A
-/// notice stays until the next message that comes from the user: the results of the outside
-/// world and the size of the screen leave it alone.
+/// The new state for a message, and the effect that is to be performed, if there is one. While
+/// there is an alert only quitting, closing it, the size of the screen and the results of the
+/// outside world get through; what the keys of the view do is blocked.
 pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect>) {
-    let from_the_user = !matches!(
+    let gets_through = matches!(
         message,
-        Message::Viewport(_) | Message::EditorClosed { .. } | Message::Reloaded { .. }
+        Message::Quit
+            | Message::DismissAlert
+            | Message::Viewport(_)
+            | Message::EditorClosed { .. }
+            | Message::Reloaded { .. }
     );
-    if from_the_user {
-        state.notice = None;
+    if state.alert.is_some() && !gets_through {
+        return (state, None);
     }
     let mut effect = None;
     match message {
         Message::Quit => state.quit = true,
+        Message::DismissAlert => state.alert = None,
         Message::Edit => effect = edit_effect(&state),
         Message::EditorClosed { file, outcome } => match outcome {
             EditorOutcome::Done => effect = Some(Effect::Reload(file)),
             EditorOutcome::NoEditor => {
-                state.notice = Some("no editor: set VISUAL or EDITOR".to_owned());
+                state.alert = Some("no editor: set VISUAL or EDITOR".to_owned());
             }
             EditorOutcome::CouldNotStart => {
-                state.notice = Some("could not start the editor".to_owned());
+                state.alert = Some("could not start the editor".to_owned());
             }
             EditorOutcome::Failed(Some(code)) => {
-                state.notice = Some(format!("the editor ended with exit code {code}"));
+                state.alert = Some(format!("the editor ended with exit code {code}"));
             }
             EditorOutcome::Failed(None) => {
-                state.notice = Some("the editor ended with an error".to_owned());
+                state.alert = Some("the editor ended with an error".to_owned());
             }
         },
         Message::Reloaded { result, .. } => {
@@ -259,7 +267,7 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
                     ReloadError::Unreadable => "the file could not be read",
                     ReloadError::Undecodable => "the file could not be decoded",
                 };
-                state.notice = Some(text.to_owned());
+                state.alert = Some(text.to_owned());
             }
             // the file may have got shorter
             settle_overview(&mut state);

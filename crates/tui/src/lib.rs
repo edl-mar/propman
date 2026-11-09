@@ -2,14 +2,15 @@
 //!
 //! `render` draws the state and changes nothing. `message_for` turns a terminal event into a
 //! message, or into nothing, by the keymap of the `Ui`; the `Ui` also holds the theme, and the
-//! line with the keys is made from the keymap. Nothing else knows a key or a colour. `run_loop` is the event loop; it gets its source of events from the
-//! outside, so that it can be driven by a fixed list of events and a test buffer instead of a
-//! terminal. `run` is the same loop on the real terminal.
+//! line with the keys is made from the keymap. Nothing else knows a key or a colour. `run_loop`
+//! is the event loop; it gets its source of events from the outside, so that it can be driven by
+//! a fixed list of events and a test buffer instead of a terminal. `run` is the same loop on the
+//! real terminal.
 //!
-//! The screen has a title, a line with the count, a status line (the count of the problems and
-//! the notice, only if there is something to say), the list of the bundle overview and a line
-//! with the keys. The list shows the part that
-//! the state scrolled to. An item is marked as follows, and never by colour alone: the selected
+//! The screen has a title, a line with the count, a status line (the count of the problems, only
+//! if there are any), the list of the bundle overview and a line with the keys. The list shows
+//! the part that the state scrolled to. An alert is a box over the top of the screen; it does
+//! not move anything. An item is marked as follows, and never by colour alone: the selected
 //! one by `>`, an uncertain file by `?`, an excluded bundle by `[excluded]`; the styles of the
 //! theme come on top. On a screen at least 100 columns wide the list gets the left half and the
 //! preview of the selected file the right half, behind a column with `|`.
@@ -33,9 +34,9 @@ use app::{
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 
 /// Why the event loop stopped with an error.
@@ -60,16 +61,64 @@ pub fn list_height(screen_height: u16, has_status: bool) -> usize {
     usize::from(screen_height).saturating_sub(HEADER_LINES + usize::from(has_status) + FOOTER_LINES)
 }
 
-/// The status line: the count of the problems and the notice, if there are any.
+/// The status line: the count of the problems, if there are any.
 fn status_line(state: &AppState) -> Option<String> {
-    let mut parts = Vec::new();
-    if !state.problems().is_empty() {
-        parts.push(counted(state.problems().len(), "problem", "problems"));
+    (!state.problems().is_empty()).then(|| counted(state.problems().len(), "problem", "problems"))
+}
+
+/// The text broken into lines of at most `width` characters, at spaces where possible.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_owned();
+        loop {
+            let length = word.chars().count();
+            let needed = if current.is_empty() {
+                length
+            } else {
+                current.chars().count() + 1 + length
+            };
+            if needed <= width {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(&word);
+                break;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+            // a word that is longer than a line
+            lines.push(word.chars().take(width).collect());
+            word = word.chars().skip(width).collect();
+            if word.is_empty() {
+                break;
+            }
+        }
     }
-    if let Some(notice) = state.notice() {
-        parts.push(notice.to_owned());
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
     }
-    (!parts.is_empty()).then(|| parts.join("   "))
+    lines
+}
+
+/// The alert as a box over the top of the screen, as high as its text needs.
+fn render_alert(theme: &Theme, text: &str, frame: &mut Frame) {
+    let screen = frame.area();
+    let lines = wrap(text, usize::from(screen.width.saturating_sub(2)));
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(screen.height);
+    let area = Rect { height, ..screen };
+    let block = Block::bordered().title(" error ").style(theme.alert);
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let lines: Vec<Line> = lines.into_iter().map(Line::from).collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// "1 file", "12 files".
@@ -250,7 +299,14 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(lines), list);
     }
 
-    frame.render_widget(Paragraph::new(key_help(&ui.keymap, state.view())), footer);
+    frame.render_widget(
+        Paragraph::new(key_help(&ui.keymap, Context::of(state))),
+        footer,
+    );
+
+    if let Some(text) = state.alert() {
+        render_alert(&ui.theme, text, frame);
+    }
 }
 
 /// The columns of the line ending in the preview: wide enough for `(none)`.
@@ -295,10 +351,10 @@ fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'sta
 }
 
 /// What the keys do, as far as they are bound: `q/ctrl+c: quit   up/k/down/j: move ...`.
-fn key_help(keymap: &Keymap, view: &View) -> String {
-    let context = Context::of(view);
-    let groups: [(&[Message], &str); 7] = [
+fn key_help(keymap: &Keymap, context: Context) -> String {
+    let groups: [(&[Message], &str); 8] = [
         (&[Message::Quit], "quit"),
+        (&[Message::DismissAlert], "dismiss"),
         (&[Message::Edit], "edit"),
         (&[Message::Up, Message::Down], "move"),
         (&[Message::PageUp, Message::PageDown], "page"),
@@ -333,9 +389,9 @@ fn key_help(keymap: &Keymap, view: &View) -> String {
 
 /// The message for an event, if there is one. Only the press of a key counts, not its release;
 /// a character with Ctrl and Alt (what AltGr sends) is a plain character.
-pub fn message_for(ui: &Ui, view: &View, event: &Event) -> Option<Message> {
+pub fn message_for(ui: &Ui, context: Context, event: &Event) -> Option<Message> {
     let key = Key::from_event(event)?;
-    ui.keymap.message(Context::of(view), key)
+    ui.keymap.message(context, key)
 }
 
 /// Tells the state how many items fit, draws, waits for an event, updates the state, and repeats
@@ -363,7 +419,7 @@ pub fn run_loop<B: Backend>(
             return Ok(state);
         }
         let event = next_event().map_err(LoopError::Events)?;
-        if let Some(message) = message_for(ui, state.view(), &event) {
+        if let Some(message) = message_for(ui, Context::of(&state), &event) {
             let (next, mut effect) = update(state, message);
             state = next;
             // an effect brings a message about its result, which can bring the next effect

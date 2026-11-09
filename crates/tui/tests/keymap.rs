@@ -316,3 +316,68 @@ fn enter_edits_in_the_overview() {
         Some(Key::new(Code::Enter))
     );
 }
+
+// ── In front of the view: the alert ──────────────────────────────────────────
+
+const ALERT: Context = Context::Alert;
+
+#[test]
+fn escape_enter_and_space_dismiss_an_alert() {
+    let keymap = Keymap::default();
+    for key in [Key::new(Code::Esc), Key::new(Code::Enter), Key::char(' ')] {
+        assert_eq!(
+            keymap.message(ALERT, key),
+            Some(Message::DismissAlert),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        keymap.keys_for(ALERT, Message::DismissAlert),
+        [Key::new(Code::Esc), Key::new(Code::Enter), Key::char(' ')]
+    );
+}
+
+#[test]
+fn the_keys_of_the_view_do_not_work_through_an_alert() {
+    let keymap = Keymap::default();
+    for key in [
+        Key::char('j'),
+        Key::char('k'),
+        Key::new(Code::Up),
+        Key::new(Code::Down),
+        Key::new(Code::PageDown),
+        Key::new(Code::Home),
+        Key::new(Code::End),
+        Key::char('u').ctrl(),
+        Key::char('d').ctrl(),
+    ] {
+        assert_eq!(keymap.message(ALERT, key), None, "{key}");
+    }
+    for message in [Message::Down, Message::Edit, Message::TogglePreview] {
+        assert_eq!(keymap.keys_for(ALERT, message), [], "{message:?}");
+    }
+}
+
+#[test]
+fn the_global_keys_still_work_through_an_alert() {
+    let keymap = Keymap::default();
+    assert_eq!(keymap.message(ALERT, Key::char('q')), Some(Message::Quit));
+    assert_eq!(
+        keymap.message(ALERT, Key::char('c').ctrl()),
+        Some(Message::Quit)
+    );
+}
+
+#[test]
+fn the_keys_of_the_overview_keep_their_meaning() {
+    let keymap = Keymap::default();
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::new(Code::Enter)),
+        Some(Message::Edit)
+    );
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::char(' ')),
+        Some(Message::TogglePreview)
+    );
+    assert_eq!(keymap.message(OVERVIEW, Key::new(Code::Esc)), None);
+}

@@ -23,9 +23,18 @@ not authoritative.
   detected again. (Choosing the encoding that is already in use is no change and so no choice.)
   An editor that fails, or a file that cannot be read again, is told to the user and changes
   nothing. On Windows a program like `code` may have to be named `code.cmd` in `EDITOR`.
-- **The notice** is a text in the state, shown in the status line next to the count of the
-  problems. It stays until the next message that comes from the user; the results of effects and
-  the size of the screen leave it alone.
+- **Something that failed is an alert** (it first was a line of text that was easy to miss): a
+  box over the top of the screen with the title `error` and the text, wrapped, as high as it
+  needs. The layout below does not move. It is **modal**: while it is there, the keys of the view
+  do nothing (the messages are ignored by `update` as well), and only `esc`, `enter` and `space`
+  close it; `q` and `ctrl+c` still quit, because they are global. The size of the screen and the
+  results of effects still get through, and a new alert replaces the old one. The state is an
+  overlay, in front of the view and not a view of its own, and the keymap has the context `Alert`
+  for it. The alert has no level: a success message would be another element that does not block
+  (a toast), and not part of the state; it comes when there is a case for it.
+- **A way to try the failures by hand:** with `PROPMAN_FAKE_EDITOR` set, the editor is replaced
+  by a line with number keys for the ways it can end. Failures of reading a file again cannot be
+  made without changing a file; for those use a copy of a folder.
 
 ### The preview in the overview (2026-11-09)
 - **The use case:** look into a file quickly, for example to check its encoding or its line

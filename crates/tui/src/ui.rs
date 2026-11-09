@@ -18,6 +18,8 @@ pub struct Theme {
     pub excluded: Style,
     /// Added to the selected item.
     pub selected: Style,
+    /// The box of an alert: its border, its title and its text.
+    pub alert: Style,
     /// The number of a line in the preview.
     pub line_number: Style,
     /// The line ending at the right edge of a line in the preview.
@@ -33,6 +35,7 @@ impl Default for Theme {
             uncertain: Style::new().fg(Color::Yellow),
             excluded: Style::new().fg(Color::DarkGray),
             selected: Style::new().add_modifier(Modifier::REVERSED),
+            alert: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             line_number: Style::new().fg(Color::DarkGray),
             ending: Style::new().fg(Color::DarkGray),
         }

@@ -57,7 +57,7 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | view | Ansicht | One of the exclusive screens of the program; for now the bundle overview. An overlay (later) lies over any view. |
 | overview item | Eintrag der Übersicht | One line of the bundle overview: a folder, a bundle or a file. Not an entry (a key) and not a line of a file. |
 | effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |
-| notice | Hinweis | A short text for the user about what just happened (for example that no editor is set). It stays until the next key. Not a problem of loading. |
+| alert | Meldung | A box over the top of the screen that says what went wrong (for example that no editor is set) and has to be dismissed first. An overlay, not a view. Not a problem of loading, and not a toast (a short success message, later). |
 | bundle assignment | Zuordnung | The value that says which bundle and locale a file belongs to, with the confidence. |
 | generation | Generation | The number of a store, carried by every id. An id from another generation gives `None`. |
 
