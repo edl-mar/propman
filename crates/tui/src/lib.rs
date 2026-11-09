@@ -6,22 +6,29 @@
 //! outside, so that it can be driven by a fixed list of events and a test buffer instead of a
 //! terminal. `run` is the same loop on the real terminal.
 //!
-//! The screen has a title, a line with the count, a line with the problems (only if there are
-//! any), the list of the bundle overview and a line with the keys. The list shows the part that
+//! The screen has a title, a line with the count, a status line (the count of the problems and
+//! the notice, only if there is something to say), the list of the bundle overview and a line
+//! with the keys. The list shows the part that
 //! the state scrolled to. An item is marked as follows, and never by colour alone: the selected
 //! one by `>`, an uncertain file by `?`, an excluded bundle by `[excluded]`; the styles of the
 //! theme come on top. On a screen at least 100 columns wide the list gets the left half and the
 //! preview of the selected file the right half, behind a column with `|`.
 
+mod editor;
 mod keys;
 mod ui;
 
 use std::io;
+use std::path::Path;
 
+pub use editor::{EditorCommand, editor_command};
 pub use keys::{Code, Context, Key, Keymap};
 pub use ui::{Theme, Ui};
 
-use app::{AppState, Confidence, Encoding, Message, OverviewItem, View, overview, preview, update};
+use app::{
+    AppState, Confidence, EditorOutcome, Encoding, Message, OverviewItem, View, overview, perform,
+    preview, update,
+};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
 use ratatui::layout::{Constraint, Layout};
@@ -46,10 +53,21 @@ const HEADER_LINES: usize = 2;
 const FOOTER_LINES: usize = 1;
 
 /// How many items of the overview fit on a screen of this height: what is left after the title,
-/// the count, the line for the problems (only if there are any) and the line with the keys.
-pub fn list_height(screen_height: u16, has_problems: bool) -> usize {
-    usize::from(screen_height)
-        .saturating_sub(HEADER_LINES + usize::from(has_problems) + FOOTER_LINES)
+/// the count, the status line (only if there is one) and the line with the keys.
+pub fn list_height(screen_height: u16, has_status: bool) -> usize {
+    usize::from(screen_height).saturating_sub(HEADER_LINES + usize::from(has_status) + FOOTER_LINES)
+}
+
+/// The status line: the count of the problems and the notice, if there are any.
+fn status_line(state: &AppState) -> Option<String> {
+    let mut parts = Vec::new();
+    if !state.problems().is_empty() {
+        parts.push(counted(state.problems().len(), "problem", "problems"));
+    }
+    if let Some(notice) = state.notice() {
+        parts.push(notice.to_owned());
+    }
+    (!parts.is_empty()).then(|| parts.join("   "))
 }
 
 /// "1 file", "12 files".
@@ -152,11 +170,11 @@ fn item_line(
 
 /// Draws the state into the frame.
 pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
-    let has_problems = !state.problems().is_empty();
-    let [title, count, problems, list, footer] = Layout::vertical([
+    let status = status_line(state);
+    let [title, count, status_area, list, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(u16::from(has_problems)),
+        Constraint::Length(u16::from(status.is_some())),
         Constraint::Min(0),
         Constraint::Length(1),
     ])
@@ -176,11 +194,8 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         )),
         count,
     );
-    if has_problems {
-        frame.render_widget(
-            Paragraph::new(counted(state.problems().len(), "problem", "problems")),
-            problems,
-        );
+    if let Some(status) = status {
+        frame.render_widget(Paragraph::new(status), status_area);
     }
 
     let View::Overview(view) = state.view();
@@ -280,8 +295,9 @@ fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'sta
 /// What the keys do, as far as they are bound: `q/ctrl+c: quit   up/k/down/j: move ...`.
 fn key_help(keymap: &Keymap, view: &View) -> String {
     let context = Context::of(view);
-    let groups: [(&[Message], &str); 6] = [
+    let groups: [(&[Message], &str); 7] = [
         (&[Message::Quit], "quit"),
+        (&[Message::Edit], "edit"),
         (&[Message::Up, Message::Down], "move"),
         (&[Message::PageUp, Message::PageDown], "page"),
         (&[Message::First, Message::Last], "ends"),
@@ -328,11 +344,12 @@ pub fn run_loop<B: Backend>(
     ui: &Ui,
     mut state: AppState,
     mut next_event: impl FnMut() -> io::Result<Event>,
+    mut edit: impl FnMut(&mut Terminal<B>, &Path) -> EditorOutcome,
 ) -> Result<AppState, LoopError<B::Error>> {
     let mut told: Option<usize> = None;
     loop {
         let size = terminal.size().map_err(LoopError::Draw)?;
-        let height = list_height(size.height, !state.problems().is_empty());
+        let height = list_height(size.height, status_line(&state).is_some());
         if told != Some(height) {
             state = update(state, Message::Viewport(height)).0;
             told = Some(height);
@@ -345,15 +362,49 @@ pub fn run_loop<B: Backend>(
         }
         let event = next_event().map_err(LoopError::Events)?;
         if let Some(message) = message_for(ui, state.view(), &event) {
-            state = update(state, message).0;
+            let (next, mut effect) = update(state, message);
+            state = next;
+            // an effect brings a message about its result, which can bring the next effect
+            while let Some(current) = effect {
+                let (next, result) = perform(state, current, |path| edit(terminal, path));
+                let (next, following) = update(next, result);
+                state = next;
+                effect = following;
+            }
         }
+    }
+}
+
+/// Runs the editor of the user on a file: leaves the terminal, waits until the editor ends and
+/// enters the terminal again. Nothing happens to the terminal if there is no editor to run.
+fn edit_in_terminal(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> EditorOutcome {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    let Some(command) = editor_command(visual.as_deref(), editor.as_deref(), path) else {
+        return EditorOutcome::NoEditor;
+    };
+    ratatui::restore();
+    let status = std::process::Command::new(&command.program)
+        .args(&command.args)
+        .status();
+    *terminal = ratatui::init();
+    match status {
+        Err(_) => EditorOutcome::CouldNotStart,
+        Ok(status) if status.success() => EditorOutcome::Done,
+        Ok(status) => EditorOutcome::Failed(status.code()),
     }
 }
 
 /// The same loop on the real terminal, which is restored when the loop ends or fails.
 pub fn run(ui: &Ui, state: AppState) -> io::Result<AppState> {
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, ui, state, ratatui::crossterm::event::read);
+    let result = run_loop(
+        &mut terminal,
+        ui,
+        state,
+        ratatui::crossterm::event::read,
+        edit_in_terminal,
+    );
     ratatui::restore();
     result.map_err(|error| match error {
         LoopError::Draw(e) | LoopError::Events(e) => e,

@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use app::{AppState, Message, OverviewState, Session, View, update};
+use app::{AppState, EditorOutcome, Message, OverviewState, Session, View, preview, update};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -192,7 +192,7 @@ fn ctrl_c_quits() {
 fn other_keys_give_no_message() {
     for event in [
         press('x'),
-        key(KeyCode::Enter, KeyModifiers::NONE),
+        key(KeyCode::Enter, KeyModifiers::CONTROL),
         key(KeyCode::Esc, KeyModifiers::NONE),
         key(KeyCode::Tab, KeyModifiers::NONE),
     ] {
@@ -251,12 +251,18 @@ fn run_with_ui(
 ) -> (Result<AppState, LoopError<Infallible>>, usize) {
     let mut events = events.into_iter();
     let mut asked = 0;
-    let result = run_loop_with(terminal, ui, state, || {
-        asked += 1;
-        events
-            .next()
-            .ok_or_else(|| io::Error::other("no more events"))
-    });
+    let result = run_loop_with(
+        terminal,
+        ui,
+        state,
+        || {
+            asked += 1;
+            events
+                .next()
+                .ok_or_else(|| io::Error::other("no more events"))
+        },
+        |_, _| EditorOutcome::NoEditor,
+    );
     (result, asked)
 }
 
@@ -738,7 +744,7 @@ fn last_line(screen: &str) -> String {
 
 #[test]
 fn the_line_with_the_keys_comes_from_the_keymap() {
-    let footer = last_line(&drawn(&state_for(&fixtures("project")), 120, 10));
+    let footer = last_line(&drawn(&state_for(&fixtures("project")), 140, 10));
     assert!(footer.contains("q/ctrl+c: quit"), "{footer}");
     assert!(footer.contains("up/k/down/j: move"), "{footer}");
     assert!(footer.contains("pgup/pgdn: page"), "{footer}");
@@ -1031,7 +1037,7 @@ fn an_empty_file_shows_only_the_header() {
 
 #[test]
 fn the_line_with_the_keys_names_the_keys_of_the_preview() {
-    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 120, 10));
+    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 140, 10));
     assert!(footer.contains("space: preview"), "{footer}");
     assert!(footer.contains("ctrl+u/ctrl+d: scroll preview"), "{footer}");
 }
@@ -1092,4 +1098,156 @@ fn the_keys_of_the_preview_work_in_the_loop() {
     match result.unwrap().view() {
         View::Overview(overview) => assert!(!overview.preview_on()),
     }
+}
+
+// ── Editing a file in the editor ─────────────────────────────────────────────
+
+/// The loop with a fake editor, which is told the path and answers with what `edit` returns.
+fn run_with_editor(
+    terminal: &mut Terminal<TestBackend>,
+    state: AppState,
+    events: Vec<Event>,
+    mut edit: impl FnMut(&Path) -> EditorOutcome,
+) -> Result<AppState, LoopError<Infallible>> {
+    let mut events = events.into_iter();
+    run_loop_with(
+        terminal,
+        &Ui::default(),
+        state,
+        || {
+            events
+                .next()
+                .ok_or_else(|| io::Error::other("no more events"))
+        },
+        |_, path| edit(path),
+    )
+}
+
+fn enter() -> Event {
+    key(KeyCode::Enter, KeyModifiers::NONE)
+}
+
+#[test]
+fn enter_on_a_file_runs_the_editor_on_it_and_reads_the_file_again() {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", b"a=1\n");
+    let mut terminal = terminal(100, 20);
+    let mut calls = Vec::new();
+
+    let state = run_with_editor(
+        &mut terminal,
+        state_with_preview(&dir.0),
+        vec![press('j'), press('j'), enter(), press('q')],
+        |path| {
+            calls.push(path.to_path_buf());
+            std::fs::write(path, b"a=1\nb=2\n").unwrap();
+            EditorOutcome::Done
+        },
+    )
+    .unwrap();
+
+    assert_eq!(calls, [dir.0.join("a.properties")]);
+    assert_eq!(preview(&state).unwrap().total, 2);
+}
+
+#[test]
+fn enter_on_a_folder_does_not_run_the_editor() {
+    let mut terminal = terminal(100, 20);
+    let mut calls = 0;
+    run_with_editor(
+        &mut terminal,
+        state_for(&fixtures("project")),
+        vec![enter(), press('j'), enter(), press('q')],
+        |_| {
+            calls += 1;
+            EditorOutcome::Done
+        },
+    )
+    .unwrap();
+    assert_eq!(calls, 0, "the folder and then the bundle");
+}
+
+#[test]
+fn an_editor_that_could_not_run_is_told_on_the_screen_and_the_list_makes_room() {
+    let lines: Vec<u8> = (1..=30)
+        .flat_map(|n| format!("l{n:02}=1\n").into_bytes())
+        .collect();
+    let dir = TempDir::new();
+    write(&dir, "a.properties", &lines);
+    let mut terminal = terminal(100, 10);
+
+    // the loop stops with an error when the events are used up; the screen is the last one drawn
+    let result = run_with_editor(
+        &mut terminal,
+        state_with_preview(&dir.0),
+        vec![press('j'), press('j'), enter(), Event::Resize(100, 10)],
+        |_| EditorOutcome::NoEditor,
+    );
+    assert!(matches!(result, Err(LoopError::Events(_))));
+
+    let screen = screen(&terminal);
+    assert!(
+        row_with(&screen, "no editor: set VISUAL or EDITOR").starts_with("no editor"),
+        "{screen}"
+    );
+    // 10 rows: the title, the count, the notice, the keys; 6 for the list, 5 lines of the file
+    assert!(screen.contains("l05=1"), "{screen}");
+    assert!(!screen.contains("l06=1"), "{screen}");
+}
+
+#[test]
+fn the_notice_and_the_count_of_problems_share_the_line() {
+    let dir = TempDir::new();
+    let state = state_for(&dir.0.join("does_not_exist"));
+    let state = update(
+        state,
+        Message::EditorClosed {
+            file: state_file_for_notice(),
+            outcome: EditorOutcome::NoEditor,
+        },
+    )
+    .0;
+    let screen = drawn(&state, 110, 10);
+    let row = row_with(&screen, "1 problem");
+    assert!(row.contains("no editor: set VISUAL or EDITOR"), "{screen}");
+}
+
+/// Any file id will do for a message that only brings a notice: the id is not looked at.
+fn state_file_for_notice() -> app::FileId {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", b"a=1\n");
+    let state = state_for(&dir.0);
+    state.session().store().files()[0]
+}
+
+#[test]
+fn a_notice_is_drawn_below_the_count_and_a_state_without_one_has_no_such_line() {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", b"a=1\n");
+    let state = state_for(&dir.0);
+    let file = state.session().store().files()[0];
+    let plain = drawn(&state, 110, 10);
+    assert!(!plain.contains("no editor"), "{plain}");
+
+    let state = update(
+        state,
+        Message::EditorClosed {
+            file,
+            outcome: EditorOutcome::NoEditor,
+        },
+    )
+    .0;
+    let screen = drawn(&state, 110, 10);
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(
+        rows[2].starts_with("no editor: set VISUAL or EDITOR"),
+        "{screen}"
+    );
+    assert!(rows[3].starts_with("> "), "the list follows: {screen}");
+}
+
+#[test]
+fn the_line_with_the_keys_names_the_key_to_edit() {
+    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 140, 10));
+    assert!(footer.contains("enter: edit"), "{footer}");
 }

@@ -266,7 +266,7 @@ fn the_standard_keymap_leaves_other_keys_unbound() {
         Key::char('x'),
         Key::char('c'),
         Key::char('q').ctrl(),
-        Key::new(Code::Enter),
+        Key::new(Code::Enter).ctrl(),
         Key::new(Code::Esc),
         Key::new(Code::Tab),
         Key::new(Code::Up).shift(),
@@ -302,4 +302,17 @@ fn the_standard_keymap_has_the_keys_of_the_preview() {
         Some(Message::Up)
     );
     assert_eq!(keymap.message(OVERVIEW, Key::char('d')), None);
+}
+
+#[test]
+fn enter_edits_in_the_overview() {
+    let keymap = Keymap::default();
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::new(Code::Enter)),
+        Some(Message::Edit)
+    );
+    assert_eq!(
+        Key::from_event(&event(KeyCode::Enter, KeyModifiers::NONE)),
+        Some(Key::new(Code::Enter))
+    );
 }
