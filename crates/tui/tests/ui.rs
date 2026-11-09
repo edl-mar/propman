@@ -31,7 +31,7 @@ fn state_with_preview(folder: &Path) -> AppState {
 
 /// The state with the preview switched off, so that the tests of the list see the whole width.
 fn state_for(folder: &Path) -> AppState {
-    update(state_with_preview(folder), Message::TogglePreview)
+    update(state_with_preview(folder), Message::TogglePreview).0
 }
 
 /// A fresh folder below the system temp dir, removed on drop.
@@ -338,7 +338,7 @@ fn write(dir: &TempDir, relative: &str, bytes: &[u8]) {
 fn press_all(state: AppState, messages: &[Message]) -> AppState {
     messages
         .iter()
-        .fold(state, |state, &message| update(state, message))
+        .fold(state, |state, &message| update(state, message).0)
 }
 
 /// The lines of the list on the screen: after the title, the count and (if there are any) the

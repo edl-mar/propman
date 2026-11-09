@@ -1,7 +1,8 @@
 //! The state of the user interface and how messages change it, without any terminal library.
 //!
 //! The structure is inspired by The Elm Architecture: a message says what happened, `update`
-//! takes the state by value and returns the new one, and the view only reads the state. The
+//! takes the state by value and returns the new one together with at most one effect (see
+//! `Effect`), and the view only reads the state. The
 //! state holds the session and what went wrong while loading it; what is shown and chosen (the
 //! current view, the selection) belongs here too and never in the store.
 //!
@@ -14,6 +15,7 @@
 //! it is scrolled. The scroll position starts at the top again when the selection changes and
 //! never goes past the last window of the file. What the preview shows is `preview`.
 
+use crate::effect::Effect;
 use crate::overview::{OverviewItem, overview};
 use crate::session::{LoadProblem, Session};
 
@@ -186,7 +188,8 @@ pub enum Message {
     PreviewHalfPageDown,
 }
 
-pub fn update(mut state: AppState, message: Message) -> AppState {
+/// The new state for a message, and the effect that is to be performed, if there is one.
+pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect>) {
     match message {
         Message::Quit => state.quit = true,
         other => {
@@ -199,5 +202,5 @@ pub fn update(mut state: AppState, message: Message) -> AppState {
             view.apply(other, items.len(), lines_of);
         }
     }
-    state
+    (state, None)
 }

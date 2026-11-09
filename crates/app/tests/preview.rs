@@ -23,7 +23,7 @@ fn one_file(bytes: &[u8]) -> (AppState, TempDir) {
 fn send(state: AppState, messages: &[Message]) -> AppState {
     messages
         .iter()
-        .fold(state, |state, &message| update(state, message))
+        .fold(state, |state, &message| update(state, message).0)
 }
 
 /// The file is selected and the list is `height` rows high.

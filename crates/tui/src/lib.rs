@@ -334,7 +334,7 @@ pub fn run_loop<B: Backend>(
         let size = terminal.size().map_err(LoopError::Draw)?;
         let height = list_height(size.height, !state.problems().is_empty());
         if told != Some(height) {
-            state = update(state, Message::Viewport(height));
+            state = update(state, Message::Viewport(height)).0;
             told = Some(height);
         }
         terminal
@@ -345,7 +345,7 @@ pub fn run_loop<B: Backend>(
         }
         let event = next_event().map_err(LoopError::Events)?;
         if let Some(message) = message_for(ui, state.view(), &event) {
-            state = update(state, message);
+            state = update(state, message).0;
         }
     }
 }

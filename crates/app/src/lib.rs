@@ -1,10 +1,12 @@
 //! Connects `store` and `disk`: load/save/reload, app state, ops. No terminal dependencies.
 
+mod effect;
 mod overview;
 mod preview;
 mod session;
 mod state;
 
+pub use effect::Effect;
 pub use overview::{OverviewItem, overview};
 pub use preview::{Preview, PreviewLine, preview};
 pub use session::{LoadProblem, SaveError, Session};

@@ -32,8 +32,29 @@ fn problems_from_loading_are_kept_in_the_state() {
 }
 
 #[test]
+fn moving_and_scrolling_ask_for_no_effect() {
+    for message in [
+        Message::Up,
+        Message::Down,
+        Message::PageUp,
+        Message::PageDown,
+        Message::First,
+        Message::Last,
+        Message::Viewport(10),
+        Message::TogglePreview,
+        Message::PreviewUp,
+        Message::PreviewDown,
+        Message::PreviewHalfPageUp,
+        Message::PreviewHalfPageDown,
+    ] {
+        assert_eq!(update(state(), message).1, None, "{message:?}");
+    }
+}
+
+#[test]
 fn quit_asks_to_quit() {
-    let state = update(state(), Message::Quit);
+    let (state, effect) = update(state(), Message::Quit);
+    assert_eq!(effect, None);
     assert!(state.should_quit());
 }
 
@@ -43,7 +64,7 @@ fn update_keeps_the_session_and_the_problems() {
     let (session, problems) = Session::open(&dir.path().join("does_not_exist"));
     let state = AppState::new(session, problems);
 
-    let state = update(state, Message::Quit);
+    let (state, _) = update(state, Message::Quit);
 
     assert_eq!(state.problems().len(), 1);
     assert!(state.session().store().files().is_empty());
@@ -51,7 +72,7 @@ fn update_keeps_the_session_and_the_problems() {
 
 #[test]
 fn quitting_twice_is_the_same_as_quitting_once() {
-    let state = update(update(state(), Message::Quit), Message::Quit);
+    let state = update(update(state(), Message::Quit).0, Message::Quit).0;
     assert!(state.should_quit());
     assert_eq!(state.session().store().files().len(), 12);
 }
@@ -70,7 +91,7 @@ fn overview_state(state: &AppState) -> OverviewState {
 fn press(state: AppState, messages: &[Message]) -> AppState {
     messages
         .iter()
-        .fold(state, |state, &message| update(state, message))
+        .fold(state, |state, &message| update(state, message).0)
 }
 
 fn empty_state() -> (AppState, TempDir) {
