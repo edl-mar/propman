@@ -32,6 +32,14 @@ not authoritative.
   overlay, in front of the view and not a view of its own, and the keymap has the context `Alert`
   for it. The alert has no level: a success message would be another element that does not block
   (a toast), and not part of the state; it comes when there is a case for it.
+- **The alert says how to close it:** the keys that dismiss it, from the keymap, are the title of
+  its lower border (`esc/enter/space: dismiss`); without such a key there is no hint.
+- **The screen as text, for the developer:** `tui::screen_text` gives the rows of the screen and
+  the runs of cells that are not plain, with colours and modifiers in words. `F12` sends it to
+  the loop's sink; `run` writes it to `propman-screen.txt` in the current folder (ignored by git)
+  only if `PROPMAN_DEBUG` is set, so that the program never writes a file unasked. It is not part
+  of the Elm cycle (no message, no effect, not in the keymap): the loop watches the screen like a
+  debugger does. Meant for showing the maintainer's screen to someone who cannot see it.
 - **A way to try the failures by hand:** with `PROPMAN_FAKE_EDITOR` set, the editor is replaced
   by a line with number keys for the ways it can end. Failures of reading a file again cannot be
   made without changing a file; for those use a copy of a folder.

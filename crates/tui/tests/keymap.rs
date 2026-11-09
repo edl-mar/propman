@@ -121,7 +121,7 @@ fn events_without_a_nameable_key_give_none() {
         Event::Resize(80, 24),
         Event::FocusGained,
         Event::FocusLost,
-        event(KeyCode::F(1), KeyModifiers::NONE),
+        event(KeyCode::Insert, KeyModifiers::NONE),
         event(KeyCode::Backspace, KeyModifiers::NONE),
         event(KeyCode::Delete, KeyModifiers::NONE),
     ] {
@@ -380,4 +380,21 @@ fn the_keys_of_the_overview_keep_their_meaning() {
         Some(Message::TogglePreview)
     );
     assert_eq!(keymap.message(OVERVIEW, Key::new(Code::Esc)), None);
+}
+
+// ── Function keys ────────────────────────────────────────────────────────────
+
+#[test]
+fn function_keys_are_keys() {
+    let none = KeyModifiers::NONE;
+    assert_eq!(
+        Key::from_event(&event(KeyCode::F(1), none)),
+        Some(Key::new(Code::F(1)))
+    );
+    assert_eq!(
+        Key::from_event(&event(KeyCode::F(12), KeyModifiers::CONTROL)),
+        Some(Key::new(Code::F(12)).ctrl())
+    );
+    assert_eq!(Key::new(Code::F(1)).to_string(), "f1");
+    assert_eq!(Key::new(Code::F(12)).ctrl().to_string(), "ctrl+f12");
 }

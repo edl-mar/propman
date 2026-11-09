@@ -258,6 +258,7 @@ fn run_with_ui(
                 .ok_or_else(|| io::Error::other("no more events"))
         },
         |_, _| EditorOutcome::NoEditor,
+        &mut |_| {},
     );
     (result, asked)
 }
@@ -1120,6 +1121,7 @@ fn run_with_editor(
                 .ok_or_else(|| io::Error::other("no more events"))
         },
         |_, path| edit(path),
+        &mut |_| {},
     )
 }
 
@@ -1364,4 +1366,163 @@ fn an_editor_that_could_not_run_is_shown_in_the_box_and_the_list_keeps_its_heigh
 fn the_line_with_the_keys_names_the_key_to_edit() {
     let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 140, 10));
     assert!(footer.contains("enter: edit"), "{footer}");
+}
+
+// ── The alert says how to close it ───────────────────────────────────────────
+
+#[test]
+fn the_alert_says_how_to_dismiss_it_on_its_lower_border() {
+    let state = with_alert(state_for(&fixtures("project")), EditorOutcome::NoEditor);
+    let screen = drawn(&state, 110, 12);
+    let rows = rows(&screen);
+    assert!(rows[2].contains("esc/enter/space: dismiss"), "{screen}");
+    assert!(!rows[1].contains("dismiss"), "{screen}");
+    assert!(
+        rows[1].contains("no editor: set VISUAL or EDITOR"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_hint_comes_from_the_keymap() {
+    let state = with_alert(state_for(&fixtures("project")), EditorOutcome::NoEditor);
+    let more =
+        ui_with(Keymap::default().bind(Context::Alert, Key::char('x'), Message::DismissAlert));
+    let screen = drawn_with(&more, &state, 110, 12);
+    assert!(
+        rows(&screen)[2].contains("esc/enter/space/x: dismiss"),
+        "{screen}"
+    );
+
+    let none = ui_with(Keymap::empty().bind_global(Key::char('q'), Message::Quit));
+    let screen = drawn_with(&none, &state, 110, 12);
+    assert!(!screen.contains("dismiss"), "{screen}");
+}
+
+#[test]
+fn the_hint_is_on_the_lower_border_however_high_the_box_is() {
+    let state = with_alert(state_for(&fixtures("project")), EditorOutcome::NoEditor);
+    // one line of text: the top border, the text and the lower border
+    let wide = drawn(&state, 110, 12);
+    assert!(rows(&wide)[2].contains("dismiss"), "{wide}");
+    assert!(!rows(&wide)[3].contains("dismiss"), "{wide}");
+    // the text is wrapped into two lines: the lower border is the fourth row
+    let narrow = drawn(&state, 30, 12);
+    assert!(rows(&narrow)[3].contains("dismiss"), "{narrow}");
+    assert!(!rows(&narrow)[4].contains("dismiss"), "{narrow}");
+}
+
+// ── The screen as text ───────────────────────────────────────────────────────
+
+fn text_of(ui: &Ui, state: &AppState, width: u16, height: u16) -> String {
+    tui::screen_text(ui, state, width, height)
+}
+
+#[test]
+fn the_text_of_the_screen_has_a_header_the_rows_and_a_list_of_styles() {
+    let state = state_for(&fixtures("project"));
+    let text = text_of(&Ui::default(), &state, 60, 8);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "screen 60x8");
+    assert_eq!(lines[1], "text:");
+    assert_eq!(lines[10], "styles:");
+}
+
+#[test]
+fn the_rows_of_the_text_are_the_rows_of_the_screen_without_trailing_spaces() {
+    let state = state_for(&fixtures("project"));
+    let text = text_of(&Ui::default(), &state, 60, 8);
+    let rows_in_text: Vec<&str> = text.lines().skip(2).take(8).collect();
+    let drawn = drawn(&state, 60, 8);
+    let expected: Vec<&str> = drawn.lines().map(str::trim_end).collect();
+    assert_eq!(rows_in_text, expected);
+}
+
+#[test]
+fn a_row_with_a_style_is_listed_with_the_style_in_words() {
+    let state = state_for(&fixtures("project"));
+    let text = text_of(&Ui::default(), &state, 60, 8);
+    // the selected folder is bold and reversed
+    let line = text
+        .lines()
+        .skip_while(|line| *line != "styles:")
+        .find(|line| line.starts_with("row 2, columns 0-"))
+        .unwrap_or_else(|| panic!("no style for row 2:\n{text}"));
+    assert!(line.ends_with(": bold reversed"), "{line}");
+}
+
+#[test]
+fn colours_are_named() {
+    let dir = TempDir::new();
+    write(&dir, "single_file_de.properties", b"a=1\n");
+    let state = state_for(&dir.0);
+    let text = text_of(&themed(loud_theme()), &state, 100, 8);
+    let styles: Vec<&str> = text.lines().skip_while(|line| *line != "styles:").collect();
+    // the uncertain file is in the fifth row
+    assert!(
+        styles
+            .iter()
+            .any(|line| line.starts_with("row 4, columns ") && line.contains("fg=Magenta")),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_screen_without_any_style_has_an_empty_list() {
+    let dir = TempDir::new();
+    let state = state_for(&dir.0);
+    let text = text_of(&Ui::default(), &state, 60, 6);
+    assert!(text.trim_end().ends_with("styles:"), "{text}");
+}
+
+#[test]
+fn a_row_with_two_runs_of_style_has_two_lines() {
+    // the number of the line and its ending have a style, the text between them has none
+    let (state, _dir) = on_a_file(b"x=1\n", 10);
+    let text = text_of(&Ui::default(), &state, 110, 10);
+    let in_row_3 = text
+        .lines()
+        .skip_while(|line| *line != "styles:")
+        .filter(|line| line.starts_with("row 3, "))
+        .count();
+    assert_eq!(in_row_3, 2, "{text}");
+}
+
+#[test]
+fn the_key_for_the_screen_gives_the_text_to_the_sink_and_changes_nothing() {
+    let mut terminal = terminal(100, 10);
+    let mut texts: Vec<String> = Vec::new();
+    let mut events = vec![
+        key(KeyCode::F(12), KeyModifiers::NONE),
+        press('j'),
+        key(KeyCode::F(12), KeyModifiers::NONE),
+        press('q'),
+    ]
+    .into_iter();
+    let state = run_loop_with(
+        &mut terminal,
+        &Ui::default(),
+        state_for(&fixtures("project")),
+        || {
+            events
+                .next()
+                .ok_or_else(|| io::Error::other("no more events"))
+        },
+        |_, _| EditorOutcome::NoEditor,
+        &mut |text| texts.push(text.to_owned()),
+    )
+    .unwrap();
+
+    assert_eq!(texts.len(), 2);
+    assert!(texts[0].starts_with("screen 100x10\n"), "{}", texts[0]);
+    // the first one is of the screen before `j`, the second of the screen after it
+    assert!(texts[0].contains("> .  3 bundles"), "{}", texts[0]);
+    assert!(
+        texts[1].contains("> ") && !texts[1].contains("> .  3 bundles"),
+        "{}",
+        texts[1]
+    );
+    match state.view() {
+        View::Overview(overview) => assert_eq!(overview.selected(), 1),
+    }
 }

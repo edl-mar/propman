@@ -18,6 +18,7 @@
 mod editor;
 mod fake_editor;
 mod keys;
+mod screen;
 mod ui;
 
 use std::io;
@@ -26,6 +27,7 @@ use std::path::Path;
 pub use editor::{EditorCommand, editor_command};
 pub use fake_editor::outcome_for_key;
 pub use keys::{Code, Context, Key, Keymap};
+pub use screen::screen_text;
 pub use ui::{Theme, Ui};
 
 use app::{
@@ -106,14 +108,22 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// The alert as a box over the top of the screen, as high as its text needs.
-fn render_alert(theme: &Theme, text: &str, frame: &mut Frame) {
+fn render_alert(theme: &Theme, keymap: &Keymap, text: &str, frame: &mut Frame) {
     let screen = frame.area();
     let lines = wrap(text, usize::from(screen.width.saturating_sub(2)));
     let height = u16::try_from(lines.len() + 2)
         .unwrap_or(u16::MAX)
         .min(screen.height);
     let area = Rect { height, ..screen };
-    let block = Block::bordered().title(" error ").style(theme.alert);
+    let keys: Vec<String> = keymap
+        .keys_for(Context::Alert, Message::DismissAlert)
+        .iter()
+        .map(Key::to_string)
+        .collect();
+    let mut block = Block::bordered().title(" error ").style(theme.alert);
+    if !keys.is_empty() {
+        block = block.title_bottom(format!(" {}: dismiss ", keys.join("/")));
+    }
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -305,7 +315,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
     );
 
     if let Some(text) = state.alert() {
-        render_alert(&ui.theme, text, frame);
+        render_alert(&ui.theme, &ui.keymap, text, frame);
     }
 }
 
@@ -403,6 +413,7 @@ pub fn run_loop<B: Backend>(
     mut state: AppState,
     mut next_event: impl FnMut() -> io::Result<Event>,
     mut edit: impl FnMut(&mut Terminal<B>, &Path) -> EditorOutcome,
+    screen_sink: &mut dyn FnMut(&str),
 ) -> Result<AppState, LoopError<B::Error>> {
     let mut told: Option<usize> = None;
     loop {
@@ -419,6 +430,12 @@ pub fn run_loop<B: Backend>(
             return Ok(state);
         }
         let event = next_event().map_err(LoopError::Events)?;
+        // a tool for the developer, not part of the program: the screen as text goes to the sink
+        if Key::from_event(&event) == Some(Key::new(Code::F(12))) {
+            let size = terminal.size().map_err(LoopError::Draw)?;
+            screen_sink(&screen_text(ui, &state, size.width, size.height));
+            continue;
+        }
         if let Some(message) = message_for(ui, Context::of(&state), &event) {
             let (next, mut effect) = update(state, message);
             state = next;
@@ -469,6 +486,12 @@ pub fn run(ui: &Ui, state: AppState) -> io::Result<AppState> {
         state,
         ratatui::crossterm::event::read,
         edit,
+        &mut |text| {
+            // with PROPMAN_DEBUG set, F12 writes the screen as text to a file
+            if std::env::var_os("PROPMAN_DEBUG").is_some() {
+                let _ = std::fs::write("propman-screen.txt", text);
+            }
+        },
     );
     ratatui::restore();
     result.map_err(|error| match error {

@@ -22,6 +22,8 @@ pub enum Code {
     Enter,
     Esc,
     Tab,
+    /// A function key: `F(12)` is F12.
+    F(u8),
 }
 
 /// A key with its modifiers. For a character the case is in the character: `N` is not
@@ -86,6 +88,7 @@ impl Key {
             KeyCode::Enter => Code::Enter,
             KeyCode::Esc => Code::Esc,
             KeyCode::Tab => Code::Tab,
+            KeyCode::F(number) => Code::F(number),
             _ => return None,
         };
         let modifiers = key.modifiers;
@@ -135,6 +138,7 @@ impl std::fmt::Display for Key {
             Code::Enter => f.write_str("enter"),
             Code::Esc => f.write_str("esc"),
             Code::Tab => f.write_str("tab"),
+            Code::F(number) => write!(f, "f{number}"),
         }
     }
 }
