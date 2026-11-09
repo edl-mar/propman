@@ -6,10 +6,10 @@ mod preview;
 mod session;
 mod state;
 
-pub use effect::Effect;
+pub use effect::{EditorOutcome, Effect, perform};
 pub use overview::{OverviewItem, overview};
 pub use preview::{Preview, PreviewLine, preview};
-pub use session::{LoadProblem, SaveError, Session};
+pub use session::{LoadProblem, ReloadError, SaveError, Session};
 pub use state::{AppState, Message, OverviewState, View, update};
 
 // The types that the user interface may read; it does not depend on `store` or `types` itself.

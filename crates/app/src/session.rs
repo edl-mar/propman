@@ -45,6 +45,18 @@ pub enum SaveError {
     Io(io::Error),
 }
 
+/// Why a file could not be read again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadError {
+    /// The id does not belong to this session.
+    UnknownFile,
+    /// The file is not on the disk any more.
+    Deleted,
+    Unreadable,
+    /// The bytes cannot be decoded with the encoding that is used.
+    Undecodable,
+}
+
 pub struct Session {
     store: Store,
     root: PathBuf,
@@ -179,6 +191,52 @@ impl Session {
         encode(&join_lines(&lines), encoding) != bytes
     }
 
+    /// Reads a file from the disk again. What is there becomes a new snapshot if its lines differ
+    /// from the last one. An encoding that the user chose is used to read it; otherwise it is
+    /// detected again.
+    pub fn reload_file(&mut self, file: FileId) -> Result<(), ReloadError> {
+        let (Some(path), Some(current)) = (
+            self.store.file_path(file).map(Path::to_path_buf),
+            self.store.file_encoding(file),
+        ) else {
+            return Err(ReloadError::UnknownFile);
+        };
+        let chosen = self
+            .store
+            .encoding_versions(file)
+            .iter()
+            .any(|version| version.source == Source::USER);
+        self.read_again(file, &path, chosen.then_some(current))
+            .map_err(|error| match error {
+                ReadError::Io(e) if e.kind() == io::ErrorKind::NotFound => ReloadError::Deleted,
+                ReadError::Io(_) => ReloadError::Unreadable,
+                ReadError::Decode(_) => ReloadError::Undecodable,
+            })
+    }
+
+    /// Reads the file and lets the store take what is on the disk as a new snapshot (which
+    /// there is only if the lines differ). The encoding is detected unless one is given.
+    fn read_again(
+        &mut self,
+        file: FileId,
+        path: &Path,
+        encoding: Option<Encoding>,
+    ) -> Result<(), ReadError> {
+        let loaded = read_file(path, encoding)?;
+        let lines = split_lines(&loaded.decoded.text);
+        let inputs = line_inputs(&lines);
+        let input = FileReload {
+            bytes: &loaded.bytes,
+            encoding: loaded.decoded.encoding,
+            fingerprint: loaded.fingerprint,
+            lines: &inputs,
+        };
+        let mut edit = self.store.edit(EditKind::Reload, Source::DISK);
+        edit.reload_file(file, input);
+        edit.commit();
+        Ok(())
+    }
+
     /// Writes a file, whether it is dirty or not.
     pub fn save_file(&mut self, file: FileId) -> Result<(), SaveError> {
         let (Some(path), Some(encoding), Some(expected)) = (
@@ -205,20 +263,8 @@ impl Session {
             })?;
         }
 
-        // Read the file again, with the encoding it was just written in, and let the store take
-        // what is now on the disk as a new snapshot.
-        let loaded = read_file(&path, Some(encoding)).map_err(|e| SaveError::Io(read_error(e)))?;
-        let lines = split_lines(&loaded.decoded.text);
-        let inputs = line_inputs(&lines);
-        let input = FileReload {
-            bytes: &loaded.bytes,
-            encoding: loaded.decoded.encoding,
-            fingerprint: loaded.fingerprint,
-            lines: &inputs,
-        };
-        let mut edit = self.store.edit(EditKind::Reload, Source::DISK);
-        edit.reload_file(file, input);
-        edit.commit();
-        Ok(())
+        // Read the file again, with the encoding it was just written in.
+        self.read_again(file, &path, Some(encoding))
+            .map_err(|e| SaveError::Io(read_error(e)))
     }
 }

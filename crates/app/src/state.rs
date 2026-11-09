@@ -15,14 +15,17 @@
 //! it is scrolled. The scroll position starts at the top again when the selection changes and
 //! never goes past the last window of the file. What the preview shows is `preview`.
 
-use crate::effect::Effect;
+use store::FileId;
+
+use crate::effect::{EditorOutcome, Effect};
 use crate::overview::{OverviewItem, overview};
-use crate::session::{LoadProblem, Session};
+use crate::session::{LoadProblem, ReloadError, Session};
 
 pub struct AppState {
     session: Session,
     problems: Vec<LoadProblem>,
     quit: bool,
+    notice: Option<String>,
     view: View,
 }
 
@@ -32,6 +35,7 @@ impl AppState {
             session,
             problems,
             quit: false,
+            notice: None,
             view: View::Overview(OverviewState::default()),
         }
     }
@@ -40,9 +44,18 @@ impl AppState {
         &self.session
     }
 
+    pub(crate) fn session_mut(&mut self) -> &mut Session {
+        &mut self.session
+    }
+
     /// What went wrong while the session was loaded.
     pub fn problems(&self) -> &[LoadProblem] {
         &self.problems
+    }
+
+    /// A short text about what just happened that the user should see, until the next key.
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
     pub fn should_quit(&self) -> bool {
@@ -107,13 +120,21 @@ impl OverviewState {
                 self.preview_scroll = self.preview_scroll.saturating_sub(half);
             }
             Message::PreviewHalfPageDown => self.preview_scroll += half,
-            Message::Quit => {}
+            Message::Quit
+            | Message::Edit
+            | Message::EditorClosed { .. }
+            | Message::Reloaded { .. } => {}
         }
-        self.selected = self.selected.min(last);
-        self.follow(count);
-        if self.selected != before {
+        if self.selected.min(last) != before {
             self.preview_scroll = 0;
         }
+        self.settle(count, lines_of);
+    }
+
+    /// Keeps the selection, the scroll position and the preview inside what there is.
+    fn settle(&mut self, count: usize, lines_of: impl Fn(usize) -> Option<usize>) {
+        self.selected = self.selected.min(count.saturating_sub(1));
+        self.follow(count);
         let furthest =
             lines_of(self.selected).map_or(0, |lines| lines.saturating_sub(self.preview_rows()));
         self.preview_scroll = self.preview_scroll.min(furthest);
@@ -186,21 +207,95 @@ pub enum Message {
     /// Scrolls the preview by half of its height.
     PreviewHalfPageUp,
     PreviewHalfPageDown,
+    /// Edits the selected file in the editor of the user.
+    Edit,
+    /// The editor of the user was closed, or could not be run.
+    EditorClosed {
+        file: FileId,
+        outcome: EditorOutcome,
+    },
+    /// The file was read from the disk again, or could not be.
+    Reloaded {
+        file: FileId,
+        result: Result<(), ReloadError>,
+    },
 }
 
-/// The new state for a message, and the effect that is to be performed, if there is one.
+/// The new state for a message, and the effect that is to be performed, if there is one. A
+/// notice stays until the next message that comes from the user: the results of the outside
+/// world and the size of the screen leave it alone.
 pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect>) {
+    let from_the_user = !matches!(
+        message,
+        Message::Viewport(_) | Message::EditorClosed { .. } | Message::Reloaded { .. }
+    );
+    if from_the_user {
+        state.notice = None;
+    }
+    let mut effect = None;
     match message {
         Message::Quit => state.quit = true,
-        other => {
-            let items = overview(&state.session);
-            let lines_of = |index: usize| match items.get(index) {
-                Some(OverviewItem::File { lines, .. }) => Some(*lines),
-                _ => None,
-            };
-            let View::Overview(view) = &mut state.view;
-            view.apply(other, items.len(), lines_of);
+        Message::Edit => effect = edit_effect(&state),
+        Message::EditorClosed { file, outcome } => match outcome {
+            EditorOutcome::Done => effect = Some(Effect::Reload(file)),
+            EditorOutcome::NoEditor => {
+                state.notice = Some("no editor: set VISUAL or EDITOR".to_owned());
+            }
+            EditorOutcome::CouldNotStart => {
+                state.notice = Some("could not start the editor".to_owned());
+            }
+            EditorOutcome::Failed(Some(code)) => {
+                state.notice = Some(format!("the editor ended with exit code {code}"));
+            }
+            EditorOutcome::Failed(None) => {
+                state.notice = Some("the editor ended with an error".to_owned());
+            }
+        },
+        Message::Reloaded { result, .. } => {
+            if let Err(error) = result {
+                let text = match error {
+                    ReloadError::UnknownFile => "unknown file",
+                    ReloadError::Deleted => "the file was deleted",
+                    ReloadError::Unreadable => "the file could not be read",
+                    ReloadError::Undecodable => "the file could not be decoded",
+                };
+                state.notice = Some(text.to_owned());
+            }
+            // the file may have got shorter
+            settle_overview(&mut state);
         }
+        movement_or_preview => apply_to_overview(&mut state, movement_or_preview),
     }
-    (state, None)
+    (state, effect)
+}
+
+/// The effect for editing the selected item: only a file can be edited.
+fn edit_effect(state: &AppState) -> Option<Effect> {
+    let View::Overview(view) = &state.view;
+    let items = overview(&state.session);
+    let Some(OverviewItem::File { id, .. }) = items.get(view.selected()) else {
+        return None;
+    };
+    let path = state.session.store().file_path(*id)?.to_path_buf();
+    Some(Effect::Edit { file: *id, path })
+}
+
+/// The number of lines of the file at an index of the list, `None` for any other item.
+fn lines_of(items: &[OverviewItem]) -> impl Fn(usize) -> Option<usize> + '_ {
+    |index| match items.get(index) {
+        Some(OverviewItem::File { lines, .. }) => Some(*lines),
+        _ => None,
+    }
+}
+
+fn apply_to_overview(state: &mut AppState, message: Message) {
+    let items = overview(&state.session);
+    let View::Overview(view) = &mut state.view;
+    view.apply(message, items.len(), lines_of(&items));
+}
+
+fn settle_overview(state: &mut AppState) {
+    let items = overview(&state.session);
+    let View::Overview(view) = &mut state.view;
+    view.settle(items.len(), lines_of(&items));
 }

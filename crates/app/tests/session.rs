@@ -405,3 +405,123 @@ fn a_bundle_of_another_session_cannot_be_excluded() {
         assert_eq!(session.store().bundle_excluded(bundle), Some(false));
     }
 }
+
+// ── Reloading ────────────────────────────────────────────────────────────────
+
+/// A folder with `a.properties` of these bytes, opened, and the id of the file.
+fn one_file(bytes: &[u8]) -> (Session, TempDir, FileId) {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.properties"), bytes).unwrap();
+    let session = open(&dir);
+    let id = file(&session, &dir, "a.properties");
+    (session, dir, id)
+}
+
+fn contents(session: &Session, id: FileId) -> Vec<String> {
+    session
+        .store()
+        .file_lines(id)
+        .iter()
+        .map(|line| line.content.to_owned())
+        .collect()
+}
+
+#[test]
+fn reloading_takes_what_is_on_the_disk_as_a_new_snapshot() {
+    let (mut session, dir, id) = one_file(b"a=1\n");
+    let before = session.store().snapshots(id);
+    std::fs::write(dir.path().join("a.properties"), b"a=1\nb=2\n").unwrap();
+
+    assert_eq!(session.reload_file(id), Ok(()));
+
+    assert_eq!(contents(&session, id), ["a=1", "b=2"]);
+    assert_eq!(session.store().snapshots(id), before + 1);
+    assert!(session.dirty_files().is_empty(), "the disk is what is held");
+}
+
+#[test]
+fn reloading_a_file_that_did_not_change_makes_no_new_snapshot() {
+    let (mut session, _dir, id) = one_file(b"a=1\n");
+    let before = session.store().snapshots(id);
+    assert_eq!(session.reload_file(id), Ok(()));
+    assert_eq!(session.store().snapshots(id), before);
+    assert_eq!(contents(&session, id), ["a=1"]);
+}
+
+#[test]
+fn reloading_reads_with_the_encoding_that_the_user_chose() {
+    let (mut session, dir, id) = one_file(b"a=\xe9\n");
+    // whichever of the two single-byte encodings was detected, the user takes the other one
+    let detected = session.store().file_encoding(id).unwrap();
+    let chosen = if detected == Encoding::Latin1 {
+        Encoding::Windows1252
+    } else {
+        Encoding::Latin1
+    };
+    assert!(session.set_encoding(id, chosen));
+    // 0x80 is a control character in Latin-1 and the euro sign in Windows-1252
+    std::fs::write(dir.path().join("a.properties"), b"a=\xe9\nb=\x80\n").unwrap();
+
+    assert_eq!(session.reload_file(id), Ok(()));
+
+    assert_eq!(session.store().file_encoding(id), Some(chosen));
+    let second = if chosen == Encoding::Latin1 {
+        "b=\u{80}"
+    } else {
+        "b=\u{20ac}"
+    };
+    assert_eq!(contents(&session, id), ["a=\u{e9}", second]);
+}
+
+#[test]
+fn reloading_detects_the_encoding_again_if_the_user_did_not_choose_one() {
+    let (mut session, dir, id) = one_file(b"a=1\n");
+    assert_eq!(session.store().file_encoding(id), Some(Encoding::Utf8));
+    std::fs::write(dir.path().join("a.properties"), b"a=\xe9\n").unwrap();
+
+    assert_eq!(session.reload_file(id), Ok(()));
+
+    assert_ne!(session.store().file_encoding(id), Some(Encoding::Utf8));
+    assert_eq!(contents(&session, id), ["a=\u{e9}"]);
+}
+
+#[test]
+fn bytes_that_the_chosen_encoding_cannot_decode_are_an_error_and_change_nothing() {
+    // not UTF-8, but the user chooses UTF-8: reading the file again cannot work
+    let (mut session, _dir, id) = one_file(b"a=\xe9\n");
+    assert!(session.set_encoding(id, Encoding::Utf8));
+    let before = session.store().snapshots(id);
+
+    assert_eq!(session.reload_file(id), Err(app::ReloadError::Undecodable));
+
+    assert_eq!(session.store().snapshots(id), before);
+    assert_eq!(contents(&session, id), ["a=\u{e9}"]);
+}
+
+#[test]
+fn reloading_a_deleted_file_is_an_error_and_keeps_the_lines() {
+    let (mut session, dir, id) = one_file(b"a=1\n");
+    std::fs::remove_file(dir.path().join("a.properties")).unwrap();
+    assert_eq!(session.reload_file(id), Err(app::ReloadError::Deleted));
+    assert_eq!(contents(&session, id), ["a=1"]);
+}
+
+#[test]
+fn reloading_something_that_cannot_be_read_is_an_error() {
+    let (mut session, dir, id) = one_file(b"a=1\n");
+    let path = dir.path().join("a.properties");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(session.reload_file(id), Err(app::ReloadError::Unreadable));
+    assert_eq!(contents(&session, id), ["a=1"]);
+}
+
+#[test]
+fn a_file_of_another_session_cannot_be_reloaded() {
+    let (mut session, _dir, _id) = one_file(b"a=1\n");
+    let (_other, _other_dir, foreign) = one_file(b"a=1\n");
+    assert_eq!(
+        session.reload_file(foreign),
+        Err(app::ReloadError::UnknownFile)
+    );
+}

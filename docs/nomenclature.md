@@ -56,6 +56,8 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | raw unit | Rohdatei-Einheit | The unit that represents what is on the disk, with its interpretation. Only ever filled from the disk; the user does not edit it. |
 | view | Ansicht | One of the exclusive screens of the program; for now the bundle overview. An overlay (later) lies over any view. |
 | overview item | Eintrag der Übersicht | One line of the bundle overview: a folder, a bundle or a file. Not an entry (a key) and not a line of a file. |
+| effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |
+| notice | Hinweis | A short text for the user about what just happened (for example that no editor is set). It stays until the next key. Not a problem of loading. |
 | bundle assignment | Zuordnung | The value that says which bundle and locale a file belongs to, with the confidence. |
 | generation | Generation | The number of a store, carried by every id. An id from another generation gives `None`. |
 

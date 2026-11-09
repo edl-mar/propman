@@ -6,6 +6,27 @@ not authoritative.
 
 ## Decisions
 
+### Effects, and editing a file in the editor of the user (2026-11-09)
+- **`update` stays pure and returns at most one effect with the new state:**
+  `update(state, message) -> (AppState, Option<Effect>)`. An effect is data; the loop performs
+  it, and the result comes back as a message, which can bring the next effect. An order of steps
+  is therefore the chain of messages and effects, and not a list: a step is decided when the
+  result of the last one is known (reading a file again only if the editor ended well).
+- **Who performs what:** `app::perform` does what touches the disk (reading a file again). What
+  needs the terminal, running the editor, is handed in as a function by the user interface,
+  because only it can leave and enter the terminal; tests hand in a fake.
+- **`enter` on a file edits it in the editor of the user.** The editor is `VISUAL`, else
+  `EDITOR`, split at white space into program and arguments without a shell or quotes, with the
+  path as the last argument. No default editor and no jump to a line are assumed; without an
+  editor the user is told. Afterwards the file is read again: what is on the disk is a new
+  snapshot if the lines differ. An encoding the user chose is used for reading; otherwise it is
+  detected again. (Choosing the encoding that is already in use is no change and so no choice.)
+  An editor that fails, or a file that cannot be read again, is told to the user and changes
+  nothing. On Windows a program like `code` may have to be named `code.cmd` in `EDITOR`.
+- **The notice** is a text in the state, shown in the status line next to the count of the
+  problems. It stays until the next message that comes from the user; the results of effects and
+  the size of the screen leave it alone.
+
 ### The preview in the overview (2026-11-09)
 - **The use case:** look into a file quickly, for example to check its encoding or its line
   endings, without leaving the list. The preview shows the raw lines of the selected file next
@@ -355,11 +376,9 @@ much later.
 
 ### Raw files: use cases and ideas (2026-11-09)
 Ideas from a talk, **not decisions**. The preview itself is decided (see above).
-- **Edit a file in `$EDITOR`** with `enter` on a file (for example when it cannot be parsed),
-  instead of building an editor. This is the first real effect: the terminal is left, a process
-  runs, the file is reloaded as a new snapshot. It forces the question whether `update` calls
-  the session or returns an effect (Elm's `Cmd`). Open on the way: no `$EDITOR` set (do not
-  assume one, say so), jumping to a line (depends on the editor, do not assume).
+- **Edit a file in `$EDITOR`** (decided, see above) instead of building an editor. Still open:
+  a conflict between a file that is edited outside and values that are changed in the program
+  and not saved; it appears once values can be edited.
 - **A raw view over all files** in the order of the overview, opened with `right`, with the
   files one after the other. It must be a virtual list (only the visible rows are made; the
   numbers of lines are in the store), and its position is a file and a line, not an index. The
