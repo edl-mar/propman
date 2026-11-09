@@ -282,3 +282,24 @@ fn the_standard_keys_to_quit_are_q_and_ctrl_c_in_that_order() {
         [Key::char('q'), Key::char('c').ctrl()]
     );
 }
+
+#[test]
+fn the_standard_keymap_has_the_keys_of_the_preview() {
+    let keymap = Keymap::default();
+    let cases = [
+        (Key::char(' '), Message::TogglePreview),
+        (Key::new(Code::Up).ctrl(), Message::PreviewUp),
+        (Key::new(Code::Down).ctrl(), Message::PreviewDown),
+        (Key::char('u').ctrl(), Message::PreviewHalfPageUp),
+        (Key::char('d').ctrl(), Message::PreviewHalfPageDown),
+    ];
+    for (key, message) in cases {
+        assert_eq!(keymap.message(OVERVIEW, key), Some(message), "{key}");
+    }
+    // the plain keys still move the selection
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::new(Code::Up)),
+        Some(Message::Up)
+    );
+    assert_eq!(keymap.message(OVERVIEW, Key::char('d')), None);
+}

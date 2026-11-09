@@ -220,7 +220,8 @@ impl Keymap {
 
 impl Default for Keymap {
     /// `q` and `ctrl+c` quit; in the overview `up`/`k` and `down`/`j` move, `pgup` and `pgdn`
-    /// page, `home` and `end` go to the ends.
+    /// page, `home` and `end` go to the ends, `space` switches the preview and `ctrl+up`,
+    /// `ctrl+down`, `ctrl+u` and `ctrl+d` scroll it.
     fn default() -> Keymap {
         let overview = Context::Overview;
         Keymap::empty()
@@ -234,5 +235,14 @@ impl Default for Keymap {
             .bind(overview, Key::new(Code::PageDown), Message::PageDown)
             .bind(overview, Key::new(Code::Home), Message::First)
             .bind(overview, Key::new(Code::End), Message::Last)
+            .bind(overview, Key::char(' '), Message::TogglePreview)
+            .bind(overview, Key::new(Code::Up).ctrl(), Message::PreviewUp)
+            .bind(overview, Key::new(Code::Down).ctrl(), Message::PreviewDown)
+            .bind(overview, Key::char('u').ctrl(), Message::PreviewHalfPageUp)
+            .bind(
+                overview,
+                Key::char('d').ctrl(),
+                Message::PreviewHalfPageDown,
+            )
     }
 }

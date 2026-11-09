@@ -10,7 +10,8 @@
 //! any), the list of the bundle overview and a line with the keys. The list shows the part that
 //! the state scrolled to. An item is marked as follows, and never by colour alone: the selected
 //! one by `>`, an uncertain file by `?`, an excluded bundle by `[excluded]`; the styles of the
-//! theme come on top.
+//! theme come on top. On a screen at least 100 columns wide the list gets the left half and the
+//! preview of the selected file the right half, behind a column with `|`.
 
 mod keys;
 mod ui;
@@ -20,11 +21,11 @@ use std::io;
 pub use keys::{Code, Context, Key, Keymap};
 pub use ui::{Theme, Ui};
 
-use app::{AppState, Confidence, Encoding, Message, OverviewItem, View, overview, update};
+use app::{AppState, Confidence, Encoding, Message, OverviewItem, View, overview, preview, update};
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 
@@ -36,6 +37,9 @@ pub enum LoopError<E> {
     /// The source of events failed.
     Events(io::Error),
 }
+
+/// The preview is drawn only on a screen at least this many columns wide.
+const PREVIEW_MIN_WIDTH: u16 = 100;
 
 /// The lines above the list (title and count) and below it (the keys).
 const HEADER_LINES: usize = 2;
@@ -179,11 +183,30 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         );
     }
 
+    let View::Overview(view) = state.view();
+    let (list, preview_area) = if view.preview_on() && frame.area().width >= PREVIEW_MIN_WIDTH {
+        let [left, separator, right] = Layout::horizontal([
+            Constraint::Length(list.width / 2),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .areas(list);
+        let bar: Vec<Line> = (0..separator.height).map(|_| Line::raw("|")).collect();
+        frame.render_widget(Paragraph::new(bar), separator);
+        (left, Some(right))
+    } else {
+        (list, None)
+    };
+    if let Some(area) = preview_area {
+        let lines = preview_lines(&ui.theme, state, usize::from(area.width));
+        let lines: Vec<Line> = lines.into_iter().take(usize::from(area.height)).collect();
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
     let items = overview(session);
     if items.is_empty() {
         frame.render_widget(Paragraph::new("no .properties files"), list);
     } else {
-        let View::Overview(view) = state.view();
         let name_width = items
             .iter()
             .filter_map(|item| match item {
@@ -213,14 +236,60 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(key_help(&ui.keymap, state.view())), footer);
 }
 
+/// The columns of the line ending in the preview: wide enough for `(none)`.
+const ENDING_WIDTH: usize = 6;
+
+/// The text padded with spaces or, if it is longer, cut at the right end with `...`.
+fn fit_right(text: &str, available: usize) -> String {
+    let length = text.chars().count();
+    if length <= available {
+        return format!("{text:<available$}");
+    }
+    if available <= 3 {
+        return ".".repeat(available);
+    }
+    let head: String = text.chars().take(available - 3).collect();
+    format!("{head}...")
+}
+
+/// The rows of the preview pane: a header and the lines of the window, or the hint that a file
+/// has to be selected. Every row starts with a space behind the separator.
+fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'static>> {
+    let Some(preview) = preview(state) else {
+        return vec![Line::raw(" select a file to preview it")];
+    };
+    let mut rows = vec![Line::raw(format!(
+        " {}  {}  {}",
+        preview.name,
+        encoding_name(preview.encoding),
+        counted(preview.total, "line", "lines"),
+    ))];
+    let digits = preview.total.to_string().len();
+    let text_width = width.saturating_sub(1 + digits + 1 + 1 + ENDING_WIDTH);
+    for line in &preview.lines {
+        rows.push(Line::from(vec![
+            Span::raw(" "),
+            Span::styled(format!("{:>digits$}", line.number), theme.line_number),
+            Span::raw(format!(" {} ", fit_right(&line.text, text_width))),
+            Span::styled(format!("{:>ENDING_WIDTH$}", line.ending), theme.ending),
+        ]));
+    }
+    rows
+}
+
 /// What the keys do, as far as they are bound: `q/ctrl+c: quit   up/k/down/j: move ...`.
 fn key_help(keymap: &Keymap, view: &View) -> String {
     let context = Context::of(view);
-    let groups: [(&[Message], &str); 4] = [
+    let groups: [(&[Message], &str); 6] = [
         (&[Message::Quit], "quit"),
         (&[Message::Up, Message::Down], "move"),
         (&[Message::PageUp, Message::PageDown], "page"),
         (&[Message::First, Message::Last], "ends"),
+        (&[Message::TogglePreview], "preview"),
+        (
+            &[Message::PreviewHalfPageUp, Message::PreviewHalfPageDown],
+            "scroll preview",
+        ),
     ];
     groups
         .iter()

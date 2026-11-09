@@ -24,9 +24,14 @@ fn fixtures(rel: &str) -> PathBuf {
         .join(rel)
 }
 
-fn state_for(folder: &Path) -> AppState {
+fn state_with_preview(folder: &Path) -> AppState {
     let (session, problems) = Session::open(folder);
     AppState::new(session, problems)
+}
+
+/// The state with the preview switched off, so that the tests of the list see the whole width.
+fn state_for(folder: &Path) -> AppState {
+    update(state_with_preview(folder), Message::TogglePreview)
 }
 
 /// A fresh folder below the system temp dir, removed on drop.
@@ -775,6 +780,8 @@ fn loud_theme() -> Theme {
         uncertain: Style::new().fg(Color::Magenta),
         excluded: Style::new().fg(Color::Cyan),
         selected: Style::new().add_modifier(Modifier::UNDERLINED),
+        line_number: Style::new().fg(Color::Yellow),
+        ending: Style::new().fg(Color::LightBlue),
     }
 }
 
@@ -880,4 +887,209 @@ fn the_standard_theme_marks_the_selection_without_colour() {
             .add_modifier
             .contains(Modifier::REVERSED)
     );
+}
+
+// ── The preview ──────────────────────────────────────────────────────────────
+
+/// `a.properties` as the only file, selected, with the height of a terminal of `height` rows
+/// told, as the loop does. The preview is on.
+fn on_a_file(bytes: &[u8], height: u16) -> (AppState, TempDir) {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", bytes);
+    let state = press_all(
+        state_with_preview(&dir.0),
+        &[
+            Message::Viewport(list_height(height, false)),
+            Message::Down,
+            Message::Down,
+        ],
+    );
+    (state, dir)
+}
+
+/// The first line of the screen that contains `needle`.
+fn row_with(screen: &str, needle: &str) -> String {
+    screen
+        .lines()
+        .find(|line| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} is not on the screen:\n{screen}"))
+        .to_owned()
+}
+
+fn has_separator(screen: &str) -> bool {
+    screen.contains('|')
+}
+
+#[test]
+fn the_preview_shows_the_header_and_the_lines_of_the_selected_file() {
+    let (state, _dir) = on_a_file(b"x=1\r\ny=2\nz=3", 10);
+    let screen = drawn(&state, 110, 10);
+    assert!(
+        screen.contains("| a.properties  UTF-8  3 lines"),
+        "{screen}"
+    );
+    let first = row_with(&screen, "| 1 x=1");
+    assert!(first.contains("CRLF"), "{screen}");
+    let second = row_with(&screen, "| 2 y=2");
+    assert!(second.trim_end().ends_with("LF"), "{screen}");
+    assert!(!second.contains("CRLF"), "{screen}");
+    assert!(row_with(&screen, "| 3 z=3").contains("(none)"), "{screen}");
+}
+
+#[test]
+fn the_list_gets_the_left_half_and_the_separator_runs_down_the_pane() {
+    let (state, _dir) = on_a_file(b"x=1\n", 10);
+    let screen = drawn(&state, 110, 10);
+    let rows: Vec<&str> = screen.lines().collect();
+    // below the title and the count, above the line with the keys
+    for (y, row) in rows.iter().enumerate().take(rows.len() - 1).skip(2) {
+        assert_eq!(row.chars().nth(55), Some('|'), "row {y}:\n{screen}");
+    }
+    // the list is cut at the separator: nothing of it is written behind
+    let file = row_with(&screen, "(default)");
+    assert!(file.find("(default)").unwrap() < 55, "{screen}");
+    assert!(!file[..55].contains('|'), "{screen}");
+}
+
+#[test]
+fn the_numbers_are_as_wide_as_the_biggest_one() {
+    let lines: Vec<u8> = (1..=30)
+        .flat_map(|n| format!("l{n:02}=1\n").into_bytes())
+        .collect();
+    let (state, _dir) = on_a_file(&lines, 12);
+    let state = press_all(
+        state,
+        &[
+            Message::PreviewDown,
+            Message::PreviewDown,
+            Message::PreviewDown,
+        ],
+    );
+    let screen = drawn(&state, 110, 12);
+    // 12 rows: 9 for the list, 1 for the header, 8 lines from the fourth on
+    assert!(screen.contains("|  4 l04=1"), "{screen}");
+    assert!(screen.contains("| 11 l11=1"), "{screen}");
+    assert!(!screen.contains("l03=1"), "{screen}");
+    assert!(!screen.contains("l12=1"), "{screen}");
+}
+
+#[test]
+fn the_preview_is_drawn_from_100_columns_on_and_not_below() {
+    let (state, _dir) = on_a_file(b"x=1\n", 10);
+    assert!(!has_separator(&drawn(&state, 99, 10)));
+    assert!(has_separator(&drawn(&state, 100, 10)));
+}
+
+#[test]
+fn a_switched_off_preview_is_not_drawn_and_a_narrow_screen_keeps_the_setting() {
+    let (state, _dir) = on_a_file(b"x=1\n", 10);
+    let state = press_all(state, &[Message::TogglePreview]);
+    assert!(!has_separator(&drawn(&state, 110, 10)));
+    let state = press_all(state, &[Message::TogglePreview]);
+    assert!(!has_separator(&drawn(&state, 80, 10)));
+    assert!(has_separator(&drawn(&state, 110, 10)));
+}
+
+#[test]
+fn for_a_folder_and_a_bundle_the_pane_asks_for_a_file() {
+    let state = state_with_preview(&fixtures("project"));
+    let screen = drawn(&state, 110, 10);
+    assert!(has_separator(&screen), "{screen}");
+    assert!(screen.contains("select a file"), "{screen}");
+    let state = press_all(state, &[Message::Down]);
+    assert!(drawn(&state, 110, 10).contains("select a file"));
+}
+
+#[test]
+fn a_line_that_is_too_long_is_cut_and_keeps_its_ending() {
+    let long = format!("k={}\n", "x".repeat(200));
+    let (state, _dir) = on_a_file(long.as_bytes(), 10);
+    let screen = drawn(&state, 100, 10);
+    let row = row_with(&screen, "| 1 k=xxx");
+    assert!(row.contains("..."), "{screen}");
+    assert!(row.trim_end().ends_with("LF"), "{screen}");
+    assert!(row.chars().count() <= 100, "{screen}");
+}
+
+#[test]
+fn control_characters_are_drawn_as_a_dot() {
+    let (state, _dir) = on_a_file(b"a\tb=1\n", 10);
+    let screen = drawn(&state, 110, 10);
+    assert!(screen.contains("| 1 a\u{b7}b=1"), "{screen}");
+    assert!(!screen.contains('\t'), "{screen}");
+}
+
+#[test]
+fn an_empty_file_shows_only_the_header() {
+    let (state, _dir) = on_a_file(b"", 10);
+    let screen = drawn(&state, 110, 10);
+    assert!(
+        screen.contains("| a.properties  UTF-8  0 lines"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_line_with_the_keys_names_the_keys_of_the_preview() {
+    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 120, 10));
+    assert!(footer.contains("space: preview"), "{footer}");
+    assert!(footer.contains("ctrl+u/ctrl+d: scroll preview"), "{footer}");
+}
+
+#[test]
+fn drawing_the_preview_survives_a_tiny_area() {
+    let (state, _dir) = on_a_file(b"x=1\ny=2\n", 10);
+    for (width, height) in [(100, 0), (100, 1), (100, 2), (101, 3), (1000, 2), (100, 40)] {
+        let mut terminal = terminal(width, height);
+        terminal
+            .draw(|frame| render_with(&Ui::default(), &state, frame))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_theme_styles_the_numbers_and_the_endings_of_the_preview() {
+    let (state, _dir) = on_a_file(b"x=1\r\ny=2\n", 10);
+    let ui = themed(loud_theme());
+    let terminal = drawn_terminal(&ui, &state);
+    assert_eq!(style_at(&terminal, "1 x=1").fg, Some(Color::Yellow));
+    assert_eq!(style_at(&terminal, "CRLF").fg, Some(Color::LightBlue));
+    assert_eq!(
+        drawn_with(&ui, &state, 110, 30),
+        drawn(&state, 110, 30),
+        "a theme never changes the text"
+    );
+}
+
+#[test]
+fn the_keys_of_the_preview_work_in_the_loop() {
+    let lines: Vec<u8> = (1..=30)
+        .flat_map(|n| format!("l{n:02}=1\n").into_bytes())
+        .collect();
+    let dir = TempDir::new();
+    write(&dir, "a.properties", &lines);
+    let mut terminal = terminal(100, 20);
+    let (result, _) = run_with(
+        &mut terminal,
+        state_with_preview(&dir.0),
+        vec![
+            press('j'),
+            press('j'),
+            key(KeyCode::Down, KeyModifiers::CONTROL),
+            key(KeyCode::Down, KeyModifiers::CONTROL),
+            press('q'),
+        ],
+    );
+    match result.unwrap().view() {
+        View::Overview(overview) => assert_eq!(overview.preview_scroll(), 2),
+    }
+
+    let (result, _) = run_with(
+        &mut terminal,
+        state_with_preview(&dir.0),
+        vec![press(' '), press('q')],
+    );
+    match result.unwrap().view() {
+        View::Overview(overview) => assert!(!overview.preview_on()),
+    }
 }

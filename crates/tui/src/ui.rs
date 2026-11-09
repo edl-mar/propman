@@ -18,6 +18,10 @@ pub struct Theme {
     pub excluded: Style,
     /// Added to the selected item.
     pub selected: Style,
+    /// The number of a line in the preview.
+    pub line_number: Style,
+    /// The line ending at the right edge of a line in the preview.
+    pub ending: Style,
 }
 
 impl Default for Theme {
@@ -29,6 +33,8 @@ impl Default for Theme {
             uncertain: Style::new().fg(Color::Yellow),
             excluded: Style::new().fg(Color::DarkGray),
             selected: Style::new().add_modifier(Modifier::REVERSED),
+            line_number: Style::new().fg(Color::DarkGray),
+            ending: Style::new().fg(Color::DarkGray),
         }
     }
 }
