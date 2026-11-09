@@ -6,6 +6,23 @@ not authoritative.
 
 ## Decisions
 
+### The preview in the overview (2026-11-09)
+- **The use case:** look into a file quickly, for example to check its encoding or its line
+  endings, without leaving the list. The preview shows the raw lines of the selected file next
+  to the list. It is derived from the state (the selected item and a scroll position), read
+  only, has no focus and is not a view of its own.
+- **On by default, `space` switches it.** It is drawn only if the terminal is at least 100
+  columns wide; otherwise it is not drawn, and the setting is kept. When it is drawn, the list
+  gets the left half. For a folder or a bundle the pane says that a file has to be selected.
+- **Scrolling:** `ctrl+up` and `ctrl+down` by one line, `ctrl+u` and `ctrl+d` by half the
+  height of the preview. It stops at the ends and starts at the top again whenever the selection
+  changes.
+- **What it shows:** a header with the name of the file, its encoding and its number of lines,
+  then the lines with their numbers. The text of a line is cut with `...` if it is too long,
+  control characters are shown as `·`, and the line ending is written as text at the right
+  edge (`LF`, `CRLF`, `CR`, and `(none)` for a last line without a line break). `app` resolves
+  all of this into plain values; the view only draws.
+
 ### Keys and colours live in one place each (2026-11-09)
 - **Only `tui` knows a key or a colour.** `app` has messages and text that is already resolved.
   Both are handed to the loop and to the drawing as one value, `Ui { keymap, theme }`, so a
@@ -335,6 +352,26 @@ both change, resolving the conflict would be too hard. A "copy content" function
 much later.
 
 ## Open questions
+
+### Raw files: use cases and ideas (2026-11-09)
+Ideas from a talk, **not decisions**. The preview itself is decided (see above).
+- **Edit a file in `$EDITOR`** with `enter` on a file (for example when it cannot be parsed),
+  instead of building an editor. This is the first real effect: the terminal is left, a process
+  runs, the file is reloaded as a new snapshot. It forces the question whether `update` calls
+  the session or returns an effect (Elm's `Cmd`). Open on the way: no `$EDITOR` set (do not
+  assume one, say so), jumping to a line (depends on the editor, do not assume).
+- **A raw view over all files** in the order of the overview, opened with `right`, with the
+  files one after the other. It must be a virtual list (only the visible rows are made; the
+  numbers of lines are in the store), and its position is a file and a line, not an index. The
+  overview and the raw view follow each other: opening starts at the selected file, going back
+  selects the file one is in. `left` should stay free for horizontal scrolling of long lines, so
+  `esc` goes back.
+- **Search in the raw view across all files.** The first text input of the program: keys that
+  are not bound must then reach a text field (the keymap has no such case yet). A search jumps,
+  a filter hides; they can share the input field. How to search (substring, case, regular
+  expression) is not assumed. The filter system itself is still open.
+- **Jumps to the borders of folders, bundles and files.** Direct keys are enough at first; an
+  overlay (the first one) only pays off with more choices.
 
 ### Bundle merging: what is left
 - Is a collision any shared key in any locale, or only per locale? Start with any locale, since
