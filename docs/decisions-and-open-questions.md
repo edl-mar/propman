@@ -6,6 +6,26 @@ not authoritative.
 
 ## Decisions
 
+### Keys and colours live in one place each (2026-11-09)
+- **Only `tui` knows a key or a colour.** `app` has messages and text that is already resolved.
+  Both are handed to the loop and to the drawing as one value, `Ui { keymap, theme }`, so a
+  settings file later only has to build that value; no other function changes.
+- **`Key` is the program's own type** (code, ctrl, alt, shift), independent of the terminal
+  library, with a text form (`ctrl+s`, `pgdn`) that a settings file can use. The case of a
+  character is in the character, and AltGr (Ctrl and Alt on a character) is a plain character.
+  Only the press of a key counts.
+- **The keymap has a global layer and one layer per context**, the context being the current
+  view. A key of the context wins over the same key of the global layer. This replaces the full
+  table per mode of the first version, in which `Ctrl+C` stood nine times.
+- **The line with the keys is made from the keymap**, so that it cannot name a key that is not
+  bound.
+- **The theme has roles, not colours:** folder, bundle, file, uncertain, excluded, selected. The
+  style of uncertain, excluded and selected comes on top of the style of the role. The meaning
+  never rests on a style (the marks are text), so a theme is decoration and is not tested for
+  looks.
+- **Not yet:** a settings file, names for messages (they come with the file, because they only
+  matter there), and keys for text input (they come with editing).
+
 ### The bundle overview: the first view (2026-11-08)
 - **A flat list, always expanded, with three kinds of items:** a folder, below it its bundles,
   below each bundle its files. The path of a folder is shown once, relative to the opened folder

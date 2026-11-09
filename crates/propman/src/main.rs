@@ -12,7 +12,7 @@ fn main() -> ExitCode {
     };
 
     let (session, problems) = app::Session::open(&folder);
-    match tui::run(app::AppState::new(session, problems)) {
+    match tui::run(&tui::Ui::default(), app::AppState::new(session, problems)) {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("propman: {error}");

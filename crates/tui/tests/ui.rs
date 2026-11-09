@@ -6,11 +6,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use app::{AppState, Message, Session, View, update};
+use app::{AppState, Message, OverviewState, Session, View, update};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use tui::{LoopError, list_height, message_for, render, run_loop};
+use ratatui::style::{Color, Modifier, Style};
+use tui::{
+    Code, Context, Key, Keymap, LoopError, Theme, Ui, list_height, message_for as message_with,
+    render as render_with, run_loop as run_loop_with,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -65,10 +69,30 @@ fn screen(terminal: &Terminal<TestBackend>) -> String {
         .join("\n")
 }
 
-fn drawn(state: &AppState, width: u16, height: u16) -> String {
+fn drawn_with(ui: &Ui, state: &AppState, width: u16, height: u16) -> String {
     let mut terminal = terminal(width, height);
-    terminal.draw(|frame| render(state, frame)).unwrap();
+    terminal
+        .draw(|frame| render_with(ui, state, frame))
+        .unwrap();
     screen(&terminal)
+}
+
+/// Drawn with the standard keymap and theme.
+fn drawn(state: &AppState, width: u16, height: u16) -> String {
+    drawn_with(&Ui::default(), state, width, height)
+}
+
+fn render(state: &AppState, frame: &mut ratatui::Frame) {
+    render_with(&Ui::default(), state, frame);
+}
+
+fn overview_view() -> View {
+    View::Overview(OverviewState::default())
+}
+
+/// The message of an event with the standard keymap, in the overview.
+fn message_for(event: &Event) -> Option<Message> {
+    message_with(&Ui::default(), &overview_view(), event)
 }
 
 fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
@@ -114,7 +138,7 @@ fn an_empty_folder_shows_zero() {
 #[test]
 fn the_screen_names_the_key_to_quit() {
     let screen = drawn(&state_for(&fixtures("project")), 120, 10);
-    assert!(screen.contains("q: quit"), "{screen}");
+    assert!(screen.contains("q/ctrl+c: quit"), "{screen}");
 }
 
 #[test]
@@ -211,9 +235,18 @@ fn run_with(
     state: AppState,
     events: Vec<Event>,
 ) -> (Result<AppState, LoopError<Infallible>>, usize) {
+    run_with_ui(&Ui::default(), terminal, state, events)
+}
+
+fn run_with_ui(
+    ui: &Ui,
+    terminal: &mut Terminal<TestBackend>,
+    state: AppState,
+    events: Vec<Event>,
+) -> (Result<AppState, LoopError<Infallible>>, usize) {
     let mut events = events.into_iter();
     let mut asked = 0;
-    let result = run_loop(terminal, state, || {
+    let result = run_loop_with(terminal, ui, state, || {
         asked += 1;
         events
             .next()
@@ -616,4 +649,235 @@ fn keys_in_the_loop_move_the_selection() {
     match result.unwrap().view() {
         View::Overview(overview) => assert_eq!(overview.selected(), 2),
     }
+}
+
+// ── The keymap decides ───────────────────────────────────────────────────────
+
+const OVERVIEW: Context = Context::Overview;
+
+fn ui_with(keymap: Keymap) -> Ui {
+    Ui {
+        keymap,
+        theme: Theme::default(),
+    }
+}
+
+#[test]
+fn the_messages_come_from_the_keymap_of_the_ui() {
+    let ui = ui_with(
+        Keymap::empty()
+            .bind(OVERVIEW, Key::char('x'), Message::Down)
+            .bind(OVERVIEW, Key::new(Code::Esc), Message::Quit),
+    );
+    let view = overview_view();
+    assert_eq!(message_with(&ui, &view, &press('x')), Some(Message::Down));
+    assert_eq!(
+        message_with(&ui, &view, &key(KeyCode::Esc, KeyModifiers::NONE)),
+        Some(Message::Quit)
+    );
+    // the standard keys are gone, the keymap is the only place that knows them
+    assert_eq!(message_with(&ui, &view, &press('q')), None);
+    assert_eq!(message_with(&ui, &view, &press('j')), None);
+}
+
+#[test]
+fn only_the_press_of_a_bound_key_gives_a_message() {
+    let ui = ui_with(Keymap::empty().bind_global(Key::char('x'), Message::Quit));
+    let release = Event::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    ));
+    assert_eq!(message_with(&ui, &overview_view(), &release), None);
+    assert_eq!(message_with(&ui, &overview_view(), &Event::FocusLost), None);
+}
+
+#[test]
+fn altgr_still_gives_the_plain_character_with_a_custom_keymap() {
+    let ui = ui_with(Keymap::empty().bind_global(Key::char('@'), Message::Down));
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    assert_eq!(
+        message_with(&ui, &overview_view(), &key(KeyCode::Char('@'), altgr)),
+        Some(Message::Down)
+    );
+}
+
+#[test]
+fn the_loop_follows_the_keymap_of_the_ui() {
+    let ui = ui_with(Keymap::empty().bind_global(Key::char('x'), Message::Quit));
+    let mut terminal = terminal(120, 10);
+    let (result, asked) = run_with_ui(
+        &ui,
+        &mut terminal,
+        state_for(&fixtures("project")),
+        vec![
+            press('q'),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            press('x'),
+        ],
+    );
+    assert!(result.unwrap().should_quit());
+    assert_eq!(asked, 3, "q and ctrl+c are not bound in this keymap");
+}
+
+// ── The line with the keys ───────────────────────────────────────────────────
+
+fn last_line(screen: &str) -> String {
+    screen
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
+#[test]
+fn the_line_with_the_keys_comes_from_the_keymap() {
+    let footer = last_line(&drawn(&state_for(&fixtures("project")), 120, 10));
+    assert!(footer.contains("q/ctrl+c: quit"), "{footer}");
+    assert!(footer.contains("up/k/down/j: move"), "{footer}");
+    assert!(footer.contains("pgup/pgdn: page"), "{footer}");
+    assert!(footer.contains("home/end: ends"), "{footer}");
+}
+
+#[test]
+fn a_changed_binding_changes_the_line_with_the_keys() {
+    let ui = ui_with(Keymap::default().bind_global(Key::char('x'), Message::Quit));
+    let footer = last_line(&drawn_with(&ui, &state_for(&fixtures("project")), 120, 10));
+    assert!(footer.contains("q/ctrl+c/x: quit"), "{footer}");
+}
+
+#[test]
+fn what_is_not_bound_is_not_named() {
+    let ui = ui_with(Keymap::empty().bind_global(Key::char('x'), Message::Quit));
+    let footer = last_line(&drawn_with(&ui, &state_for(&fixtures("project")), 120, 10));
+    assert_eq!(footer, "x: quit");
+}
+
+#[test]
+fn only_the_keys_of_a_movement_that_are_bound_are_named() {
+    let ui = ui_with(
+        Keymap::empty()
+            .bind(OVERVIEW, Key::char('s'), Message::Down)
+            .bind_global(Key::char('q'), Message::Quit),
+    );
+    let footer = last_line(&drawn_with(&ui, &state_for(&fixtures("project")), 120, 10));
+    assert_eq!(footer, "q: quit   s: move");
+}
+
+// ── The theme decides ────────────────────────────────────────────────────────
+
+fn loud_theme() -> Theme {
+    Theme {
+        folder: Style::new().fg(Color::Red),
+        bundle: Style::new().fg(Color::Green),
+        file: Style::new().fg(Color::Blue),
+        uncertain: Style::new().fg(Color::Magenta),
+        excluded: Style::new().fg(Color::Cyan),
+        selected: Style::new().add_modifier(Modifier::UNDERLINED),
+    }
+}
+
+fn themed(theme: Theme) -> Ui {
+    Ui {
+        keymap: Keymap::default(),
+        theme,
+    }
+}
+
+/// The style of the first character of `needle` on the first line that contains it.
+fn style_at(terminal: &Terminal<TestBackend>, needle: &str) -> Style {
+    let screen = screen(terminal);
+    let (y, line) = screen
+        .lines()
+        .enumerate()
+        .find(|(_, line)| line.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} is not on the screen:\n{screen}"));
+    let x = line[..line.find(needle).unwrap()].chars().count();
+    terminal.backend().buffer()[(x as u16, y as u16)].style()
+}
+
+fn drawn_terminal(ui: &Ui, state: &AppState) -> Terminal<TestBackend> {
+    let mut terminal = terminal(110, 30);
+    terminal
+        .draw(|frame| render_with(ui, state, frame))
+        .unwrap();
+    terminal
+}
+
+#[test]
+fn a_theme_changes_the_style_and_never_the_text() {
+    let state = state_for(&fixtures("project"));
+    assert_eq!(
+        drawn_with(&themed(loud_theme()), &state, 110, 30),
+        drawn(&state, 110, 30)
+    );
+}
+
+#[test]
+fn every_kind_of_item_is_drawn_in_the_style_of_its_role() {
+    let state = press_all(state_for(&fixtures("project")), &[Message::Down]);
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    // the folder is not selected any more, the bundle is
+    assert_eq!(style_at(&terminal, "3 bundles").fg, Some(Color::Red));
+    assert_eq!(
+        style_at(&terminal, "stripping  ").fg,
+        Some(Color::Green),
+        "a bundle"
+    );
+    assert_eq!(
+        style_at(&terminal, "messages.properties").fg,
+        Some(Color::Blue),
+        "a file"
+    );
+}
+
+#[test]
+fn the_selected_item_gets_the_style_for_the_selection_on_top_of_its_role() {
+    let state = state_for(&fixtures("project"));
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    let folder = style_at(&terminal, "3 bundles");
+    assert_eq!(folder.fg, Some(Color::Red), "the role stays");
+    assert!(folder.add_modifier.contains(Modifier::UNDERLINED));
+    assert!(
+        !folder.add_modifier.contains(Modifier::REVERSED),
+        "the selection style is the one of the theme"
+    );
+    let other = style_at(&terminal, "messages.properties");
+    assert!(!other.add_modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn an_uncertain_file_and_an_excluded_bundle_get_their_styles_on_top_of_their_roles() {
+    let dir = TempDir::new();
+    write(&dir, "single_file_de.properties", b"a=1\n");
+    let terminal = drawn_terminal(&themed(loud_theme()), &state_for(&dir.0));
+    assert_eq!(
+        style_at(&terminal, "single_file_de.properties").fg,
+        Some(Color::Magenta)
+    );
+
+    let (mut session, problems) = Session::open(&fixtures("project"));
+    let bundle = session.store().bundles()[0];
+    session.exclude_bundle(bundle, true);
+    let state = press_all(AppState::new(session, problems), &[Message::Last]);
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    assert_eq!(style_at(&terminal, "messages  ").fg, Some(Color::Cyan));
+    assert_eq!(style_at(&terminal, "stripping  ").fg, Some(Color::Green));
+}
+
+#[test]
+fn the_standard_theme_marks_the_selection_without_colour() {
+    let state = state_for(&fixtures("project"));
+    let terminal = drawn_terminal(&Ui::default(), &state);
+    assert!(
+        style_at(&terminal, "3 bundles")
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
+    assert!(
+        !style_at(&terminal, "messages.properties")
+            .add_modifier
+            .contains(Modifier::REVERSED)
+    );
 }

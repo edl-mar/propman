@@ -1,23 +1,29 @@
 //! Views, rendering and input. Reads and writes only through `app`.
 //!
 //! `render` draws the state and changes nothing. `message_for` turns a terminal event into a
-//! message, or into nothing. `run_loop` is the event loop; it gets its source of events from the
+//! message, or into nothing, by the keymap of the `Ui`; the `Ui` also holds the theme, and the
+//! line with the keys is made from the keymap. Nothing else knows a key or a colour. `run_loop` is the event loop; it gets its source of events from the
 //! outside, so that it can be driven by a fixed list of events and a test buffer instead of a
 //! terminal. `run` is the same loop on the real terminal.
 //!
 //! The screen has a title, a line with the count, a line with the problems (only if there are
 //! any), the list of the bundle overview and a line with the keys. The list shows the part that
 //! the state scrolled to. An item is marked as follows, and never by colour alone: the selected
-//! one by `>` (and reversed), an uncertain file by `?` (and yellow), an excluded bundle by
-//! `[excluded]` (and dimmed).
+//! one by `>`, an uncertain file by `?`, an excluded bundle by `[excluded]`; the styles of the
+//! theme come on top.
+
+mod keys;
+mod ui;
 
 use std::io;
 
+pub use keys::{Code, Context, Key, Keymap};
+pub use ui::{Theme, Ui};
+
 use app::{AppState, Confidence, Encoding, Message, OverviewItem, View, overview, update};
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::Event;
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
@@ -73,6 +79,7 @@ fn fit_left(text: &str, available: usize) -> String {
 /// One line of the list. A folder is indented by 0, a bundle by 2 and a file by 4 characters
 /// behind the two characters of the selection mark.
 fn item_line(
+    theme: &Theme,
     item: &OverviewItem,
     selected: bool,
     width: usize,
@@ -85,7 +92,7 @@ fn item_line(
             let available = width.saturating_sub(mark.len() + 2 + count.chars().count());
             (
                 format!("{mark}{}  {count}", fit_left(path, available)),
-                Style::new().add_modifier(Modifier::BOLD),
+                theme.folder,
             )
         }
         OverviewItem::Bundle {
@@ -95,10 +102,10 @@ fn item_line(
             ..
         } => {
             let mut text = format!("{mark}  {name}  {}", counted(*files, "file", "files"));
-            let mut style = Style::new();
+            let mut style = theme.bundle;
             if *excluded {
                 text.push_str("  [excluded]");
-                style = style.fg(Color::DarkGray);
+                style = style.patch(theme.excluded);
             }
             (text, style)
         }
@@ -124,15 +131,15 @@ fn item_line(
                     counted(*lines, "line", "lines")
                 ),
                 if uncertain {
-                    Style::new().fg(Color::Yellow)
+                    theme.file.patch(theme.uncertain)
                 } else {
-                    Style::new()
+                    theme.file
                 },
             )
         }
     };
     let style = if selected {
-        style.add_modifier(Modifier::REVERSED)
+        style.patch(theme.selected)
     } else {
         style
     };
@@ -140,7 +147,7 @@ fn item_line(
 }
 
 /// Draws the state into the frame.
-pub fn render(state: &AppState, frame: &mut Frame) {
+pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
     let has_problems = !state.problems().is_empty();
     let [title, count, problems, list, footer] = Layout::vertical([
         Constraint::Length(1),
@@ -192,6 +199,7 @@ pub fn render(state: &AppState, frame: &mut Frame) {
             .take(usize::from(list.height))
             .map(|(index, item)| {
                 item_line(
+                    &ui.theme,
                     item,
                     index == view.selected(),
                     usize::from(list.width),
@@ -202,40 +210,45 @@ pub fn render(state: &AppState, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(lines), list);
     }
 
-    frame.render_widget(
-        Paragraph::new("q: quit   j/k or arrows: move   PgUp/PgDn: page   Home/End: ends"),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(key_help(&ui.keymap, state.view())), footer);
+}
+
+/// What the keys do, as far as they are bound: `q/ctrl+c: quit   up/k/down/j: move ...`.
+fn key_help(keymap: &Keymap, view: &View) -> String {
+    let context = Context::of(view);
+    let groups: [(&[Message], &str); 4] = [
+        (&[Message::Quit], "quit"),
+        (&[Message::Up, Message::Down], "move"),
+        (&[Message::PageUp, Message::PageDown], "page"),
+        (&[Message::First, Message::Last], "ends"),
+    ];
+    groups
+        .iter()
+        .filter_map(|(messages, label)| {
+            let mut keys: Vec<Key> = Vec::new();
+            for key in messages
+                .iter()
+                .flat_map(|&message| keymap.keys_for(context, message))
+            {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            if keys.is_empty() {
+                return None;
+            }
+            let keys: Vec<String> = keys.iter().map(Key::to_string).collect();
+            Some(format!("{}: {label}", keys.join("/")))
+        })
+        .collect::<Vec<_>>()
+        .join("   ")
 }
 
 /// The message for an event, if there is one. Only the press of a key counts, not its release;
 /// a character with Ctrl and Alt (what AltGr sends) is a plain character.
-pub fn message_for(event: &Event) -> Option<Message> {
-    let Event::Key(key) = event else {
-        return None;
-    };
-    if key.kind != KeyEventKind::Press {
-        return None;
-    }
-    let altgr = key
-        .modifiers
-        .contains(KeyModifiers::CONTROL | KeyModifiers::ALT);
-    let modifiers = if altgr {
-        KeyModifiers::NONE
-    } else {
-        key.modifiers
-    };
-    match (key.code, modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::NONE) => Some(Message::Quit),
-        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(Message::Quit),
-        (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => Some(Message::Up),
-        (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => Some(Message::Down),
-        (KeyCode::PageUp, KeyModifiers::NONE) => Some(Message::PageUp),
-        (KeyCode::PageDown, KeyModifiers::NONE) => Some(Message::PageDown),
-        (KeyCode::Home, KeyModifiers::NONE) => Some(Message::First),
-        (KeyCode::End, KeyModifiers::NONE) => Some(Message::Last),
-        _ => None,
-    }
+pub fn message_for(ui: &Ui, view: &View, event: &Event) -> Option<Message> {
+    let key = Key::from_event(event)?;
+    ui.keymap.message(Context::of(view), key)
 }
 
 /// Tells the state how many items fit, draws, waits for an event, updates the state, and repeats
@@ -243,6 +256,7 @@ pub fn message_for(event: &Event) -> Option<Message> {
 /// changes. Returns the final state.
 pub fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
+    ui: &Ui,
     mut state: AppState,
     mut next_event: impl FnMut() -> io::Result<Event>,
 ) -> Result<AppState, LoopError<B::Error>> {
@@ -255,22 +269,22 @@ pub fn run_loop<B: Backend>(
             told = Some(height);
         }
         terminal
-            .draw(|frame| render(&state, frame))
+            .draw(|frame| render(ui, &state, frame))
             .map_err(LoopError::Draw)?;
         if state.should_quit() {
             return Ok(state);
         }
         let event = next_event().map_err(LoopError::Events)?;
-        if let Some(message) = message_for(&event) {
+        if let Some(message) = message_for(ui, state.view(), &event) {
             state = update(state, message);
         }
     }
 }
 
 /// The same loop on the real terminal, which is restored when the loop ends or fails.
-pub fn run(state: AppState) -> io::Result<AppState> {
+pub fn run(ui: &Ui, state: AppState) -> io::Result<AppState> {
     let mut terminal = ratatui::init();
-    let result = run_loop(&mut terminal, state, ratatui::crossterm::event::read);
+    let result = run_loop(&mut terminal, ui, state, ratatui::crossterm::event::read);
     ratatui::restore();
     result.map_err(|error| match error {
         LoopError::Draw(e) | LoopError::Events(e) => e,
