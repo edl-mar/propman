@@ -15,6 +15,7 @@
 //! preview of the selected file the right half, behind a column with `|`.
 
 mod editor;
+mod fake_editor;
 mod keys;
 mod ui;
 
@@ -22,6 +23,7 @@ use std::io;
 use std::path::Path;
 
 pub use editor::{EditorCommand, editor_command};
+pub use fake_editor::outcome_for_key;
 pub use keys::{Code, Context, Key, Keymap};
 pub use ui::{Theme, Ui};
 
@@ -398,12 +400,19 @@ fn edit_in_terminal(terminal: &mut ratatui::DefaultTerminal, path: &Path) -> Edi
 /// The same loop on the real terminal, which is restored when the loop ends or fails.
 pub fn run(ui: &Ui, state: AppState) -> io::Result<AppState> {
     let mut terminal = ratatui::init();
+    // to try by hand how the failure cases of the editor look, without a setup for them
+    let edit: fn(&mut ratatui::DefaultTerminal, &Path) -> EditorOutcome =
+        if std::env::var_os("PROPMAN_FAKE_EDITOR").is_some() {
+            fake_editor::fake_editor
+        } else {
+            edit_in_terminal
+        };
     let result = run_loop(
         &mut terminal,
         ui,
         state,
         ratatui::crossterm::event::read,
-        edit_in_terminal,
+        edit,
     );
     ratatui::restore();
     result.map_err(|error| match error {
