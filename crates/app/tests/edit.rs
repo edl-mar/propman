@@ -41,7 +41,7 @@ fn the_file(state: &AppState) -> FileId {
 
 fn overview_state(state: &AppState) -> OverviewState {
     match state.view() {
-        View::Overview(overview) => *overview,
+        View::Overview(overview) => overview.clone(),
     }
 }
 

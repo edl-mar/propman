@@ -84,7 +84,7 @@ const ITEMS: usize = 18;
 
 fn overview_state(state: &AppState) -> OverviewState {
     match state.view() {
-        View::Overview(overview) => *overview,
+        View::Overview(overview) => overview.clone(),
     }
 }
 

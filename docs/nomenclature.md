@@ -56,6 +56,7 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | raw unit | Rohdatei-Einheit | The unit that represents what is on the disk, with its interpretation. Only ever filled from the disk; the user does not edit it. |
 | view | Ansicht | One of the exclusive screens of the program; for now the bundle overview. An overlay (later) lies over any view. |
 | overview item | Eintrag der Übersicht | One line of the bundle overview: a folder, a bundle or a file. Not an entry (a key) and not a line of a file. |
+| item id | Id eines Eintrags | What identifies an item of the overview whatever its place in the list: the id of a file or a bundle, or the path of a folder. Not a key (of a property). |
 | level | Ebene | What one row of a view is: a file, a bundle, later a line or an entry. Not a scope of bundle merging. |
 | group | Gruppe | A header row that gathers rows by a field (folder, bundle; later a key prefix). |
 | selection | Auswahl | The ids of entries of one kind that an action works on; the cursor is a selection of one. A condition or a fixed set. |

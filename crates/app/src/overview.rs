@@ -13,6 +13,15 @@ use types::{Confidence, Encoding};
 
 use crate::session::Session;
 
+/// What identifies an item of the overview, whatever its place in the list. A folder has no id in
+/// the store, it is a path, so its identity is the path relative to the opened folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ItemId {
+    Folder(String),
+    Bundle(BundleId),
+    File(FileId),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverviewItem {
     Folder {
@@ -36,6 +45,16 @@ pub enum OverviewItem {
         encoding: Encoding,
         lines: usize,
     },
+}
+
+impl OverviewItem {
+    pub fn id(&self) -> ItemId {
+        match self {
+            OverviewItem::Folder { path, .. } => ItemId::Folder(path.clone()),
+            OverviewItem::Bundle { id, .. } => ItemId::Bundle(*id),
+            OverviewItem::File { id, .. } => ItemId::File(*id),
+        }
+    }
 }
 
 /// A folder relative to the opened one, with `/` as separator and `.` for the folder itself.
