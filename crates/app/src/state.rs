@@ -21,6 +21,7 @@ use store::FileId;
 use crate::effect::{EditorOutcome, Effect};
 use crate::list::{ListState, Movement};
 use crate::overview::{ItemId, OverviewItem, overview};
+use crate::selection::selection;
 use crate::session::{LoadProblem, ReloadError, Session};
 
 pub struct AppState {
@@ -80,6 +81,7 @@ pub enum View {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverviewState {
     list: ListState<ItemId>,
+    marks: Vec<ItemId>,
     preview: bool,
     preview_scroll: usize,
 }
@@ -88,6 +90,7 @@ impl Default for OverviewState {
     fn default() -> Self {
         Self {
             list: ListState::new(),
+            marks: Vec::new(),
             preview: true,
             preview_scroll: 0,
         }
@@ -128,6 +131,8 @@ impl OverviewState {
                 self.preview_scroll = self.preview_scroll.saturating_sub(half);
             }
             Message::PreviewHalfPageDown => self.preview_scroll += half,
+            Message::ToggleMark => self.toggle_mark(),
+            Message::ClearMarks => self.marks.clear(),
             Message::Quit
             | Message::DismissAlert
             | Message::Edit
@@ -137,13 +142,36 @@ impl OverviewState {
         if self.list.cursor() != before.as_ref() {
             self.preview_scroll = 0;
         }
+        self.marks.retain(|mark| ids.contains(mark));
         self.keep_preview_inside(items);
+    }
+
+    /// Marks the item under the cursor or takes its mark away. The marks are of one kind: an
+    /// item of another kind than the marked ones starts a new set.
+    fn toggle_mark(&mut self) {
+        let Some(id) = self.list.cursor().cloned() else {
+            return;
+        };
+        if let Some(position) = self.marks.iter().position(|mark| *mark == id) {
+            self.marks.remove(position);
+            return;
+        }
+        let other_kind = self
+            .marks
+            .first()
+            .is_some_and(|mark| std::mem::discriminant(mark) != std::mem::discriminant(&id));
+        if other_kind {
+            self.marks.clear();
+        }
+        self.marks.push(id);
     }
 
     /// Finds the cursor among the items again after they changed, and keeps the preview inside
     /// what there is.
     fn settle(&mut self, items: &[OverviewItem]) {
-        self.list.settle(&ids_of(items));
+        let ids = ids_of(items);
+        self.list.settle(&ids);
+        self.marks.retain(|mark| ids.contains(mark));
         self.keep_preview_inside(items);
     }
 
@@ -172,6 +200,15 @@ impl OverviewState {
     /// The number of items that fit; 0 as long as it is not known.
     pub fn height(&self) -> usize {
         self.list.height()
+    }
+
+    /// The items that were marked by hand.
+    pub fn marked(&self) -> &[ItemId] {
+        &self.marks
+    }
+
+    pub fn is_marked(&self, id: &ItemId) -> bool {
+        self.marks.contains(id)
     }
 
     /// Whether the preview is switched on (the view may still not draw it on a narrow screen).
@@ -206,6 +243,10 @@ pub enum Message {
     /// Scrolls the preview by half of its height.
     PreviewHalfPageUp,
     PreviewHalfPageDown,
+    /// Marks the item under the cursor, or takes the mark away.
+    ToggleMark,
+    /// Takes all marks away.
+    ClearMarks,
     /// Closes the alert.
     DismissAlert,
     /// Edits the file under the cursor in the editor of the user.
@@ -241,7 +282,10 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     match message {
         Message::Quit => state.quit = true,
         Message::DismissAlert => state.alert = None,
-        Message::Edit => effect = edit_effect(&state),
+        Message::Edit => match edit_effect(&state) {
+            Some(edit) => effect = Some(edit),
+            None => state.alert = Some("edit needs exactly one file".to_owned()),
+        },
         Message::EditorClosed { file, outcome } => match outcome {
             EditorOutcome::Done => effect = Some(Effect::Reload(file)),
             EditorOutcome::NoEditor => {
@@ -277,15 +321,14 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     (state, effect)
 }
 
-/// The effect for editing the item under the cursor: only a file can be edited.
+/// The effect for editing the selection: it has to be exactly one file.
 fn edit_effect(state: &AppState) -> Option<Effect> {
-    let View::Overview(view) = &state.view;
-    let items = overview(&state.session);
-    let Some(OverviewItem::File { id, .. }) = items.get(view.index()) else {
+    let chosen = selection(state);
+    let [ItemId::File(file)] = chosen.as_slice() else {
         return None;
     };
-    let path = state.session.store().file_path(*id)?.to_path_buf();
-    Some(Effect::Edit { file: *id, path })
+    let path = state.session.store().file_path(*file)?.to_path_buf();
+    Some(Effect::Edit { file: *file, path })
 }
 
 fn apply_to_overview(state: &mut AppState, message: Message) {

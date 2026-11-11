@@ -67,13 +67,90 @@ fn edit_on_a_file_asks_to_edit_that_file() {
 }
 
 #[test]
-fn edit_on_a_folder_or_a_bundle_asks_for_nothing() {
+fn edit_on_a_folder_or_a_bundle_asks_for_nothing_and_says_what_it_needs() {
     let (state, _dir) = one_file(b"a=1\n");
     let state = send(state, &[Message::Viewport(10)]);
     let (state, effect) = update(state, Message::Edit);
     assert_eq!(effect, None, "the folder");
-    let state = send(state, &[Message::Down]);
-    assert_eq!(update(state, Message::Edit).1, None, "the bundle");
+    assert!(
+        state
+            .alert()
+            .unwrap()
+            .contains("edit needs exactly one file")
+    );
+
+    let state = send(state, &[Message::DismissAlert, Message::Down]);
+    let (state, effect) = update(state, Message::Edit);
+    assert_eq!(effect, None, "the bundle");
+    assert!(
+        state
+            .alert()
+            .unwrap()
+            .contains("edit needs exactly one file")
+    );
+}
+
+#[test]
+fn edit_works_on_the_marked_file_even_if_the_cursor_is_elsewhere() {
+    let (state, dir) = one_file(b"a=1\n");
+    let state = on_the_file(state);
+    let file = the_file(&state);
+    // mark the file and go back to the bundle
+    let state = send(state, &[Message::ToggleMark, Message::Up]);
+    let (_, effect) = update(state, Message::Edit);
+    assert_eq!(
+        effect,
+        Some(Effect::Edit {
+            file,
+            path: path_of(&dir)
+        })
+    );
+}
+
+#[test]
+fn edit_with_two_marked_files_asks_for_nothing_and_says_what_it_needs() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.properties"), b"a=1\n").unwrap();
+    std::fs::write(dir.path().join("b.properties"), b"b=1\n").unwrap();
+    let (session, problems) = Session::open(dir.path());
+    // the list: folder, bundle a, a, bundle b, b
+    let state = send(
+        AppState::new(session, problems),
+        &[
+            Message::Viewport(10),
+            Message::Down,
+            Message::Down,
+            Message::ToggleMark,
+            Message::Down,
+            Message::Down,
+            Message::ToggleMark,
+        ],
+    );
+    let (state, effect) = update(state, Message::Edit);
+    assert_eq!(effect, None);
+    assert!(
+        state
+            .alert()
+            .unwrap()
+            .contains("edit needs exactly one file")
+    );
+}
+
+#[test]
+fn edit_with_a_marked_bundle_asks_for_nothing_even_if_the_cursor_is_on_a_file() {
+    let (state, _dir) = one_file(b"a=1\n");
+    let state = send(
+        state,
+        &[
+            Message::Viewport(10),
+            Message::Down,
+            Message::ToggleMark,
+            Message::Down,
+        ],
+    );
+    let (state, effect) = update(state, Message::Edit);
+    assert_eq!(effect, None);
+    assert!(state.alert().is_some());
 }
 
 // ── What comes back from the editor ──────────────────────────────────────────
@@ -197,6 +274,8 @@ fn an_alert_blocks_what_the_keys_of_the_view_do() {
         Message::TogglePreview,
         Message::PreviewDown,
         Message::PreviewHalfPageDown,
+        Message::ToggleMark,
+        Message::ClearMarks,
         Message::Edit,
     ];
     for message in blocked {

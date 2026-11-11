@@ -189,7 +189,7 @@ fn other_keys_give_no_message() {
     for event in [
         press('x'),
         key(KeyCode::Enter, KeyModifiers::CONTROL),
-        key(KeyCode::Esc, KeyModifiers::NONE),
+        key(KeyCode::Backspace, KeyModifiers::NONE),
         key(KeyCode::Tab, KeyModifiers::NONE),
     ] {
         assert_eq!(message_for(&event), None, "{event:?}");
@@ -744,7 +744,7 @@ fn last_line(screen: &str) -> String {
 
 #[test]
 fn the_line_with_the_keys_comes_from_the_keymap() {
-    let footer = last_line(&drawn(&state_for(&fixtures("project")), 140, 10));
+    let footer = last_line(&drawn(&state_for(&fixtures("project")), 170, 10));
     assert!(footer.contains("q/ctrl+c: quit"), "{footer}");
     assert!(footer.contains("up/k/down/j: move"), "{footer}");
     assert!(footer.contains("pgup/pgdn: page"), "{footer}");
@@ -786,6 +786,7 @@ fn loud_theme() -> Theme {
         uncertain: Style::new().fg(Color::Magenta),
         excluded: Style::new().fg(Color::Cyan),
         cursor: Style::new().add_modifier(Modifier::UNDERLINED),
+        marked: Style::new().fg(Color::LightGreen),
         alert: Style::new().fg(Color::LightRed),
         line_number: Style::new().fg(Color::Yellow),
         ending: Style::new().fg(Color::LightBlue),
@@ -1038,8 +1039,8 @@ fn an_empty_file_shows_only_the_header() {
 
 #[test]
 fn the_line_with_the_keys_names_the_keys_of_the_preview() {
-    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 140, 10));
-    assert!(footer.contains("space: preview"), "{footer}");
+    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 170, 10));
+    assert!(footer.contains("v: preview"), "{footer}");
     assert!(footer.contains("ctrl+u/ctrl+d: scroll preview"), "{footer}");
 }
 
@@ -1094,7 +1095,7 @@ fn the_keys_of_the_preview_work_in_the_loop() {
     let (result, _) = run_with(
         &mut terminal,
         state_with_preview(&dir.0),
-        vec![press(' '), press('q')],
+        vec![press('v'), press('q')],
     );
     match result.unwrap().view() {
         View::Overview(overview) => assert!(!overview.preview_on()),
@@ -1252,7 +1253,7 @@ fn the_line_with_the_keys_names_only_what_works_while_there_is_an_alert() {
         state_with_preview(&fixtures("project")),
         EditorOutcome::NoEditor,
     );
-    let footer = last_line(&drawn(&state, 140, 10));
+    let footer = last_line(&drawn(&state, 170, 10));
     assert!(footer.contains("esc/enter/space: dismiss"), "{footer}");
     assert!(footer.contains("q/ctrl+c: quit"), "{footer}");
     for not_there in ["move", "edit", "page", "preview"] {
@@ -1364,7 +1365,12 @@ fn an_editor_that_could_not_run_is_shown_in_the_box_and_the_list_keeps_its_heigh
 
 #[test]
 fn the_line_with_the_keys_names_the_key_to_edit() {
-    let footer = last_line(&drawn(&state_with_preview(&fixtures("project")), 140, 10));
+    // on a file: editing needs one, so it is named only there
+    let state = press_all(
+        state_with_preview(&fixtures("project")),
+        &[Message::Down, Message::Down],
+    );
+    let footer = last_line(&drawn(&state, 170, 10));
     assert!(footer.contains("enter: edit"), "{footer}");
 }
 
@@ -1525,4 +1531,170 @@ fn the_key_for_the_screen_gives_the_text_to_the_sink_and_changes_nothing() {
     match state.view() {
         View::Overview(overview) => assert_eq!(overview.index(), 1),
     }
+}
+
+// ── Marks ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn a_marked_item_shows_a_star_beside_the_mark_of_the_cursor() {
+    let state = state_for(&fixtures("project"));
+    // mark the file at index 2, then move the cursor on
+    let marked = press_all(state, &[Message::Down, Message::Down, Message::ToggleMark]);
+    let screen = drawn(&marked, 110, 30);
+    let list = list_lines(&screen, false);
+    assert!(
+        list[2].starts_with(">*"),
+        "the cursor is on the marked item: {screen}"
+    );
+
+    let moved = press_all(marked, &[Message::Down]);
+    let screen = drawn(&moved, 110, 30);
+    let list = list_lines(&screen, false);
+    assert!(
+        list[2].starts_with(" *"),
+        "marked, the cursor is elsewhere: {screen}"
+    );
+    assert!(list[3].starts_with("> "), "{screen}");
+    assert!(list[0].starts_with("  "), "{screen}");
+    assert!(list[2].contains("messages.properties"), "{screen}");
+}
+
+#[test]
+fn the_line_with_the_count_says_what_is_marked() {
+    let state = state_for(&fixtures("project"));
+    let plain = drawn(&state, 110, 12);
+    assert!(!rows(&plain)[1].contains("marked"), "{plain}");
+
+    let files = press_all(
+        state_for(&fixtures("project")),
+        &[
+            Message::Down,
+            Message::Down,
+            Message::ToggleMark,
+            Message::Down,
+            Message::ToggleMark,
+        ],
+    );
+    let screen = drawn(&files, 110, 12);
+    assert!(
+        rows(&screen)[1].contains("12 files in 4 bundles \u{b7} 2 files marked"),
+        "{screen}"
+    );
+
+    let bundle = press_all(
+        state_for(&fixtures("project")),
+        &[Message::Down, Message::ToggleMark],
+    );
+    assert!(drawn(&bundle, 110, 12).contains("\u{b7} 1 bundle marked"));
+
+    let folder = press_all(state_for(&fixtures("project")), &[Message::ToggleMark]);
+    assert!(drawn(&folder, 110, 12).contains("\u{b7} 1 folder marked"));
+}
+
+#[test]
+fn the_theme_styles_a_marked_item() {
+    // mark the file at index 3 and move the cursor away from it
+    let state = press_all(
+        state_for(&fixtures("project")),
+        &[
+            Message::Down,
+            Message::Down,
+            Message::Down,
+            Message::ToggleMark,
+            Message::Down,
+        ],
+    );
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    assert_eq!(
+        style_at(&terminal, "messages_de.properties").fg,
+        Some(Color::LightGreen)
+    );
+    assert_eq!(
+        style_at(&terminal, "messages_fr.properties").fg,
+        Some(Color::Blue),
+        "an item that is not marked keeps the style of its role"
+    );
+}
+
+#[test]
+fn the_line_with_the_keys_names_marking_and_clearing_only_when_they_can_be_done() {
+    let state = state_for(&fixtures("project"));
+    let footer = last_line(&drawn(&state, 170, 10));
+    assert!(footer.contains("space: mark"), "{footer}");
+    assert!(!footer.contains("clear marks"), "{footer}");
+
+    let marked = press_all(state, &[Message::ToggleMark]);
+    let footer = last_line(&drawn(&marked, 170, 10));
+    assert!(footer.contains("esc: clear marks"), "{footer}");
+}
+
+#[test]
+fn editing_is_offered_only_when_it_can_be_done() {
+    let state = state_for(&fixtures("project"));
+    let on_folder = last_line(&drawn(&state, 170, 10));
+    assert!(!on_folder.contains("edit"), "a folder: {on_folder}");
+
+    let on_file = press_all(state, &[Message::Down, Message::Down]);
+    let footer = last_line(&drawn(&on_file, 170, 10));
+    assert!(footer.contains("enter: edit"), "a file: {footer}");
+
+    let two = press_all(
+        on_file,
+        &[Message::ToggleMark, Message::Down, Message::ToggleMark],
+    );
+    let footer = last_line(&drawn(&two, 170, 10));
+    assert!(!footer.contains("edit"), "two files: {footer}");
+}
+
+#[test]
+fn the_keys_to_mark_and_to_clear_work_in_the_loop() {
+    let mut terminal = terminal(100, 20);
+    let (result, _) = run_with(
+        &mut terminal,
+        state_for(&fixtures("project")),
+        vec![
+            press('j'),
+            press('j'),
+            press(' '),
+            press('j'),
+            press(' '),
+            press('q'),
+        ],
+    );
+    match result.unwrap().view() {
+        View::Overview(overview) => assert_eq!(overview.marked().len(), 2),
+    }
+
+    let (result, _) = run_with(
+        &mut terminal,
+        state_for(&fixtures("project")),
+        vec![
+            press('j'),
+            press(' '),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            press('q'),
+        ],
+    );
+    match result.unwrap().view() {
+        View::Overview(overview) => assert!(overview.marked().is_empty()),
+    }
+}
+
+#[test]
+fn enter_on_a_folder_shows_an_alert_that_says_what_editing_needs_and_runs_no_editor() {
+    let mut terminal = terminal(100, 12);
+    let mut calls = 0;
+    let result = run_with_editor(
+        &mut terminal,
+        state_for(&fixtures("project")),
+        vec![enter(), Event::Resize(100, 12)],
+        |_| {
+            calls += 1;
+            EditorOutcome::Done
+        },
+    );
+    assert!(matches!(result, Err(LoopError::Events(_))));
+    assert_eq!(calls, 0);
+    let screen = screen(&terminal);
+    assert!(screen.contains("edit needs exactly one file"), "{screen}");
 }

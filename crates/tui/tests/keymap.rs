@@ -267,7 +267,6 @@ fn the_standard_keymap_leaves_other_keys_unbound() {
         Key::char('c'),
         Key::char('q').ctrl(),
         Key::new(Code::Enter).ctrl(),
-        Key::new(Code::Esc),
         Key::new(Code::Tab),
         Key::new(Code::Up).shift(),
     ] {
@@ -287,7 +286,7 @@ fn the_standard_keys_to_quit_are_q_and_ctrl_c_in_that_order() {
 fn the_standard_keymap_has_the_keys_of_the_preview() {
     let keymap = Keymap::default();
     let cases = [
-        (Key::char(' '), Message::TogglePreview),
+        (Key::char('v'), Message::TogglePreview),
         (Key::new(Code::Up).ctrl(), Message::PreviewUp),
         (Key::new(Code::Down).ctrl(), Message::PreviewDown),
         (Key::char('u').ctrl(), Message::PreviewHalfPageUp),
@@ -377,9 +376,12 @@ fn the_keys_of_the_overview_keep_their_meaning() {
     );
     assert_eq!(
         keymap.message(OVERVIEW, Key::char(' ')),
-        Some(Message::TogglePreview)
+        Some(Message::ToggleMark)
     );
-    assert_eq!(keymap.message(OVERVIEW, Key::new(Code::Esc)), None);
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::new(Code::Esc)),
+        Some(Message::ClearMarks)
+    );
 }
 
 // ── Function keys ────────────────────────────────────────────────────────────

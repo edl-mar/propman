@@ -18,6 +18,8 @@ pub struct Theme {
     pub excluded: Style,
     /// Added to the row under the cursor.
     pub cursor: Style,
+    /// Added to an item that is marked.
+    pub marked: Style,
     /// The box of an alert: its border, its title and its text.
     pub alert: Style,
     /// The number of a line in the preview.
@@ -35,6 +37,7 @@ impl Default for Theme {
             uncertain: Style::new().fg(Color::Yellow),
             excluded: Style::new().fg(Color::DarkGray),
             cursor: Style::new().add_modifier(Modifier::REVERSED),
+            marked: Style::new().fg(Color::Cyan),
             alert: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             line_number: Style::new().fg(Color::DarkGray),
             ending: Style::new().fg(Color::DarkGray),

@@ -229,8 +229,8 @@ impl Keymap {
 
 impl Default for Keymap {
     /// `q` and `ctrl+c` quit; an alert is dismissed by `esc`, `enter` and `space`; in the overview `up`/`k` and `down`/`j` move, `pgup` and `pgdn`
-    /// page, `home` and `end` go to the ends, `enter` edits the file, `space` switches the
-    /// preview and `ctrl+up`, `ctrl+down`, `ctrl+u` and `ctrl+d` scroll it.
+    /// page, `home` and `end` go to the ends, `enter` edits the file, `space` marks, `esc`
+    /// clears the marks, `v` switches the preview and `ctrl+up`, `ctrl+down`, `ctrl+u` and `ctrl+d` scroll it.
     fn default() -> Keymap {
         let overview = Context::Overview;
         Keymap::empty()
@@ -248,7 +248,9 @@ impl Default for Keymap {
             .bind(Context::Alert, Key::new(Code::Esc), Message::DismissAlert)
             .bind(Context::Alert, Key::new(Code::Enter), Message::DismissAlert)
             .bind(Context::Alert, Key::char(' '), Message::DismissAlert)
-            .bind(overview, Key::char(' '), Message::TogglePreview)
+            .bind(overview, Key::char(' '), Message::ToggleMark)
+            .bind(overview, Key::new(Code::Esc), Message::ClearMarks)
+            .bind(overview, Key::char('v'), Message::TogglePreview)
             .bind(overview, Key::new(Code::Up).ctrl(), Message::PreviewUp)
             .bind(overview, Key::new(Code::Down).ctrl(), Message::PreviewDown)
             .bind(overview, Key::char('u').ctrl(), Message::PreviewHalfPageUp)

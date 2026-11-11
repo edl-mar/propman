@@ -40,7 +40,11 @@ be learned by heart, should be fast once known, and should not trigger anything 
   files"). That makes actions on many entries possible and the help fit: only what fits the
   selection is offered. Before an action is confirmed, it says what it works on ("3 files").
   What only happens in memory is not final because of the history; what writes to the disk shows
-  a summary first.
+  a summary first. An action that cannot be done (its precondition does not hold) is not named in
+  the line with the keys, and doing it anyway gives an alert that says what it needs (editing:
+  `edit needs exactly one file`). The marked entries are the selection, even if the cursor is
+  elsewhere; the count line says what is marked (`2 files marked`), and a marked row has a `*`
+  next to the `>` of the cursor.
 - **The state of a view can be written as a line**, and is shown all the time, like the address
   bar of a browser (`show folder, bundle, file`). A compact form is an idea for later.
 - **The command line.** `:` opens it (as in Helix). Segments are separated by `Tab`, `Shift+Tab`
@@ -474,7 +478,10 @@ much later.
   `AltGr+8` and `AltGr+9`, slower to type than round brackets, which are needed later for
   grouping; a possible way out is to accept the elements without brackets and to show them with
   brackets.
-- **More of the language:** "or", "not", a union; how a reference is named.
+- **More of the language:** "or", "not", a union; how a reference is named; what a second
+  `show` does (replace, or add: `show add ...`). A command language of this kind can easily grow
+  into a small Lisp inside; the rule is that it stays a sequence of named segments over typed
+  selections, without variables, functions of its own, loops or conditions.
 - **The compact form of the line** that shows the state of the view.
 - **The format of the descriptions** and the names of the commands.
 - The filter was listed as not to be anticipated. It is now being designed as a part of this

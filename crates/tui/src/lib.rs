@@ -31,8 +31,8 @@ pub use screen::screen_text;
 pub use ui::{Theme, Ui};
 
 use app::{
-    AppState, Confidence, EditorOutcome, Encoding, Message, OverviewItem, View, overview, perform,
-    preview, update,
+    AppState, Confidence, EditorOutcome, Encoding, ItemId, Message, OverviewItem, View, applicable,
+    overview, perform, preview, update,
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
@@ -61,6 +61,19 @@ const FOOTER_LINES: usize = 1;
 /// the count, the status line (only if there is one) and the line with the keys.
 pub fn list_height(screen_height: u16, has_status: bool) -> usize {
     usize::from(screen_height).saturating_sub(HEADER_LINES + usize::from(has_status) + FOOTER_LINES)
+}
+
+/// "2 files marked", or nothing if nothing is marked.
+fn marked_text(marked: &[ItemId]) -> Option<String> {
+    let (singular, plural) = match marked.first()? {
+        ItemId::Folder(_) => ("folder", "folders"),
+        ItemId::Bundle(_) => ("bundle", "bundles"),
+        ItemId::File(_) => ("file", "files"),
+    };
+    Some(format!(
+        "{} marked",
+        counted(marked.len(), singular, plural)
+    ))
 }
 
 /// The status line: the count of the problems, if there are any.
@@ -160,15 +173,20 @@ fn fit_left(text: &str, available: usize) -> String {
 }
 
 /// One line of the list. A folder is indented by 0, a bundle by 2 and a file by 4 characters
-/// behind the two characters of the cursor mark.
+/// behind the two characters of the cursor and the mark (`>` and `*`).
 fn item_line(
     theme: &Theme,
     item: &OverviewItem,
     at_cursor: bool,
+    marked: bool,
     width: usize,
     name_width: usize,
 ) -> Line<'static> {
-    let mark = if at_cursor { "> " } else { "  " };
+    let mark = format!(
+        "{}{}",
+        if at_cursor { '>' } else { ' ' },
+        if marked { '*' } else { ' ' }
+    );
     let (text, style) = match item {
         OverviewItem::Folder { path, bundles } => {
             let count = counted(*bundles, "bundle", "bundles");
@@ -221,6 +239,11 @@ fn item_line(
             )
         }
     };
+    let style = if marked {
+        style.patch(theme.marked)
+    } else {
+        style
+    };
     let style = if at_cursor {
         style.patch(theme.cursor)
     } else {
@@ -247,19 +270,20 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         title,
     );
 
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{} in {}",
-            counted(session.file_count(), "file", "files"),
-            counted(session.bundle_count(), "bundle", "bundles"),
-        )),
-        count,
+    let View::Overview(view) = state.view();
+    let mut counts = format!(
+        "{} in {}",
+        counted(session.file_count(), "file", "files"),
+        counted(session.bundle_count(), "bundle", "bundles"),
     );
+    if let Some(marked) = marked_text(view.marked()) {
+        counts.push_str(&format!(" \u{b7} {marked}"));
+    }
+    frame.render_widget(Paragraph::new(counts), count);
     if let Some(status) = status {
         frame.render_widget(Paragraph::new(status), status_area);
     }
 
-    let View::Overview(view) = state.view();
     let (list, preview_area) = if view.preview_on() && frame.area().width >= PREVIEW_MIN_WIDTH {
         let [left, separator, right] = Layout::horizontal([
             Constraint::Length(list.width / 2),
@@ -301,6 +325,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
                     &ui.theme,
                     item,
                     index == view.index(),
+                    view.is_marked(&item.id()),
                     usize::from(list.width),
                     name_width,
                 )
@@ -309,10 +334,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(lines), list);
     }
 
-    frame.render_widget(
-        Paragraph::new(key_help(&ui.keymap, Context::of(state))),
-        footer,
-    );
+    frame.render_widget(Paragraph::new(key_help(&ui.keymap, state)), footer);
 
     if let Some(text) = state.alert() {
         render_alert(&ui.theme, &ui.keymap, text, frame);
@@ -360,12 +382,15 @@ fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'sta
     rows
 }
 
-/// What the keys do, as far as they are bound: `q/ctrl+c: quit   up/k/down/j: move ...`.
-fn key_help(keymap: &Keymap, context: Context) -> String {
-    let groups: [(&[Message], &str); 8] = [
+/// What the keys do, as far as they are bound and can be done now: `q/ctrl+c: quit   up/k/down/j: move ...`.
+fn key_help(keymap: &Keymap, state: &AppState) -> String {
+    let context = Context::of(state);
+    let groups: [(&[Message], &str); 10] = [
         (&[Message::Quit], "quit"),
         (&[Message::DismissAlert], "dismiss"),
         (&[Message::Edit], "edit"),
+        (&[Message::ToggleMark], "mark"),
+        (&[Message::ClearMarks], "clear marks"),
         (&[Message::Up, Message::Down], "move"),
         (&[Message::PageUp, Message::PageDown], "page"),
         (&[Message::First, Message::Last], "ends"),
@@ -381,6 +406,7 @@ fn key_help(keymap: &Keymap, context: Context) -> String {
             let mut keys: Vec<Key> = Vec::new();
             for key in messages
                 .iter()
+                .filter(|&&message| applicable(state, message))
                 .flat_map(|&message| keymap.keys_for(context, message))
             {
                 if !keys.contains(&key) {
