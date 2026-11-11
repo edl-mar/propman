@@ -16,8 +16,8 @@ pub struct Theme {
     pub uncertain: Style,
     /// Added to a bundle that is excluded.
     pub excluded: Style,
-    /// Added to the selected item.
-    pub selected: Style,
+    /// Added to the row under the cursor.
+    pub cursor: Style,
     /// The box of an alert: its border, its title and its text.
     pub alert: Style,
     /// The number of a line in the preview.
@@ -34,7 +34,7 @@ impl Default for Theme {
             file: Style::new(),
             uncertain: Style::new().fg(Color::Yellow),
             excluded: Style::new().fg(Color::DarkGray),
-            selected: Style::new().add_modifier(Modifier::REVERSED),
+            cursor: Style::new().add_modifier(Modifier::REVERSED),
             alert: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             line_number: Style::new().fg(Color::DarkGray),
             ending: Style::new().fg(Color::DarkGray),

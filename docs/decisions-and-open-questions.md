@@ -23,11 +23,19 @@ be learned by heart, should be fast once known, and should not trigger anything 
 - **Level, group, filter.** The *level* of a view says what a row is (not to be confused with a
   scope of bundle merging). A *group* is a header row that gathers rows by a field (folder,
   bundle; later a key prefix). A *filter* is a condition over fields and hides rows.
-- **Selection.** The ids of entries of **one** kind, and where needed one field. The cursor is a
-  selection of one. There are no mixed selections: several steps one after the other replace
-  them. A selection is either a *condition* (it holds as new things come) or a *fixed set* (marked
-  by hand, it stays until changed; stale ids drop out). An action turns a condition into a fixed
-  set at the moment it is confirmed.
+- **Cursor, mark, selection.** The *cursor* is the row the user is on. To *mark* is to put the
+  entry under the cursor into a fixed set by hand (`Space`, shown as `*`; the same key takes it
+  out again). The *selection* is what an action works on: the ids of entries of **one** kind, and
+  where needed one field. It is the marked entries, and if none is marked, the entry under the
+  cursor; later it can also be a *condition* (it holds as new things come). A marked set stays
+  until changed, and stale ids drop out. There are no mixed selections: several steps one after
+  the other replace them. An action turns a condition into a fixed set at the moment it is
+  confirmed.
+- **Brackets mean a fixed set.** `sel [a.properties, b.properties]` is a fixed set, written with
+  natural names and not with ids; `sel locale de` without brackets is a condition. So the line
+  shows which kind of selection it is, and compactly `sel [3 files]`. What is marked by hand
+  shows in the command line as such a literal and can be changed there, with completion for every
+  element; so no keys for "add" and "remove" are needed.
 - **Action.** Its precondition is the kind of the selection (for example "the field `encoding` of
   files"). That makes actions on many entries possible and the help fit: only what fits the
   selection is offered. Before an action is confirmed, it says what it works on ("3 files").
@@ -47,17 +55,19 @@ be learned by heart, should be fast once known, and should not trigger anything 
   selection (a chain of "and"). A reference is followed by naming it, taken from the description.
 - **The table of commands** (name, label, key) is the base for the help and for the settings
   file; the command line is the searchable help to the keys.
-- **Direct operation:** the arrow keys move in the level, `Space` marks, `Tab` and the left and
-  right keys go into the fields. `Esc` leaves the topmost: an overlay, then the level, then the
-  selection. The line with the keys shows the keys of the current context, as it does now.
+- **Direct operation:** the arrow keys move in the level, `Space` marks (the left thumb, while the
+  right hand stays on the arrows), `Tab` and the left and right keys go into the fields. `Esc`
+  leaves the topmost: an overlay, then the level, then the marks. For now `v` switches the preview
+  (later a command). All, none and invert are commands (`sel all`, `sel none`, `sel invert`), not
+  keys. The line with the keys shows the keys of the current context, as it does now.
 - **Dropped:** `Shift`, `ctrl` or `alt` as a way through to an outer layer (terminals differ too
   much, and `Ctrl+Alt` is AltGr on some keyboards), and a leader menu (the command line does the
   same).
 - **In the architecture:** the command line is an overlay like the alert, with its own context in
-  the keymap. The selection and the cursor are state of the view. Rows, candidates and the
+  the keymap. The marks and the cursor are state of the view. Rows, candidates and the
   preview are pure functions of the store, like `overview` and `preview`: **no new stores**. It
   is the first text input (keys that are not bound reach a field; `Backspace` and `BackTab` are
-  new). Cursor and selection hold ids, not indices.
+  new). The cursor and the marks hold ids, not indices.
 - **What changes:** the overview is `show folder, bundle, file`; the preview is the lines of the
   selected file; the raw view over all files is the level "line" grouped by file and **not a view
   of its own**; searching is a filter on the field "text" (jumping or filtering); jumps to the
@@ -104,15 +114,16 @@ be learned by heart, should be fast once known, and should not trigger anything 
 
 ### The preview in the overview (2026-11-09)
 - **The use case:** look into a file quickly, for example to check its encoding or its line
-  endings, without leaving the list. The preview shows the raw lines of the selected file next
-  to the list. It is derived from the state (the selected item and a scroll position), read
+  endings, without leaving the list. The preview shows the raw lines of the file under the cursor
+  next to the list. It is derived from the state (the item under the cursor and a scroll position), read
   only, has no focus and is not a view of its own.
 - **On by default, `space` switches it.** It is drawn only if the terminal is at least 100
   columns wide; otherwise it is not drawn, and the setting is kept. When it is drawn, the list
-  gets the left half. For a folder or a bundle the pane says that a file has to be selected.
+  gets the left half. For a folder or a bundle the pane says that a file has to be
+  under the cursor.
 - **Scrolling:** `ctrl+up` and `ctrl+down` by one line, `ctrl+u` and `ctrl+d` by half the
-  height of the preview. It stops at the ends and starts at the top again whenever the selection
-  changes.
+  height of the preview. It stops at the ends and starts at the top again whenever the cursor
+  moves to another item.
 - **What it shows:** a header with the name of the file, its encoding and its number of lines,
   then the lines with their numbers. The text of a line is cut with `...` if it is too long,
   control characters are shown as `·`, and the line ending is written as text at the right
@@ -132,8 +143,8 @@ be learned by heart, should be fast once known, and should not trigger anything 
   table per mode of the first version, in which `Ctrl+C` stood nine times.
 - **The line with the keys is made from the keymap**, so that it cannot name a key that is not
   bound.
-- **The theme has roles, not colours:** folder, bundle, file, uncertain, excluded, selected. The
-  style of uncertain, excluded and selected comes on top of the style of the role. The meaning
+- **The theme has roles, not colours:** folder, bundle, file, uncertain, excluded, cursor. The
+  style of uncertain, excluded and cursor comes on top of the style of the role. The meaning
   never rests on a style (the marks are text), so a theme is decoration and is not tested for
   looks.
 - **Not yet:** a settings file, names for messages (they come with the file, because they only
@@ -148,19 +159,19 @@ be learned by heart, should be fast once known, and should not trigger anything 
 - **What an item shows.** Folder: the path and the number of bundles. Bundle: the name, the
   number of files, `[excluded]` if it is excluded. File: the locale or `(default)`, the file name,
   the encoding (`UTF-8`, `UTF-8+BOM`, `Windows-1252`, `Latin-1`) and the number of lines.
-- **Marks, never by colour alone:** `>` for the selected item (and reversed), `?` for an uncertain
+- **Marks, never by colour alone:** `>` for the item under the cursor (and reversed), `?` for an uncertain
   file (and yellow), `[excluded]` for an excluded bundle (and dimmed). The colours are
   decoration and are not tested.
 - **The list is a pure function of the session** (`app::overview`), as plain values with the text
   already resolved, so that a view only draws. Sorted by folder path, then bundle name; in a
   bundle the default file first, then the locales in alphabetical order. A file belongs to the
   bundle of its current assignment.
-- **Selection and scroll position are indices in the state.** The height of the visible part
+- **Cursor and scroll position are in the state** (since 2026-11-11 the cursor is the id of an item,
+  see `ListState`; before it was an index). The height of the visible part
   arrives as a message from the event loop, at the start and whenever the terminal changes its
   size, because only the terminal knows it. The scroll position moves as little as possible to
-  keep the selection visible. A page is as many items as fit, or one item while the height is
-  unknown. The selection stops at the ends. An index is enough while the list does not reorder;
-  with reload and moving files the selection can hold an id instead (a stale id gives `None`).
+  keep the cursor visible. A page is as many items as fit, or one item while the height is
+  unknown. The cursor stops at the ends.
 - **Keys:** `j` and `k` or the arrows, page up and page down, home and end.
 - **The view enum exists from now on** with one variant, so that the next view is only another
   variant. `Session::exclude_bundle` exists; the key for it comes with the first operations.
@@ -457,12 +468,12 @@ much later.
   `ctrl+down`, `ctrl+u` and `ctrl+d`, `enter` go? Modes with a visible bar (F-keys switch them;
   `ctrl+digit` does not work in terminals) or levels of focus with `Tab` (the preview as a pane
   that one goes into)?
-- **A manual selection in the command line:** a fixed set written as a literal, for example
-  `sel [messages_de.properties, messages_fr.properties]`, shown as `[...]` or `[3 files]` in the
-  compact form. It is written with natural names (a path, a folder and a name), not with ids,
-  which only live in one session. In a saved view, entries that are gone are left out and the user
-  is told. Combining it with a condition: after a condition it narrows (a chain of "and"); to add
-  to it a union is needed.
+- **The fixed set in the command line** (see the brackets above): in a saved view, entries that
+  are gone are left out and the user is told. Combining it with a condition: after a condition it
+  narrows (a chain of "and"); to add to it a union is needed. On a German keyboard `[` and `]` are
+  `AltGr+8` and `AltGr+9`, slower to type than round brackets, which are needed later for
+  grouping; a possible way out is to accept the elements without brackets and to show them with
+  brackets.
 - **More of the language:** "or", "not", a union; how a reference is named.
 - **The compact form of the line** that shows the state of the view.
 - **The format of the descriptions** and the names of the commands.
@@ -478,7 +489,7 @@ Ideas from a talk, **not decisions**. The preview itself is decided (see above).
   concept; the rest of this item is the earlier idea) in the order of the overview, opened with `right`, with the
   files one after the other. It must be a virtual list (only the visible rows are made; the
   numbers of lines are in the store), and its position is a file and a line, not an index. The
-  overview and the raw view follow each other: opening starts at the selected file, going back
+  overview and the raw view follow each other: opening starts at the file under the cursor, going back
   selects the file one is in. `left` should stay free for horizontal scrolling of long lines, so
   `esc` goes back.
 - **Search in the raw view across all files.** The first text input of the program: keys that

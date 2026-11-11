@@ -355,7 +355,7 @@ fn list_lines(screen: &str, problems: bool) -> Vec<String> {
         .collect()
 }
 
-/// The indentation of an item: the spaces after the two characters of the selection mark.
+/// The indentation of an item: the spaces after the two characters of the cursor mark.
 fn indent(line: &str) -> usize {
     line.chars().skip(2).take_while(|&c| c == ' ').count()
 }
@@ -429,7 +429,7 @@ fn folders_bundles_and_files_are_indented_by_kind() {
 }
 
 #[test]
-fn exactly_one_line_carries_the_selection_mark_and_it_follows_the_selection() {
+fn exactly_one_line_carries_the_cursor_mark_and_it_follows_the_cursor() {
     let state = state_for(&fixtures("project"));
     let marked = |state: &AppState| -> Vec<usize> {
         let screen = drawn(state, 110, 30);
@@ -565,7 +565,7 @@ fn the_list_shows_the_part_that_the_state_scrolled_to() {
     let list = list_lines(&screen, false);
 
     assert_eq!(list.len(), 5, "{screen}");
-    // item 3 is the first one that is shown, item 7 is selected and the last one shown
+    // item 3 is the first one that is shown, the cursor is on item 7, the last one shown
     assert!(list[0].contains("messages_de.properties"), "{screen}");
     assert!(list[4].starts_with('>'), "{screen}");
     assert!(list[4].contains("stripping.properties"), "{screen}");
@@ -641,7 +641,7 @@ fn the_height_leaves_room_for_the_line_with_problems() {
 }
 
 #[test]
-fn keys_in_the_loop_move_the_selection() {
+fn keys_in_the_loop_move_the_cursor() {
     let mut terminal = terminal(100, 20);
     let (result, _) = run_with(
         &mut terminal,
@@ -655,7 +655,7 @@ fn keys_in_the_loop_move_the_selection() {
         ],
     );
     match result.unwrap().view() {
-        View::Overview(overview) => assert_eq!(overview.selected(), 2),
+        View::Overview(overview) => assert_eq!(overview.index(), 2),
     }
 }
 
@@ -785,7 +785,7 @@ fn loud_theme() -> Theme {
         file: Style::new().fg(Color::Blue),
         uncertain: Style::new().fg(Color::Magenta),
         excluded: Style::new().fg(Color::Cyan),
-        selected: Style::new().add_modifier(Modifier::UNDERLINED),
+        cursor: Style::new().add_modifier(Modifier::UNDERLINED),
         alert: Style::new().fg(Color::LightRed),
         line_number: Style::new().fg(Color::Yellow),
         ending: Style::new().fg(Color::LightBlue),
@@ -832,7 +832,7 @@ fn a_theme_changes_the_style_and_never_the_text() {
 fn every_kind_of_item_is_drawn_in_the_style_of_its_role() {
     let state = press_all(state_for(&fixtures("project")), &[Message::Down]);
     let terminal = drawn_terminal(&themed(loud_theme()), &state);
-    // the folder is not selected any more, the bundle is
+    // the cursor left the folder, it is on the bundle
     assert_eq!(style_at(&terminal, "3 bundles").fg, Some(Color::Red));
     assert_eq!(
         style_at(&terminal, "stripping  ").fg,
@@ -847,7 +847,7 @@ fn every_kind_of_item_is_drawn_in_the_style_of_its_role() {
 }
 
 #[test]
-fn the_selected_item_gets_the_style_for_the_selection_on_top_of_its_role() {
+fn the_item_under_the_cursor_gets_the_cursor_style_on_top_of_its_role() {
     let state = state_for(&fixtures("project"));
     let terminal = drawn_terminal(&themed(loud_theme()), &state);
     let folder = style_at(&terminal, "3 bundles");
@@ -855,7 +855,7 @@ fn the_selected_item_gets_the_style_for_the_selection_on_top_of_its_role() {
     assert!(folder.add_modifier.contains(Modifier::UNDERLINED));
     assert!(
         !folder.add_modifier.contains(Modifier::REVERSED),
-        "the selection style is the one of the theme"
+        "the cursor style is the one of the theme"
     );
     let other = style_at(&terminal, "messages.properties");
     assert!(!other.add_modifier.contains(Modifier::UNDERLINED));
@@ -881,7 +881,7 @@ fn an_uncertain_file_and_an_excluded_bundle_get_their_styles_on_top_of_their_rol
 }
 
 #[test]
-fn the_standard_theme_marks_the_selection_without_colour() {
+fn the_standard_theme_marks_the_cursor_without_colour() {
     let state = state_for(&fixtures("project"));
     let terminal = drawn_terminal(&Ui::default(), &state);
     assert!(
@@ -898,7 +898,7 @@ fn the_standard_theme_marks_the_selection_without_colour() {
 
 // ── The preview ──────────────────────────────────────────────────────────────
 
-/// `a.properties` as the only file, selected, with the height of a terminal of `height` rows
+/// `a.properties` as the only file, under the cursor, with the height of a terminal of `height` rows
 /// told, as the loop does. The preview is on.
 fn on_a_file(bytes: &[u8], height: u16) -> (AppState, TempDir) {
     let dir = TempDir::new();
@@ -928,7 +928,7 @@ fn has_separator(screen: &str) -> bool {
 }
 
 #[test]
-fn the_preview_shows_the_header_and_the_lines_of_the_selected_file() {
+fn the_preview_shows_the_header_and_the_lines_of_the_file_under_the_cursor() {
     let (state, _dir) = on_a_file(b"x=1\r\ny=2\nz=3", 10);
     let screen = drawn(&state, 110, 10);
     assert!(
@@ -1300,7 +1300,7 @@ fn drawing_an_alert_survives_a_tiny_area() {
 }
 
 #[test]
-fn while_an_alert_is_shown_the_loop_leaves_the_selection_alone_until_it_is_dismissed() {
+fn while_an_alert_is_shown_the_loop_leaves_the_cursor_alone_until_it_is_dismissed() {
     for dismiss in [
         key(KeyCode::Esc, KeyModifiers::NONE),
         key(KeyCode::Enter, KeyModifiers::NONE),
@@ -1328,7 +1328,7 @@ fn while_an_alert_is_shown_the_loop_leaves_the_selection_alone_until_it_is_dismi
         )
         .unwrap();
         match state.view() {
-            View::Overview(overview) => assert_eq!(overview.selected(), 3, "{dismiss:?}"),
+            View::Overview(overview) => assert_eq!(overview.index(), 3, "{dismiss:?}"),
         }
         assert_eq!(state.alert(), None, "{dismiss:?}");
     }
@@ -1442,7 +1442,7 @@ fn the_rows_of_the_text_are_the_rows_of_the_screen_without_trailing_spaces() {
 fn a_row_with_a_style_is_listed_with_the_style_in_words() {
     let state = state_for(&fixtures("project"));
     let text = text_of(&Ui::default(), &state, 60, 8);
-    // the selected folder is bold and reversed
+    // the folder under the cursor is bold and reversed
     let line = text
         .lines()
         .skip_while(|line| *line != "styles:")
@@ -1523,6 +1523,6 @@ fn the_key_for_the_screen_gives_the_text_to_the_sink_and_changes_nothing() {
         texts[1]
     );
     match state.view() {
-        View::Overview(overview) => assert_eq!(overview.selected(), 1),
+        View::Overview(overview) => assert_eq!(overview.index(), 1),
     }
 }

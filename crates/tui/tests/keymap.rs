@@ -296,7 +296,7 @@ fn the_standard_keymap_has_the_keys_of_the_preview() {
     for (key, message) in cases {
         assert_eq!(keymap.message(OVERVIEW, key), Some(message), "{key}");
     }
-    // the plain keys still move the selection
+    // the plain keys still move the cursor
     assert_eq!(
         keymap.message(OVERVIEW, Key::new(Code::Up)),
         Some(Message::Up)

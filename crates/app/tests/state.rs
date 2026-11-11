@@ -77,7 +77,7 @@ fn quitting_twice_is_the_same_as_quitting_once() {
     assert_eq!(state.session().store().files().len(), 12);
 }
 
-// ── The selection and the scroll position of the overview ────────────────────
+// ── The cursor and the scroll position of the overview ────────────────────
 
 /// The overview of the fixtures has 18 items: 2 folders, 4 bundles and 12 files.
 const ITEMS: usize = 18;
@@ -104,78 +104,78 @@ fn empty_state() -> (AppState, TempDir) {
 fn the_overview_starts_at_the_first_item_with_an_unknown_height() {
     let overview = overview_state(&state());
     assert_eq!(
-        (overview.selected(), overview.scroll(), overview.height()),
+        (overview.index(), overview.scroll(), overview.height()),
         (0, 0, 0)
     );
 }
 
 #[test]
-fn down_moves_the_selection_and_up_moves_it_back() {
+fn down_moves_the_cursor_and_up_moves_it_back() {
     let state = press(state(), &[Message::Down, Message::Down, Message::Down]);
-    assert_eq!(overview_state(&state).selected(), 3);
+    assert_eq!(overview_state(&state).index(), 3);
     let state = press(state, &[Message::Up]);
-    assert_eq!(overview_state(&state).selected(), 2);
+    assert_eq!(overview_state(&state).index(), 2);
 }
 
 #[test]
-fn the_selection_stops_at_the_ends() {
+fn the_cursor_stops_at_the_ends() {
     let state = press(state(), &[Message::Up]);
-    assert_eq!(overview_state(&state).selected(), 0);
+    assert_eq!(overview_state(&state).index(), 0);
 
     let downs = vec![Message::Down; ITEMS + 10];
     let state = press(state, &downs);
-    assert_eq!(overview_state(&state).selected(), ITEMS - 1);
+    assert_eq!(overview_state(&state).index(), ITEMS - 1);
 }
 
 #[test]
 fn first_and_last_jump_to_the_ends() {
     let state = press(state(), &[Message::Last]);
-    assert_eq!(overview_state(&state).selected(), ITEMS - 1);
+    assert_eq!(overview_state(&state).index(), ITEMS - 1);
     let state = press(state, &[Message::First]);
-    assert_eq!(overview_state(&state).selected(), 0);
+    assert_eq!(overview_state(&state).index(), 0);
 }
 
 #[test]
 fn a_page_is_as_many_items_as_fit() {
     let state = press(state(), &[Message::Viewport(5)]);
     let state = press(state, &[Message::PageDown]);
-    assert_eq!(overview_state(&state).selected(), 5);
+    assert_eq!(overview_state(&state).index(), 5);
     let state = press(state, &[Message::PageDown]);
-    assert_eq!(overview_state(&state).selected(), 10);
+    assert_eq!(overview_state(&state).index(), 10);
     let state = press(state, &[Message::PageUp]);
-    assert_eq!(overview_state(&state).selected(), 5);
+    assert_eq!(overview_state(&state).index(), 5);
 }
 
 #[test]
 fn a_page_stops_at_the_ends_too() {
     let state = press(state(), &[Message::Viewport(5)]);
     let state = press(state, &[Message::PageUp]);
-    assert_eq!(overview_state(&state).selected(), 0);
+    assert_eq!(overview_state(&state).index(), 0);
 
     let pages = vec![Message::PageDown; 10];
     let state = press(state, &pages);
-    assert_eq!(overview_state(&state).selected(), ITEMS - 1);
+    assert_eq!(overview_state(&state).index(), ITEMS - 1);
 }
 
 #[test]
 fn without_a_known_height_a_page_is_one_item() {
     let state = press(state(), &[Message::PageDown]);
-    assert_eq!(overview_state(&state).selected(), 1);
+    assert_eq!(overview_state(&state).index(), 1);
 }
 
 #[test]
-fn the_scroll_position_only_moves_when_the_selection_leaves_the_visible_part() {
+fn the_scroll_position_only_moves_when_the_cursor_leaves_the_visible_part() {
     let mut state = press(state(), &[Message::Viewport(5)]);
-    // selection 0..=4 are visible without scrolling
+    // cursor 0..=4 are visible without scrolling
     for expected in 1..=4 {
         state = press(state, &[Message::Down]);
         let overview = overview_state(&state);
-        assert_eq!((overview.selected(), overview.scroll()), (expected, 0));
+        assert_eq!((overview.index(), overview.scroll()), (expected, 0));
     }
     // beyond the last visible item the list scrolls by one
     state = press(state, &[Message::Down]);
     let overview = overview_state(&state);
-    assert_eq!((overview.selected(), overview.scroll()), (5, 1));
+    assert_eq!((overview.index(), overview.scroll()), (5, 1));
 }
 
 #[test]
@@ -193,7 +193,7 @@ fn moving_up_scrolls_back_only_above_the_visible_part() {
     state = press(state, &[Message::Up]);
     let overview = overview_state(&state);
     assert_eq!(
-        (overview.selected(), overview.scroll()),
+        (overview.index(), overview.scroll()),
         (ITEMS - 6, ITEMS - 6)
     );
 }
@@ -207,7 +207,7 @@ fn first_and_last_scroll_to_the_ends() {
 }
 
 #[test]
-fn a_smaller_height_keeps_the_selection_visible() {
+fn a_smaller_height_keeps_the_cursor_visible() {
     let state = press(state(), &[Message::Viewport(10), Message::Last]);
     assert_eq!(overview_state(&state).scroll(), ITEMS - 10);
 
@@ -215,7 +215,7 @@ fn a_smaller_height_keeps_the_selection_visible() {
     let overview = overview_state(&state);
     assert_eq!(overview.height(), 3);
     assert_eq!(overview.scroll(), ITEMS - 3);
-    assert_eq!(overview.selected(), ITEMS - 1);
+    assert_eq!(overview.index(), ITEMS - 1);
 }
 
 #[test]
@@ -241,7 +241,7 @@ fn an_empty_overview_ignores_every_movement() {
         ],
     );
     let overview = overview_state(&state);
-    assert_eq!((overview.selected(), overview.scroll()), (0, 0));
+    assert_eq!((overview.index(), overview.scroll()), (0, 0));
     assert!(!state.should_quit());
 }
 

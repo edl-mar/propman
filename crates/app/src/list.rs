@@ -111,7 +111,7 @@ impl<I: Clone + PartialEq> ListState<I> {
     }
 
     /// The index of the row of the cursor.
-    pub fn selected(&self) -> usize {
+    pub fn index(&self) -> usize {
         self.index
     }
 

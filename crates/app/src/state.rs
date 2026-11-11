@@ -4,7 +4,7 @@
 //! takes the state by value and returns the new one together with at most one effect (see
 //! `Effect`), and the view only reads the state. The
 //! state holds the session and what went wrong while loading it; what is shown and chosen (the
-//! current view, the selection) belongs here too and never in the store.
+//! current view, the cursor) belongs here too and never in the store.
 //!
 //! The bundle overview is the first view. Its cursor is the id of an item (`ItemId`), found again
 //! in the list that `overview` gives after every message, so that it stays on its item when the
@@ -12,8 +12,8 @@
 //! is told by a message, because only the terminal knows it; until then it is 0, which means
 //! unknown.
 //!
-//! The preview of the selected file is part of the overview state: whether it is on and how far
-//! it is scrolled. The scroll position starts at the top again when the selection changes and
+//! The preview of the file under the cursor is part of the overview state: whether it is on and how far
+//! it is scrolled. The scroll position starts at the top again when the cursor moves to another item and
 //! never goes past the last window of the file. What the preview shows is `preview`.
 
 use store::FileId;
@@ -148,7 +148,7 @@ impl OverviewState {
     }
 
     fn keep_preview_inside(&mut self, items: &[OverviewItem]) {
-        let furthest = lines_at(items, self.list.selected())
+        let furthest = lines_at(items, self.list.index())
             .map_or(0, |lines| lines.saturating_sub(self.preview_rows()));
         self.preview_scroll = self.preview_scroll.min(furthest);
     }
@@ -160,8 +160,8 @@ impl OverviewState {
     }
 
     /// The index of the item under the cursor.
-    pub fn selected(&self) -> usize {
-        self.list.selected()
+    pub fn index(&self) -> usize {
+        self.list.index()
     }
 
     /// The index of the first item that is shown.
@@ -198,7 +198,7 @@ pub enum Message {
     Last,
     /// The number of items of the overview that fit on the screen.
     Viewport(usize),
-    /// Switches the preview of the selected file on or off.
+    /// Switches the preview of the file under the cursor on or off.
     TogglePreview,
     /// Scrolls the preview by one line.
     PreviewUp,
@@ -208,7 +208,7 @@ pub enum Message {
     PreviewHalfPageDown,
     /// Closes the alert.
     DismissAlert,
-    /// Edits the selected file in the editor of the user.
+    /// Edits the file under the cursor in the editor of the user.
     Edit,
     /// The editor of the user was closed, or could not be run.
     EditorClosed {
@@ -277,11 +277,11 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     (state, effect)
 }
 
-/// The effect for editing the selected item: only a file can be edited.
+/// The effect for editing the item under the cursor: only a file can be edited.
 fn edit_effect(state: &AppState) -> Option<Effect> {
     let View::Overview(view) = &state.view;
     let items = overview(&state.session);
-    let Some(OverviewItem::File { id, .. }) = items.get(view.selected()) else {
+    let Some(OverviewItem::File { id, .. }) = items.get(view.index()) else {
         return None;
     };
     let path = state.session.store().file_path(*id)?.to_path_buf();

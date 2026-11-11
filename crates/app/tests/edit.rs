@@ -175,11 +175,11 @@ fn with_an_alert() -> (AppState, TempDir) {
     (state, dir)
 }
 
-/// What the selection and the preview are, to see that nothing moved.
+/// What the cursor and the preview are, to see that nothing moved.
 fn looks_like(state: &AppState) -> (usize, usize, bool, usize) {
     let overview = overview_state(state);
     (
-        overview.selected(),
+        overview.index(),
         overview.scroll(),
         overview.preview_on(),
         overview.preview_scroll(),
@@ -242,7 +242,7 @@ fn dismissing_closes_the_alert_and_the_keys_of_the_view_work_again() {
     let state = send(state, &[Message::DismissAlert]);
     assert_eq!(state.alert(), None);
     let state = send(state, &[Message::Down]);
-    assert_eq!(overview_state(&state).selected(), 1);
+    assert_eq!(overview_state(&state).index(), 1);
 }
 
 #[test]

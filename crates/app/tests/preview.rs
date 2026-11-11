@@ -1,4 +1,4 @@
-//! Specification of the preview of the selected file in the overview: what it shows (see
+//! Specification of the preview of the file under the cursor in the overview: what it shows (see
 //! `app::preview`) and how the messages for it change the state.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -26,7 +26,7 @@ fn send(state: AppState, messages: &[Message]) -> AppState {
         .fold(state, |state, &message| update(state, message).0)
 }
 
-/// The file is selected and the list is `height` rows high.
+/// The cursor is on the file and the list is `height` rows high.
 fn on_the_file(state: AppState, height: usize) -> AppState {
     send(
         state,
@@ -201,7 +201,7 @@ fn the_preview_is_on_at_the_start_and_the_message_switches_it() {
 }
 
 #[test]
-fn switching_the_preview_does_not_move_the_selection_or_the_scroll_position() {
+fn switching_the_preview_does_not_move_the_cursor_or_the_scroll_position() {
     let (state, _dir) = one_file(&thirty_lines());
     let state = send(
         on_the_file(state, 10),
@@ -210,7 +210,7 @@ fn switching_the_preview_does_not_move_the_selection_or_the_scroll_position() {
     let before = overview_state(&state);
     let state = send(state, &[Message::TogglePreview, Message::TogglePreview]);
     assert_eq!(overview_state(&state), before);
-    assert_eq!(overview_state(&state).selected(), 2);
+    assert_eq!(overview_state(&state).index(), 2);
     assert_eq!(overview_state(&state).preview_scroll(), 2);
 }
 
@@ -262,7 +262,7 @@ fn half_a_page_is_at_least_one_line() {
 }
 
 #[test]
-fn the_scroll_position_starts_again_when_the_selection_changes() {
+fn the_scroll_position_starts_again_when_the_cursor_changes_its_item() {
     let dir = TempDir::new();
     std::fs::write(dir.path().join("a.properties"), thirty_lines()).unwrap();
     std::fs::write(dir.path().join("b.properties"), thirty_lines()).unwrap();

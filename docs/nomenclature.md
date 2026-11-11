@@ -59,7 +59,9 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | item id | Id eines Eintrags | What identifies an item of the overview whatever its place in the list: the id of a file or a bundle, or the path of a folder. Not a key (of a property). |
 | level | Ebene | What one row of a view is: a file, a bundle, later a line or an entry. Not a scope of bundle merging. |
 | group | Gruppe | A header row that gathers rows by a field (folder, bundle; later a key prefix). |
-| selection | Auswahl | The ids of entries of one kind that an action works on; the cursor is a selection of one. A condition or a fixed set. |
+| cursor | Cursor | The row the user is on. Not the selection, and not what was called "the selected row" earlier. |
+| mark | markieren | To put the entry under the cursor into a fixed set by hand (`Space`, shown as `*`). One way to make a selection. |
+| selection | Auswahl | The ids of entries of one kind that an action works on: the marked entries, else the entry under the cursor; later also a condition. A fixed set is written in brackets. |
 | action | Aktion | What is done to a selection; its precondition is the kind of the selection. Not an effect: an action may need none. |
 | command line | Befehlszeile | The overlay that `:` opens, in which commands are typed with completion. |
 | effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |

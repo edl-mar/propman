@@ -10,10 +10,10 @@
 //! The screen has a title, a line with the count, a status line (the count of the problems, only
 //! if there are any), the list of the bundle overview and a line with the keys. The list shows
 //! the part that the state scrolled to. An alert is a box over the top of the screen; it does
-//! not move anything. An item is marked as follows, and never by colour alone: the selected
+//! not move anything. An item is marked as follows, and never by colour alone: the one under the cursor
 //! one by `>`, an uncertain file by `?`, an excluded bundle by `[excluded]`; the styles of the
 //! theme come on top. On a screen at least 100 columns wide the list gets the left half and the
-//! preview of the selected file the right half, behind a column with `|`.
+//! preview of the file under the cursor the right half, behind a column with `|`.
 
 mod editor;
 mod fake_editor;
@@ -160,15 +160,15 @@ fn fit_left(text: &str, available: usize) -> String {
 }
 
 /// One line of the list. A folder is indented by 0, a bundle by 2 and a file by 4 characters
-/// behind the two characters of the selection mark.
+/// behind the two characters of the cursor mark.
 fn item_line(
     theme: &Theme,
     item: &OverviewItem,
-    selected: bool,
+    at_cursor: bool,
     width: usize,
     name_width: usize,
 ) -> Line<'static> {
-    let mark = if selected { "> " } else { "  " };
+    let mark = if at_cursor { "> " } else { "  " };
     let (text, style) = match item {
         OverviewItem::Folder { path, bundles } => {
             let count = counted(*bundles, "bundle", "bundles");
@@ -221,8 +221,8 @@ fn item_line(
             )
         }
     };
-    let style = if selected {
-        style.patch(theme.selected)
+    let style = if at_cursor {
+        style.patch(theme.cursor)
     } else {
         style
     };
@@ -300,7 +300,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
                 item_line(
                     &ui.theme,
                     item,
-                    index == view.selected(),
+                    index == view.index(),
                     usize::from(list.width),
                     name_width,
                 )

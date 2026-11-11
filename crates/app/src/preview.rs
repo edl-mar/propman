@@ -1,4 +1,4 @@
-//! The preview of the selected file in the overview, derived from the state each time it is
+//! The preview of the file under the cursor in the overview, derived from the state each time it is
 //! needed and made of plain values, so that a view only draws.
 //!
 //! The preview shows the raw lines of the file. It has a window: the lines from the scroll
@@ -31,13 +31,13 @@ pub struct PreviewLine {
     pub ending: &'static str,
 }
 
-/// The preview of the selected item: `None` unless it is a file.
+/// The preview of the item under the cursor: `None` unless it is a file.
 pub fn preview(state: &AppState) -> Option<Preview> {
     let View::Overview(view) = state.view();
     let items = overview(state.session());
     let Some(OverviewItem::File {
         id, name, encoding, ..
-    }) = items.get(view.selected())
+    }) = items.get(view.index())
     else {
         return None;
     };
