@@ -6,6 +6,64 @@ not authoritative.
 
 ## Decisions
 
+### The operating concept: views, selections and the command line (2026-11-11)
+Why: the list of keys will soon be too long. In a tool like lazygit one cannot be sure what `p`
+and `P` do and looks into the help every time. The operation of the program should not have to
+be learned by heart, should be fast once known, and should not trigger anything by accident.
+
+- **In one sentence:** a view is a table over entries of one kind, one works with a selection
+  on it, and an action works on that selection. Keys and the command line produce the same
+  messages.
+- **Kind, fields, references.** An entry has a kind (file, bundle; later line, entry), fields
+  (name, locale, encoding, excluded, ...) and references to entries of other kinds (a file to its
+  bundle, with the way back). What a kind has is described in `app`: how a field is read, which
+  candidates it has, which actions apply, and with which precondition. **Nothing is assumed about
+  a hierarchy**: there is no built-in "children" or "parent". Where one can go from one kind to
+  another, the description says so (a reference), and the completion offers it.
+- **Level, group, filter.** The *level* of a view says what a row is (not to be confused with a
+  scope of bundle merging). A *group* is a header row that gathers rows by a field (folder,
+  bundle; later a key prefix). A *filter* is a condition over fields and hides rows.
+- **Selection.** The ids of entries of **one** kind, and where needed one field. The cursor is a
+  selection of one. There are no mixed selections: several steps one after the other replace
+  them. A selection is either a *condition* (it holds as new things come) or a *fixed set* (marked
+  by hand, it stays until changed; stale ids drop out). An action turns a condition into a fixed
+  set at the moment it is confirmed.
+- **Action.** Its precondition is the kind of the selection (for example "the field `encoding` of
+  files"). That makes actions on many entries possible and the help fit: only what fits the
+  selection is offered. Before an action is confirmed, it says what it works on ("3 files").
+  What only happens in memory is not final because of the history; what writes to the disk shows
+  a summary first.
+- **The state of a view can be written as a line**, and is shown all the time, like the address
+  bar of a browser (`show folder, bundle, file`). A compact form is an idea for later.
+- **The command line.** `:` opens it (as in Helix). Segments are separated by `Tab`, `Shift+Tab`
+  goes back, `Enter` runs it if it is complete, `Esc` cancels, the up and down keys go through
+  the lines typed before. Typing narrows the candidates as a subsequence (`n` gives `name` and
+  `encoding`, then `a` gives `name`; `en` gives `encoding`, then `w` gives `Windows-1252`). The
+  order of the candidates is **deterministic** (start of the word, then starts of words, then
+  other subsequences), never by "used last", so that it can be learned by the fingers. The
+  history of lines is a separate thing.
+- **`show`** names the levels with an explicit list: `:show folder, bundle, file` is the
+  bundle overview, `:show file, line` the raw lines grouped by file. **`sel`** narrows the
+  selection (a chain of "and"). A reference is followed by naming it, taken from the description.
+- **The table of commands** (name, label, key) is the base for the help and for the settings
+  file; the command line is the searchable help to the keys.
+- **Direct operation:** the arrow keys move in the level, `Space` marks, `Tab` and the left and
+  right keys go into the fields. `Esc` leaves the topmost: an overlay, then the level, then the
+  selection. The line with the keys shows the keys of the current context, as it does now.
+- **Dropped:** `Shift`, `ctrl` or `alt` as a way through to an outer layer (terminals differ too
+  much, and `Ctrl+Alt` is AltGr on some keyboards), and a leader menu (the command line does the
+  same).
+- **In the architecture:** the command line is an overlay like the alert, with its own context in
+  the keymap. The selection and the cursor are state of the view. Rows, candidates and the
+  preview are pure functions of the store, like `overview` and `preview`: **no new stores**. It
+  is the first text input (keys that are not bound reach a field; `Backspace` and `BackTab` are
+  new). Cursor and selection hold ids, not indices.
+- **What changes:** the overview is `show folder, bundle, file`; the preview is the lines of the
+  selected file; the raw view over all files is the level "line" grouped by file and **not a view
+  of its own**; searching is a filter on the field "text" (jumping or filtering); jumps to the
+  borders of folders, bundles and files are moving to the next header row; `enter` is an action on
+  a selection of files.
+
 ### Effects, and editing a file in the editor of the user (2026-11-09)
 - **`update` stays pure and returns at most one effect with the new state:**
   `update(state, message) -> (AppState, Option<Effect>)`. An effect is data; the loop performs
@@ -391,12 +449,33 @@ much later.
 
 ## Open questions
 
+### Operating concept: what is open (2026-11-11)
+- **Header rows:** are they entries of their own (a bundle has fields and actions of its own, such
+  as `excluded`), or only groups over fields of the file? A bundle looks like an entry, and a
+  folder is only a path, hence a group. What does selecting a header select?
+- **The keys of the direct operation:** where do `Space` (now: the preview), `ctrl+up` and
+  `ctrl+down`, `ctrl+u` and `ctrl+d`, `enter` go? Modes with a visible bar (F-keys switch them;
+  `ctrl+digit` does not work in terminals) or levels of focus with `Tab` (the preview as a pane
+  that one goes into)?
+- **A manual selection in the command line:** a fixed set written as a literal, for example
+  `sel [messages_de.properties, messages_fr.properties]`, shown as `[...]` or `[3 files]` in the
+  compact form. It is written with natural names (a path, a folder and a name), not with ids,
+  which only live in one session. In a saved view, entries that are gone are left out and the user
+  is told. Combining it with a condition: after a condition it narrows (a chain of "and"); to add
+  to it a union is needed.
+- **More of the language:** "or", "not", a union; how a reference is named.
+- **The compact form of the line** that shows the state of the view.
+- **The format of the descriptions** and the names of the commands.
+- The filter was listed as not to be anticipated. It is now being designed as a part of this
+  concept and is not built before the concept is settled.
+
 ### Raw files: use cases and ideas (2026-11-09)
 Ideas from a talk, **not decisions**. The preview itself is decided (see above).
 - **Edit a file in `$EDITOR`** (decided, see above) instead of building an editor. Still open:
   a conflict between a file that is edited outside and values that are changed in the program
   and not saved; it appears once values can be edited.
-- **A raw view over all files** in the order of the overview, opened with `right`, with the
+- **A raw view over all files** (now seen as the level "line" grouped by file, see the operating
+  concept; the rest of this item is the earlier idea) in the order of the overview, opened with `right`, with the
   files one after the other. It must be a virtual list (only the visible rows are made; the
   numbers of lines are in the store), and its position is a file and a line, not an index. The
   overview and the raw view follow each other: opening starts at the selected file, going back

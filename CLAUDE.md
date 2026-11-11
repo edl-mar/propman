@@ -116,5 +116,6 @@ drafts about it is a rule.
 
 ## Still open: do not design or anticipate
 
-The filter system, the conflict UI, the UI for scopes, the format of the settings files, and
-the order of locales or bundles. The tree and fragment views are open as well.
+The conflict UI, the UI for scopes, the format of the settings files, and the order of locales
+or bundles. The tree and fragment views are open as well. The filter system is part of the
+operating concept in the decisions document and is not built before that is settled.

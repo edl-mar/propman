@@ -56,6 +56,11 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | raw unit | Rohdatei-Einheit | The unit that represents what is on the disk, with its interpretation. Only ever filled from the disk; the user does not edit it. |
 | view | Ansicht | One of the exclusive screens of the program; for now the bundle overview. An overlay (later) lies over any view. |
 | overview item | Eintrag der Übersicht | One line of the bundle overview: a folder, a bundle or a file. Not an entry (a key) and not a line of a file. |
+| level | Ebene | What one row of a view is: a file, a bundle, later a line or an entry. Not a scope of bundle merging. |
+| group | Gruppe | A header row that gathers rows by a field (folder, bundle; later a key prefix). |
+| selection | Auswahl | The ids of entries of one kind that an action works on; the cursor is a selection of one. A condition or a fixed set. |
+| action | Aktion | What is done to a selection; its precondition is the kind of the selection. Not an effect: an action may need none. |
+| command line | Befehlszeile | The overlay that `:` opens, in which commands are typed with completion. |
 | effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |
 | alert | Meldung | A box over the top of the screen that says what went wrong (for example that no editor is set) and has to be dismissed first. An overlay, not a view. Not a problem of loading, and not a toast (a short success message, later). |
 | bundle assignment | Zuordnung | The value that says which bundle and locale a file belongs to, with the confidence. |
