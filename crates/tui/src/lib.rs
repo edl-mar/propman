@@ -31,12 +31,13 @@ pub use screen::screen_text;
 pub use ui::{Theme, Ui};
 
 use app::{
-    AppState, Confidence, EditorOutcome, Encoding, ItemId, Message, OverviewItem, View, applicable,
-    overview, perform, preview, update,
+    AppState, Confidence, EditorOutcome, Encoding, ItemId, Message, OverviewItem, TextEdit, View,
+    applicable, candidates, commands, overview, perform, preview, update,
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -336,9 +337,124 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
 
     frame.render_widget(Paragraph::new(key_help(&ui.keymap, state)), footer);
 
+    render_command_line(ui, state, frame);
     if let Some(text) = state.alert() {
         render_alert(&ui.theme, &ui.keymap, text, frame);
     }
+}
+
+/// How many candidates of the command line are shown at most.
+const MAX_CANDIDATES: usize = 8;
+
+/// The context below the overlays: the view.
+fn view_context(state: &AppState) -> Context {
+    match state.view() {
+        View::Overview(_) => Context::Overview,
+    }
+}
+
+/// The command line over the bottom of the screen: the input in the last row, behind it the keys
+/// of the line, and above it the candidates, the best one in the row next to the input.
+fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
+    let Some(line) = state.command_line() else {
+        return;
+    };
+    let screen = frame.area();
+    if screen.width == 0 || screen.height == 0 {
+        return;
+    }
+    let found = candidates(state);
+    let available = usize::from(screen.height - 1).min(MAX_CANDIDATES);
+    // the highlighted candidate is always among the shown ones
+    let first = (line.highlighted() + 1).saturating_sub(available);
+    let shown = found.len().saturating_sub(first).min(available);
+    let rows = if found.is_empty() {
+        available.min(1)
+    } else {
+        shown
+    };
+    let input_y = screen.bottom() - 1;
+    let rows_u16 = u16::try_from(rows).unwrap_or(u16::MAX);
+    let block = Rect {
+        y: input_y - rows_u16,
+        height: rows_u16 + 1,
+        ..screen
+    };
+    frame.render_widget(Clear, block);
+
+    let row_at = |y: u16| Rect {
+        y,
+        height: 1,
+        ..screen
+    };
+    if found.is_empty() && rows > 0 {
+        frame.render_widget(Paragraph::new("  no matching command"), row_at(input_y - 1));
+    }
+    let name_width = commands()
+        .iter()
+        .map(|command| command.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = commands()
+        .iter()
+        .map(|command| command.label.chars().count())
+        .max()
+        .unwrap_or(0);
+    let below = view_context(state);
+    for (index, candidate) in found.iter().enumerate().skip(first).take(shown) {
+        let at_cursor = index == line.highlighted();
+        let name = candidate.command.name;
+        let mut spans = vec![Span::raw(if at_cursor { "> " } else { "  " })];
+        for (place, letter) in name.chars().enumerate() {
+            let style = if candidate.matched.contains(&place) {
+                ui.theme.matched
+            } else {
+                Style::new()
+            };
+            spans.push(Span::styled(letter.to_string(), style));
+        }
+        let keys: Vec<String> = ui
+            .keymap
+            .keys_for(below, candidate.command.message)
+            .iter()
+            .map(Key::to_string)
+            .collect();
+        spans.push(Span::raw(format!(
+            "{}  {:<label_width$}  {}",
+            " ".repeat(name_width.saturating_sub(name.chars().count())),
+            candidate.command.label,
+            keys.join("/"),
+        )));
+        let style = if at_cursor {
+            ui.theme.cursor
+        } else {
+            Style::new()
+        };
+        let y = input_y - 1 - u16::try_from(index - first).unwrap_or(u16::MAX);
+        frame.render_widget(Paragraph::new(Line::from(spans).style(style)), row_at(y));
+    }
+
+    let text = line.field().text();
+    frame.render_widget(Paragraph::new(format!(":{text}")), row_at(input_y));
+    // the keys of the line, at the right edge, if there is room behind the input
+    let used = u16::try_from(1 + text.chars().count() + 2).unwrap_or(u16::MAX);
+    if used < screen.width {
+        let hints = Rect {
+            x: screen.x + used,
+            y: input_y,
+            width: screen.width - used,
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(key_help(&ui.keymap, state)).alignment(Alignment::Right),
+            hints,
+        );
+    }
+    let caret = u16::try_from(1 + line.field().cursor()).unwrap_or(u16::MAX);
+    frame.set_cursor_position(Position::new(
+        screen.x + caret.min(screen.width - 1),
+        input_y,
+    ));
 }
 
 /// The columns of the line ending in the preview: wide enough for `(none)`.
@@ -385,9 +501,17 @@ fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'sta
 /// What the keys do, as far as they are bound and can be done now: `q/ctrl+c: quit   up/k/down/j: move ...`.
 fn key_help(keymap: &Keymap, state: &AppState) -> String {
     let context = Context::of(state);
-    let groups: [(&[Message], &str); 10] = [
+    let groups: [(&[Message], &str); 15] = [
         (&[Message::Quit], "quit"),
         (&[Message::DismissAlert], "dismiss"),
+        (&[Message::CloseCommandLine], "close"),
+        (&[Message::RunCommand], "run"),
+        (&[Message::CompleteCommand], "complete"),
+        (
+            &[Message::NextCandidate, Message::PreviousCandidate],
+            "choose",
+        ),
+        (&[Message::OpenCommandLine], "commands"),
         (&[Message::Edit], "edit"),
         (&[Message::ToggleMark], "mark"),
         (&[Message::ClearMarks], "clear marks"),
@@ -407,7 +531,14 @@ fn key_help(keymap: &Keymap, state: &AppState) -> String {
             for key in messages
                 .iter()
                 .filter(|&&message| applicable(state, message))
-                .flat_map(|&message| keymap.keys_for(context, message))
+                .flat_map(|&message| {
+                    // while text is typed, the global keys are not what the line is about
+                    if context.takes_text() {
+                        keymap.context_keys_for(context, message)
+                    } else {
+                        keymap.keys_for(context, message)
+                    }
+                })
             {
                 if !keys.contains(&key) {
                     keys.push(key);
@@ -427,6 +558,18 @@ fn key_help(keymap: &Keymap, state: &AppState) -> String {
 /// a character with Ctrl and Alt (what AltGr sends) is a plain character.
 pub fn message_for(ui: &Ui, context: Context, event: &Event) -> Option<Message> {
     let key = Key::from_event(event)?;
+    // where text is typed, a plain character is text before the global layer is asked: `q` must
+    // not quit there. The keys of the context itself (Esc, Enter, ...) are asked first.
+    if context.takes_text()
+        && let Code::Char(c) = key.code
+        && !key.ctrl
+        && !key.alt
+    {
+        return ui
+            .keymap
+            .context_message(context, key)
+            .or(Some(Message::Text(TextEdit::Insert(c))));
+    }
     ui.keymap.message(context, key)
 }
 

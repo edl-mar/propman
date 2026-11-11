@@ -122,8 +122,7 @@ fn events_without_a_nameable_key_give_none() {
         Event::FocusGained,
         Event::FocusLost,
         event(KeyCode::Insert, KeyModifiers::NONE),
-        event(KeyCode::Backspace, KeyModifiers::NONE),
-        event(KeyCode::Delete, KeyModifiers::NONE),
+        event(KeyCode::Null, KeyModifiers::NONE),
     ] {
         assert_eq!(Key::from_event(&event), None, "{event:?}");
     }
@@ -399,4 +398,73 @@ fn function_keys_are_keys() {
     );
     assert_eq!(Key::new(Code::F(1)).to_string(), "f1");
     assert_eq!(Key::new(Code::F(12)).ctrl().to_string(), "ctrl+f12");
+}
+
+// ── Keys for text ────────────────────────────────────────────────────────────
+
+#[test]
+fn backspace_delete_and_shift_tab_are_keys() {
+    let none = KeyModifiers::NONE;
+    assert_eq!(
+        Key::from_event(&event(KeyCode::Backspace, none)),
+        Some(Key::new(Code::Backspace))
+    );
+    assert_eq!(
+        Key::from_event(&event(KeyCode::Delete, none)),
+        Some(Key::new(Code::Delete))
+    );
+    // a terminal reports Shift+Tab as its own key
+    assert_eq!(
+        Key::from_event(&event(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        Some(Key::new(Code::Tab).shift())
+    );
+    assert_eq!(Key::new(Code::Backspace).to_string(), "backspace");
+    assert_eq!(Key::new(Code::Delete).to_string(), "delete");
+    assert_eq!(Key::new(Code::Tab).shift().to_string(), "shift+tab");
+}
+
+#[test]
+fn only_the_command_line_takes_text() {
+    assert!(Context::CommandLine.takes_text());
+    assert!(!Context::Overview.takes_text());
+    assert!(!Context::Alert.takes_text());
+}
+
+#[test]
+fn the_standard_keymap_has_the_keys_of_the_command_line() {
+    use app::TextEdit;
+    let keymap = Keymap::default();
+    let line = Context::CommandLine;
+    assert_eq!(
+        keymap.message(OVERVIEW, Key::char(':')),
+        Some(Message::OpenCommandLine)
+    );
+    let cases = [
+        (Key::new(Code::Esc), Message::CloseCommandLine),
+        (Key::new(Code::Enter), Message::RunCommand),
+        (Key::new(Code::Up), Message::NextCandidate),
+        (Key::new(Code::Down), Message::PreviousCandidate),
+        (Key::new(Code::Tab), Message::CompleteCommand),
+        (
+            Key::new(Code::Backspace),
+            Message::Text(TextEdit::Backspace),
+        ),
+        (Key::new(Code::Delete), Message::Text(TextEdit::Delete)),
+        (Key::new(Code::Left), Message::Text(TextEdit::Left)),
+        (Key::new(Code::Right), Message::Text(TextEdit::Right)),
+        (Key::new(Code::Home), Message::Text(TextEdit::Home)),
+        (Key::new(Code::End), Message::Text(TextEdit::End)),
+        (Key::char('u').ctrl(), Message::Text(TextEdit::Clear)),
+    ];
+    for (key, message) in cases {
+        assert_eq!(keymap.message(line, key), Some(message), "{key}");
+    }
+    // the keys of the overview do not reach through
+    for key in [Key::char('j'), Key::new(Code::PageDown), Key::char('v')] {
+        assert_eq!(keymap.message(line, key), None, "{key}");
+    }
+    assert_eq!(
+        keymap.keys_for(line, Message::NextCandidate),
+        [Key::new(Code::Up)]
+    );
 }

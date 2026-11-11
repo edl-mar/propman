@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use app::{AppState, EditorOutcome, Message, Session, View, preview, update};
+use app::{AppState, EditorOutcome, Message, Session, TextEdit, View, preview, update};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -786,6 +786,7 @@ fn loud_theme() -> Theme {
         uncertain: Style::new().fg(Color::Magenta),
         excluded: Style::new().fg(Color::Cyan),
         cursor: Style::new().add_modifier(Modifier::UNDERLINED),
+        matched: Style::new().fg(Color::LightYellow),
         marked: Style::new().fg(Color::LightGreen),
         alert: Style::new().fg(Color::LightRed),
         line_number: Style::new().fg(Color::Yellow),
@@ -1697,4 +1698,423 @@ fn enter_on_a_folder_shows_an_alert_that_says_what_editing_needs_and_runs_no_edi
     assert_eq!(calls, 0);
     let screen = screen(&terminal);
     assert!(screen.contains("edit needs exactly one file"), "{screen}");
+}
+
+// ── The command line ─────────────────────────────────────────────────────────
+
+/// The command line is opened in this state and this is typed.
+fn with_line(state: AppState, input: &str) -> AppState {
+    let state = press_all(state, &[Message::OpenCommandLine]);
+    input.chars().fold(state, |state, c| {
+        press_all(state, &[Message::Text(TextEdit::Insert(c))])
+    })
+}
+
+/// The cursor is on the file `messages.properties` of the folder `project`.
+fn on_a_file_of_the_project() -> AppState {
+    press_all(
+        state_for(&fixtures("project")),
+        &[Message::Down, Message::Down],
+    )
+}
+
+fn event_in(context: Context, event: Event) -> Option<Message> {
+    message_with(&Ui::default(), context, &event)
+}
+
+#[test]
+fn in_the_command_line_characters_go_into_the_field_even_if_they_are_bound_elsewhere() {
+    let line = Context::CommandLine;
+    // `q` quits in the overview, `j` moves, `space` marks: here they are text
+    assert_eq!(
+        event_in(line, press('q')),
+        Some(Message::Text(TextEdit::Insert('q')))
+    );
+    assert_eq!(
+        event_in(line, press('j')),
+        Some(Message::Text(TextEdit::Insert('j')))
+    );
+    assert_eq!(
+        event_in(line, press(' ')),
+        Some(Message::Text(TextEdit::Insert(' ')))
+    );
+    assert_eq!(
+        event_in(line, press('-')),
+        Some(Message::Text(TextEdit::Insert('-')))
+    );
+    // a capital letter comes with Shift, and AltGr sends Ctrl and Alt with the character
+    assert_eq!(
+        event_in(line, key(KeyCode::Char('N'), KeyModifiers::SHIFT)),
+        Some(Message::Text(TextEdit::Insert('N')))
+    );
+    let altgr = KeyModifiers::CONTROL | KeyModifiers::ALT;
+    assert_eq!(
+        event_in(line, key(KeyCode::Char('['), altgr)),
+        Some(Message::Text(TextEdit::Insert('[')))
+    );
+}
+
+#[test]
+fn in_the_command_line_the_keys_with_a_meaning_have_it() {
+    let line = Context::CommandLine;
+    let none = KeyModifiers::NONE;
+    let cases = [
+        (KeyCode::Esc, Message::CloseCommandLine),
+        (KeyCode::Enter, Message::RunCommand),
+        (KeyCode::Up, Message::NextCandidate),
+        (KeyCode::Down, Message::PreviousCandidate),
+        (KeyCode::Tab, Message::CompleteCommand),
+        (KeyCode::Backspace, Message::Text(TextEdit::Backspace)),
+        (KeyCode::Delete, Message::Text(TextEdit::Delete)),
+        (KeyCode::Left, Message::Text(TextEdit::Left)),
+        (KeyCode::Right, Message::Text(TextEdit::Right)),
+        (KeyCode::Home, Message::Text(TextEdit::Home)),
+        (KeyCode::End, Message::Text(TextEdit::End)),
+    ];
+    for (code, message) in cases {
+        assert_eq!(event_in(line, key(code, none)), Some(message), "{code:?}");
+    }
+    assert_eq!(
+        event_in(line, key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        Some(Message::Text(TextEdit::Clear))
+    );
+    assert_eq!(
+        event_in(line, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(Message::Quit),
+        "ctrl+c still quits"
+    );
+}
+
+#[test]
+fn in_the_command_line_other_keys_with_modifiers_and_other_events_are_nothing() {
+    let line = Context::CommandLine;
+    for event in [
+        key(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        key(KeyCode::Char('x'), KeyModifiers::ALT),
+        key(KeyCode::BackTab, KeyModifiers::SHIFT),
+        key(KeyCode::F(12), KeyModifiers::NONE),
+        key(KeyCode::PageUp, KeyModifiers::NONE),
+        Event::FocusLost,
+    ] {
+        assert_eq!(event_in(line, event.clone()), None, "{event:?}");
+    }
+    let release = Event::Key(KeyEvent::new_with_kind(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    ));
+    assert_eq!(event_in(line, release), None);
+}
+
+#[test]
+fn only_the_command_line_takes_text_and_the_colon_opens_it() {
+    assert_eq!(event_in(Context::Alert, press('x')), None);
+    assert_eq!(
+        event_in(Context::Overview, press(':')),
+        Some(Message::OpenCommandLine)
+    );
+    // a terminal sends the colon with Shift
+    assert_eq!(
+        event_in(
+            Context::Overview,
+            key(KeyCode::Char(':'), KeyModifiers::SHIFT)
+        ),
+        Some(Message::OpenCommandLine)
+    );
+    assert_eq!(event_in(Context::Overview, press('x')), None);
+}
+
+#[test]
+fn the_context_is_the_command_line_while_it_is_open_and_the_alert_is_in_front_of_it() {
+    let state = on_a_file_of_the_project();
+    assert_eq!(Context::of(&state), Context::Overview);
+    let state = with_line(state, "ed");
+    assert_eq!(Context::of(&state), Context::CommandLine);
+    let state = with_alert(state, EditorOutcome::NoEditor);
+    assert_eq!(Context::of(&state), Context::Alert);
+    let state = press_all(state, &[Message::DismissAlert]);
+    assert_eq!(Context::of(&state), Context::CommandLine);
+    let state = press_all(state, &[Message::CloseCommandLine]);
+    assert_eq!(Context::of(&state), Context::Overview);
+}
+
+#[test]
+fn the_line_with_the_keys_names_the_key_for_the_command_line() {
+    let footer = last_line(&drawn(&on_a_file_of_the_project(), 170, 10));
+    assert!(footer.contains(":: commands"), "{footer}");
+}
+
+// ── Drawing the command line ─────────────────────────────────────────────────
+
+#[test]
+fn the_input_is_the_last_row_with_a_colon_and_the_keys_of_the_line_behind_it() {
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    let screen = drawn(&state, 120, 20);
+    let last = last_line(&screen);
+    assert!(last.starts_with(":ed"), "{screen}");
+    for hint in [
+        "esc: close",
+        "enter: run",
+        "tab: complete",
+        "up/down: choose",
+    ] {
+        assert!(last.contains(hint), "{hint}: {last}");
+    }
+    assert!(
+        !last.contains("quit"),
+        "the keys of the overview are not offered: {last}"
+    );
+}
+
+#[test]
+fn the_best_candidate_is_the_row_above_the_input_and_the_others_follow_upwards() {
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    let screen = drawn(&state, 120, 20);
+    let rows = rows(&screen);
+    assert!(rows[18].contains("edit"), "{screen}");
+    assert!(
+        rows[18].contains("edit the file under the cursor"),
+        "{screen}"
+    );
+    assert!(
+        rows[18].contains("enter"),
+        "the key of the command: {screen}"
+    );
+    assert!(rows[17].contains("preview-down"), "{screen}");
+    assert!(rows[16].contains("preview-half-down"), "{screen}");
+    assert!(rows[15].contains("page-down"), "{screen}");
+    assert!(
+        !rows[14].contains("page-down"),
+        "the list of the overview goes on: {screen}"
+    );
+}
+
+#[test]
+fn the_highlighted_candidate_has_a_mark_and_the_others_have_not() {
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    let screen = drawn(&state, 120, 20);
+    let first = rows(&screen);
+    assert!(first[18].starts_with("> "), "{screen}");
+    assert!(first[17].starts_with("  "), "{screen}");
+
+    // the next one is the one above
+    let state = press_all(state, &[Message::NextCandidate]);
+    let screen = drawn(&state, 120, 20);
+    let second = rows(&screen);
+    assert!(second[18].starts_with("  "), "{screen}");
+    assert!(second[17].starts_with("> "), "{screen}");
+    assert!(second[17].contains("preview-down"), "{screen}");
+}
+
+#[test]
+fn at_most_eight_candidates_are_shown_and_the_highlighted_one_is_always_among_them() {
+    // 14 commands can be done on a file that is not marked
+    let state = with_line(on_a_file_of_the_project(), "");
+    let screen = drawn(&state, 120, 20);
+    let rows = rows(&screen);
+    assert!(rows[18].contains("quit"), "{screen}");
+    assert!(
+        rows[11].contains("preview-half-down"),
+        "the eighth: {screen}"
+    );
+    assert!(!rows[10].contains("preview-half-down"), "{screen}");
+    assert!(
+        !screen.contains("page-up  "),
+        "the eleventh is not shown yet: {screen}"
+    );
+
+    // the eleventh candidate is `page-up`
+    let state = press_all(state, &[Message::NextCandidate; 10]);
+    let screen = drawn(&state, 120, 20);
+    // only the rows of the command line, not the cursor row of the list above it
+    let highlighted: Vec<&str> = rows_of(&screen)
+        .into_iter()
+        .skip(10)
+        .filter(|row| row.starts_with("> "))
+        .collect();
+    assert_eq!(highlighted.len(), 1, "{screen}");
+    assert!(highlighted[0].contains("page-up"), "{screen}");
+}
+
+fn rows_of(screen: &str) -> Vec<&str> {
+    screen.lines().collect()
+}
+
+#[test]
+fn without_a_candidate_the_row_above_the_input_says_so() {
+    let state = with_line(on_a_file_of_the_project(), "xyz");
+    let screen = drawn(&state, 120, 20);
+    assert!(
+        rows(&screen)[18].contains("no matching command"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_command_line_covers_only_the_bottom_of_the_screen() {
+    let state = on_a_file_of_the_project();
+    let plain = drawn(&state, 120, 20);
+    let covered = drawn(&with_line(state, "ed"), 120, 20);
+    // four candidates and the input: the rows above the fifth from the bottom are the same
+    assert_eq!(rows(&plain)[..14], rows(&covered)[..14]);
+}
+
+#[test]
+fn the_letters_that_were_hit_have_their_own_style_and_the_highlighted_row_the_style_of_the_cursor()
+{
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    // the first `edit` on the screen is the name of the first candidate
+    let edit = style_at(&terminal, "edit");
+    assert_eq!(edit.fg, Some(Color::LightYellow), "e of edit");
+    assert!(
+        edit.add_modifier.contains(Modifier::UNDERLINED),
+        "the highlighted row"
+    );
+    let other = style_at(&terminal, "preview-down");
+    assert!(!other.add_modifier.contains(Modifier::UNDERLINED));
+}
+
+#[test]
+fn the_cursor_of_the_terminal_stands_behind_the_text() {
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    let mut terminal = terminal(120, 20);
+    terminal
+        .draw(|frame| render_with(&Ui::default(), &state, frame))
+        .unwrap();
+    let position = terminal.get_cursor_position().unwrap();
+    assert_eq!((position.x, position.y), (3, 19), "after `:ed`");
+
+    // and it follows the cursor of the field
+    let state = press_all(state, &[Message::Text(TextEdit::Left)]);
+    terminal
+        .draw(|frame| render_with(&Ui::default(), &state, frame))
+        .unwrap();
+    let position = terminal.get_cursor_position().unwrap();
+    assert_eq!((position.x, position.y), (2, 19));
+}
+
+#[test]
+fn drawing_the_command_line_survives_a_tiny_area() {
+    let state = with_line(on_a_file_of_the_project(), "e");
+    for (width, height) in [
+        (0, 0),
+        (1, 1),
+        (5, 1),
+        (20, 3),
+        (100, 2),
+        (110, 40),
+        (3, 30),
+    ] {
+        let mut terminal = terminal(width, height);
+        terminal
+            .draw(|frame| render_with(&Ui::default(), &state, frame))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_theme_never_changes_the_text_of_the_command_line() {
+    let state = with_line(on_a_file_of_the_project(), "ed");
+    assert_eq!(
+        drawn_with(&themed(loud_theme()), &state, 120, 20),
+        drawn(&state, 120, 20)
+    );
+}
+
+// ── Typing in the loop ───────────────────────────────────────────────────────
+
+fn typed_events(input: &str) -> Vec<Event> {
+    input.chars().map(press).collect()
+}
+
+#[test]
+fn a_command_that_is_typed_and_run_in_the_loop_is_done() {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", b"a=1\n");
+    let mut terminal = terminal(100, 20);
+    let mut calls = Vec::new();
+
+    let mut events = vec![press('j'), press('j'), press(':')];
+    events.extend(typed_events("ed"));
+    events.extend([enter(), press('q')]);
+    let state = run_with_editor(&mut terminal, state_for(&dir.0), events, |path| {
+        calls.push(path.to_path_buf());
+        EditorOutcome::Done
+    })
+    .unwrap();
+
+    assert_eq!(calls, [dir.0.join("a.properties")], "`edit` was run");
+    assert!(state.command_line().is_none());
+}
+
+#[test]
+fn quit_typed_in_the_command_line_ends_the_loop() {
+    let mut terminal = terminal(100, 20);
+    let mut events = vec![press(':')];
+    events.extend(typed_events("quit"));
+    events.push(enter());
+    let (result, asked) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    assert!(result.unwrap().should_quit());
+    assert_eq!(asked, 6);
+}
+
+#[test]
+fn a_q_that_is_typed_in_the_command_line_does_not_quit() {
+    let mut terminal = terminal(100, 20);
+    let events = vec![
+        press(':'),
+        press('q'),
+        key(KeyCode::Esc, KeyModifiers::NONE),
+        press('q'),
+    ];
+    let (result, asked) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    let state = result.unwrap();
+    assert_eq!(asked, 4, "only the last `q` quits");
+    assert!(state.should_quit());
+    assert!(state.command_line().is_none());
+}
+
+#[test]
+fn ctrl_c_quits_from_the_command_line() {
+    let mut terminal = terminal(100, 20);
+    let events = vec![press(':'), key(KeyCode::Char('c'), KeyModifiers::CONTROL)];
+    let (result, asked) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    assert!(result.unwrap().should_quit());
+    assert_eq!(asked, 2);
+}
+
+#[test]
+fn backspace_and_tab_work_in_the_loop() {
+    let mut terminal = terminal(100, 20);
+    // `x` is taken away again, `q` is completed to `quit`, and enter runs it
+    let events = vec![
+        press(':'),
+        press('x'),
+        key(KeyCode::Backspace, KeyModifiers::NONE),
+        press('q'),
+        key(KeyCode::Tab, KeyModifiers::NONE),
+        enter(),
+    ];
+    let (result, asked) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    assert!(result.unwrap().should_quit());
+    assert_eq!(asked, 6);
+}
+
+#[test]
+fn the_arrow_keys_choose_the_candidate_in_the_loop() {
+    let dir = TempDir::new();
+    write(&dir, "a.properties", b"a=1\n");
+    let mut terminal = terminal(100, 20);
+    let mut calls = 0;
+    // `ed` lists `edit` first; up chooses the next one, `preview-down`, so no editor is run
+    let mut events = vec![press('j'), press('j'), press(':')];
+    events.extend(typed_events("ed"));
+    events.extend([key(KeyCode::Up, KeyModifiers::NONE), enter(), press('q')]);
+    run_with_editor(&mut terminal, state_for(&dir.0), events, |_| {
+        calls += 1;
+        EditorOutcome::Done
+    })
+    .unwrap();
+    assert_eq!(calls, 0);
 }

@@ -5,7 +5,7 @@
 //! and one layer per context (the current view); a key of the context wins over the same key of
 //! the global layer. Nothing else in the program names a key.
 
-use app::{AppState, Message, View};
+use app::{AppState, Message, TextEdit, View};
 use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +22,8 @@ pub enum Code {
     Enter,
     Esc,
     Tab,
+    Backspace,
+    Delete,
     /// A function key: `F(12)` is F12.
     F(u8),
 }
@@ -87,7 +89,9 @@ impl Key {
             KeyCode::End => Code::End,
             KeyCode::Enter => Code::Enter,
             KeyCode::Esc => Code::Esc,
-            KeyCode::Tab => Code::Tab,
+            KeyCode::Tab | KeyCode::BackTab => Code::Tab,
+            KeyCode::Backspace => Code::Backspace,
+            KeyCode::Delete => Code::Delete,
             KeyCode::F(number) => Code::F(number),
             _ => return None,
         };
@@ -108,7 +112,8 @@ impl Key {
             code,
             ctrl: modifiers.contains(KeyModifiers::CONTROL),
             alt: modifiers.contains(KeyModifiers::ALT),
-            shift: modifiers.contains(KeyModifiers::SHIFT),
+            // a terminal reports Shift+Tab as a key of its own
+            shift: modifiers.contains(KeyModifiers::SHIFT) || key.code == KeyCode::BackTab,
         })
     }
 }
@@ -138,6 +143,8 @@ impl std::fmt::Display for Key {
             Code::Enter => f.write_str("enter"),
             Code::Esc => f.write_str("esc"),
             Code::Tab => f.write_str("tab"),
+            Code::Backspace => f.write_str("backspace"),
+            Code::Delete => f.write_str("delete"),
             Code::F(number) => write!(f, "f{number}"),
         }
     }
@@ -149,12 +156,21 @@ impl std::fmt::Display for Key {
 pub enum Context {
     Overview,
     Alert,
+    CommandLine,
 }
 
 impl Context {
+    /// Whether plain characters typed in this context are text for a field.
+    pub fn takes_text(self) -> bool {
+        matches!(self, Context::CommandLine)
+    }
+
     pub fn of(state: &AppState) -> Context {
         if state.alert().is_some() {
             return Context::Alert;
+        }
+        if state.command_line().is_some() {
+            return Context::CommandLine;
         }
         match state.view() {
             View::Overview(_) => Context::Overview,
@@ -207,6 +223,24 @@ impl Keymap {
         })
     }
 
+    /// The message of a key in the layer of the context alone, without the global layer.
+    pub fn context_message(&self, context: Context, key: Key) -> Option<Message> {
+        self.contexts
+            .iter()
+            .find(|(c, bound, _)| *c == context && *bound == key)
+            .map(|(_, _, message)| *message)
+    }
+
+    /// The keys of the layer of the context alone that give this message, in the order they were
+    /// bound.
+    pub fn context_keys_for(&self, context: Context, message: Message) -> Vec<Key> {
+        self.contexts
+            .iter()
+            .filter(|(c, _, bound)| *c == context && *bound == message)
+            .map(|(_, key, _)| *key)
+            .collect()
+    }
+
     /// The keys that give this message in this context, in the order they were bound, those of
     /// the context before the global ones. A key that the context binds to another message is
     /// not among them.
@@ -233,6 +267,7 @@ impl Default for Keymap {
     /// clears the marks, `v` switches the preview and `ctrl+up`, `ctrl+down`, `ctrl+u` and `ctrl+d` scroll it.
     fn default() -> Keymap {
         let overview = Context::Overview;
+        let line = Context::CommandLine;
         Keymap::empty()
             .bind_global(Key::char('q'), Message::Quit)
             .bind_global(Key::char('c').ctrl(), Message::Quit)
@@ -248,6 +283,28 @@ impl Default for Keymap {
             .bind(Context::Alert, Key::new(Code::Esc), Message::DismissAlert)
             .bind(Context::Alert, Key::new(Code::Enter), Message::DismissAlert)
             .bind(Context::Alert, Key::char(' '), Message::DismissAlert)
+            .bind(line, Key::new(Code::Esc), Message::CloseCommandLine)
+            .bind(line, Key::new(Code::Enter), Message::RunCommand)
+            // the best candidate is the row above the input, so up goes to the next one
+            .bind(line, Key::new(Code::Up), Message::NextCandidate)
+            .bind(line, Key::new(Code::Down), Message::PreviousCandidate)
+            .bind(line, Key::new(Code::Tab), Message::CompleteCommand)
+            .bind(
+                line,
+                Key::new(Code::Backspace),
+                Message::Text(TextEdit::Backspace),
+            )
+            .bind(
+                line,
+                Key::new(Code::Delete),
+                Message::Text(TextEdit::Delete),
+            )
+            .bind(line, Key::new(Code::Left), Message::Text(TextEdit::Left))
+            .bind(line, Key::new(Code::Right), Message::Text(TextEdit::Right))
+            .bind(line, Key::new(Code::Home), Message::Text(TextEdit::Home))
+            .bind(line, Key::new(Code::End), Message::Text(TextEdit::End))
+            .bind(line, Key::char('u').ctrl(), Message::Text(TextEdit::Clear))
+            .bind(overview, Key::char(':'), Message::OpenCommandLine)
             .bind(overview, Key::char(' '), Message::ToggleMark)
             .bind(overview, Key::new(Code::Esc), Message::ClearMarks)
             .bind(overview, Key::char('v'), Message::TogglePreview)

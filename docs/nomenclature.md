@@ -63,6 +63,8 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | mark | markieren | To put the entry under the cursor into a fixed set by hand (`Space`, shown as `*`). One way to make a selection. |
 | selection | Auswahl | The ids of entries of one kind that an action works on: the marked entries, else the entry under the cursor; later also a condition. A fixed set is written in brackets. |
 | action | Aktion | What is done to a selection; its precondition is the kind of the selection. Not an effect: an action may need none. |
+| command | Befehl | An action with a name and a label that can be typed in the command line and bound to a key. Not a message: a message is what `update` gets, a command stands for one. |
+| candidate | Kandidat | A command that fits what is typed, with the places of the letters that were hit. |
 | command line | Befehlszeile | The overlay that `:` opens, in which commands are typed with completion. |
 | effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |
 | alert | Meldung | A box over the top of the screen that says what went wrong (for example that no editor is set) and has to be dismissed first. An overlay, not a view. Not a problem of loading, and not a toast (a short success message, later). |

@@ -6,6 +6,38 @@ not authoritative.
 
 ## Decisions
 
+### The command line, first slice (2026-11-11)
+The first part of the operating concept: `:` opens a command line with a flat list of named
+commands that narrows while typing. Arguments, `show` and `sel` come later.
+- **The commands** have a name, a label and the message they stand for: `quit`, `edit`, `mark`,
+  `clear-marks`, `preview`, `preview-up`, `preview-down`, `preview-half-up`, `preview-half-down`,
+  `up`, `down`, `page-up`, `page-down`, `first`, `last`. The names are what is typed and what a
+  settings file will use. Messages that come from the program (`Viewport`, `EditorClosed`,
+  `Reloaded`, `DismissAlert`) are no commands.
+- **The candidates** are the commands that can be done now (`applicable`) and whose name has the
+  input as a subsequence, without regard to case. The order is the same every time: first the names
+  that begin with the input, then those whose words begin with the letters (`pd` for
+  `preview-down`; words may be skipped), then any other subsequence; within a group the order of
+  the table. The places of the letters that were hit are given for the display.
+- **Keys:** `Enter` runs the **highlighted** command, also for a partial input, `Tab` writes its
+  name into the line, `Esc` closes, `ctrl+u` clears, the usual keys edit the text. An open line
+  takes the keys of the view (and `update` ignores their messages); an alert is in front of it.
+- **Text goes into the field before the global layer is asked:** in a context that takes text a
+  plain character (no `ctrl`, no `alt`; capital letters and `AltGr` characters are plain) is text,
+  so `q` does not quit there. The keys of the context itself come first, `ctrl+c` still quits. The
+  line with the keys names only the keys of the context while text is typed.
+- **The layout is like `fzf`:** the input is the last row, and the best candidate is the row
+  directly above it, the others above that (at most eight). So the best one does not move while
+  typing. Hence `Up` is the *next* candidate (it goes up on the screen) and `Down` the previous
+  one. The keys of the line are at the right edge of the input row, the terminal's cursor stands
+  behind the text, and the layout above the block does not change.
+- **The text field is our own** (`TextField`, 60 lines) and not `tui-textarea`: that crate takes
+  key events and has its own keys (the keymap must stay the only place that knows keys), needs
+  `ratatui` and `crossterm` in `app`, and is a multi-line editor. It steps by `char` and counts one
+  column for each, which is wrong for combined letters and wide characters; when free text with
+  such characters or multi-line values come, the options are a bigger `TextField` or small
+  dependencies (`unicode-segmentation`, `unicode-width`), to be asked first.
+
 ### The operating concept: views, selections and the command line (2026-11-11)
 Why: the list of keys will soon be too long. In a tool like lazygit one cannot be sure what `p`
 and `P` do and looks into the help every time. The operation of the program should not have to
@@ -478,6 +510,8 @@ much later.
   `AltGr+8` and `AltGr+9`, slower to type than round brackets, which are needed later for
   grouping; a possible way out is to accept the elements without brackets and to show them with
   brackets.
+- **History of the lines typed in the command line:** the up and down keys choose candidates now,
+  so it needs other keys.
 - **More of the language:** "or", "not", a union; how a reference is named; what a second
   `show` does (replace, or add: `show add ...`). A command language of this kind can easily grow
   into a small Lisp inside; the rule is that it stays a sequence of named segments over typed

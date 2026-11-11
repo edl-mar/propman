@@ -18,17 +18,20 @@
 
 use store::FileId;
 
+use crate::commands::candidates;
 use crate::effect::{EditorOutcome, Effect};
 use crate::list::{ListState, Movement};
 use crate::overview::{ItemId, OverviewItem, overview};
 use crate::selection::selection;
 use crate::session::{LoadProblem, ReloadError, Session};
+use crate::text::{TextEdit, TextField};
 
 pub struct AppState {
     session: Session,
     problems: Vec<LoadProblem>,
     quit: bool,
     alert: Option<String>,
+    command_line: Option<CommandLine>,
     view: View,
 }
 
@@ -39,6 +42,7 @@ impl AppState {
             problems,
             quit: false,
             alert: None,
+            command_line: None,
             view: View::Overview(OverviewState::default()),
         }
     }
@@ -61,12 +65,35 @@ impl AppState {
         self.alert.as_deref()
     }
 
+    /// The command line, while it is open.
+    pub fn command_line(&self) -> Option<&CommandLine> {
+        self.command_line.as_ref()
+    }
+
     pub fn should_quit(&self) -> bool {
         self.quit
     }
 
     pub fn view(&self) -> &View {
         &self.view
+    }
+}
+
+/// The command line: the text that is typed and which of the candidates is highlighted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommandLine {
+    field: TextField,
+    highlighted: usize,
+}
+
+impl CommandLine {
+    pub fn field(&self) -> &TextField {
+        &self.field
+    }
+
+    /// The index of the highlighted candidate in the list of `candidates`.
+    pub fn highlighted(&self) -> usize {
+        self.highlighted
     }
 }
 
@@ -134,6 +161,13 @@ impl OverviewState {
             Message::ToggleMark => self.toggle_mark(),
             Message::ClearMarks => self.marks.clear(),
             Message::Quit
+            | Message::OpenCommandLine
+            | Message::CloseCommandLine
+            | Message::RunCommand
+            | Message::Text(_)
+            | Message::NextCandidate
+            | Message::PreviousCandidate
+            | Message::CompleteCommand
             | Message::DismissAlert
             | Message::Edit
             | Message::EditorClosed { .. }
@@ -249,6 +283,20 @@ pub enum Message {
     ClearMarks,
     /// Closes the alert.
     DismissAlert,
+    /// Opens the command line.
+    OpenCommandLine,
+    /// Closes the command line without doing anything.
+    CloseCommandLine,
+    /// Closes the command line and does the highlighted command.
+    RunCommand,
+    /// Edits the text of the command line.
+    Text(TextEdit),
+    /// Highlights the next candidate in the order of the list.
+    NextCandidate,
+    /// Highlights the candidate before.
+    PreviousCandidate,
+    /// Writes the name of the highlighted command into the command line.
+    CompleteCommand,
     /// Edits the file under the cursor in the editor of the user.
     Edit,
     /// The editor of the user was closed, or could not be run.
@@ -278,10 +326,67 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     if state.alert.is_some() && !gets_through {
         return (state, None);
     }
+    // an open command line takes the keys of the view; it has its own messages
+    let for_the_line = matches!(
+        message,
+        Message::CloseCommandLine
+            | Message::RunCommand
+            | Message::Text(_)
+            | Message::NextCandidate
+            | Message::PreviousCandidate
+            | Message::CompleteCommand
+    );
+    if state.command_line.is_some() && !gets_through && !for_the_line {
+        return (state, None);
+    }
     let mut effect = None;
     match message {
         Message::Quit => state.quit = true,
         Message::DismissAlert => state.alert = None,
+        Message::OpenCommandLine => state.command_line = Some(CommandLine::default()),
+        Message::CloseCommandLine => state.command_line = None,
+        Message::Text(edit) => {
+            if let Some(line) = &mut state.command_line {
+                let before = line.field.text().to_owned();
+                line.field.apply(edit);
+                if line.field.text() != before {
+                    line.highlighted = 0;
+                }
+            }
+        }
+        Message::NextCandidate => {
+            let count = candidates(&state).len();
+            if let Some(line) = &mut state.command_line {
+                line.highlighted = (line.highlighted + 1).min(count.saturating_sub(1));
+            }
+        }
+        Message::PreviousCandidate => {
+            if let Some(line) = &mut state.command_line {
+                line.highlighted = line.highlighted.saturating_sub(1);
+            }
+        }
+        Message::CompleteCommand => {
+            let name = state.command_line.as_ref().and_then(|line| {
+                candidates(&state)
+                    .get(line.highlighted)
+                    .map(|c| c.command.name)
+            });
+            if let (Some(name), Some(line)) = (name, &mut state.command_line) {
+                line.field = TextField::with_text(name);
+                line.highlighted = 0;
+            }
+        }
+        Message::RunCommand => {
+            let chosen = state.command_line.as_ref().and_then(|line| {
+                candidates(&state)
+                    .get(line.highlighted)
+                    .map(|c| c.command.message)
+            });
+            if let Some(chosen) = chosen {
+                state.command_line = None;
+                return update(state, chosen);
+            }
+        }
         Message::Edit => match edit_effect(&state) {
             Some(edit) => effect = Some(edit),
             None => state.alert = Some("edit needs exactly one file".to_owned()),
