@@ -289,6 +289,7 @@ impl Default for Keymap {
             .bind(line, Key::new(Code::Up), Message::NextCandidate)
             .bind(line, Key::new(Code::Down), Message::PreviousCandidate)
             .bind(line, Key::new(Code::Tab), Message::CompleteCommand)
+            .bind(line, Key::new(Code::Tab).shift(), Message::PreviousSegment)
             .bind(
                 line,
                 Key::new(Code::Backspace),

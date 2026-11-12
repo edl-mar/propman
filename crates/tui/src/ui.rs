@@ -20,6 +20,10 @@ pub struct Theme {
     pub cursor: Style,
     /// The letters of a candidate that were hit by what is typed in the command line.
     pub matched: Style,
+    /// The segment of the command line that was chosen already.
+    pub token: Style,
+    /// The row of the command line that says what it works on and what it would do.
+    pub target: Style,
     /// Added to an item that is marked.
     pub marked: Style,
     /// The box of an alert: its border, its title and its text.
@@ -40,6 +44,8 @@ impl Default for Theme {
             excluded: Style::new().fg(Color::DarkGray),
             cursor: Style::new().add_modifier(Modifier::REVERSED),
             matched: Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            token: Style::new().add_modifier(Modifier::BOLD),
+            target: Style::new().fg(Color::DarkGray),
             marked: Style::new().fg(Color::Cyan),
             alert: Style::new().fg(Color::Red).add_modifier(Modifier::BOLD),
             line_number: Style::new().fg(Color::DarkGray),

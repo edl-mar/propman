@@ -64,6 +64,8 @@ A term is only listed once it is used or agreed. Where a term is not final, the 
 | selection | Auswahl | The ids of entries of one kind that an action works on: the marked entries, else the entry under the cursor; later also a condition. A fixed set is written in brackets. |
 | action | Aktion | What is done to a selection; its precondition is the kind of the selection. Not an effect: an action may need none. |
 | command | Befehl | An action with a name and a label that can be typed in the command line and bound to a key. Not a message: a message is what `update` gets, a command stands for one. |
+| segment | Segment | One part of the command line: the command, then its value. The ones that were chosen are shown in front of the field. |
+| value | Wert | One of the entries of the list that a command offers after it was chosen (`Windows-1252` for `encoding`). Not the value of a property. |
 | candidate | Kandidat | A command that fits what is typed, with the places of the letters that were hit. |
 | command line | Befehlszeile | The overlay that `:` opens, in which commands are typed with completion. |
 | effect | Effekt | What `update` asks the outside world to do (run the editor, read a file again), as plain data. At most one per message. Not a message: the result of it comes back as one. |

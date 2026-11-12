@@ -237,6 +237,54 @@ impl Session {
         Ok(())
     }
 
+    /// Gives several files this encoding in one edit. Files that have it already are left out;
+    /// the number of files that changed is returned.
+    pub fn set_encodings(&mut self, files: &[FileId], encoding: Encoding) -> usize {
+        let todo: Vec<FileId> = files
+            .iter()
+            .copied()
+            .filter(|&file| {
+                self.store
+                    .file_encoding(file)
+                    .is_some_and(|current| current != encoding)
+            })
+            .collect();
+        if todo.is_empty() {
+            return 0;
+        }
+        let mut edit = self.store.edit(EditKind::User, Source::USER);
+        let changed = todo
+            .iter()
+            .filter(|&&file| edit.set_encoding(file, encoding))
+            .count();
+        edit.commit();
+        changed
+    }
+
+    /// Leaves several bundles out of the session, or takes them back, in one edit. Bundles that
+    /// are so already are left out; the number of bundles that changed is returned.
+    pub fn exclude_bundles(&mut self, bundles: &[BundleId], excluded: bool) -> usize {
+        let todo: Vec<BundleId> = bundles
+            .iter()
+            .copied()
+            .filter(|&bundle| {
+                self.store
+                    .bundle_excluded(bundle)
+                    .is_some_and(|current| current != excluded)
+            })
+            .collect();
+        if todo.is_empty() {
+            return 0;
+        }
+        let mut edit = self.store.edit(EditKind::User, Source::USER);
+        let changed = todo
+            .iter()
+            .filter(|&&bundle| edit.exclude_bundle(bundle, excluded))
+            .count();
+        edit.commit();
+        changed
+    }
+
     /// Writes a file, whether it is dirty or not.
     pub fn save_file(&mut self, file: FileId) -> Result<(), SaveError> {
         let (Some(path), Some(encoding), Some(expected)) = (

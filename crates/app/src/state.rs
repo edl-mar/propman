@@ -17,12 +17,13 @@
 //! never goes past the last window of the file. What the preview shows is `preview`.
 
 use store::FileId;
+use types::Encoding;
 
-use crate::commands::candidates;
+use crate::commands::{Action, Command, Entry, candidates};
 use crate::effect::{EditorOutcome, Effect};
 use crate::list::{ListState, Movement};
 use crate::overview::{ItemId, OverviewItem, overview};
-use crate::selection::selection;
+use crate::selection::{selected_bundles, selected_files, selection};
 use crate::session::{LoadProblem, ReloadError, Session};
 use crate::text::{TextEdit, TextField};
 
@@ -82,11 +83,17 @@ impl AppState {
 /// The command line: the text that is typed and which of the candidates is highlighted.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommandLine {
+    chosen: Option<&'static Command>,
     field: TextField,
     highlighted: usize,
 }
 
 impl CommandLine {
+    /// The command that was chosen, if it needs a value; the field is then for the value.
+    pub fn chosen(&self) -> Option<&'static Command> {
+        self.chosen
+    }
+
     pub fn field(&self) -> &TextField {
         &self.field
     }
@@ -168,6 +175,9 @@ impl OverviewState {
             | Message::NextCandidate
             | Message::PreviousCandidate
             | Message::CompleteCommand
+            | Message::PreviousSegment
+            | Message::SetEncoding(_)
+            | Message::SetExcluded(_)
             | Message::DismissAlert
             | Message::Edit
             | Message::EditorClosed { .. }
@@ -295,8 +305,15 @@ pub enum Message {
     NextCandidate,
     /// Highlights the candidate before.
     PreviousCandidate,
-    /// Writes the name of the highlighted command into the command line.
+    /// Takes the highlighted candidate: a command with values becomes a segment of the line and
+    /// the values are listed; anything else is written into the line.
     CompleteCommand,
+    /// Takes the last segment of the line back into the field.
+    PreviousSegment,
+    /// Gives the selected files this encoding.
+    SetEncoding(Encoding),
+    /// Leaves the selected bundles out of the session, or takes them back.
+    SetExcluded(bool),
     /// Edits the file under the cursor in the editor of the user.
     Edit,
     /// The editor of the user was closed, or could not be run.
@@ -330,6 +347,7 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     let for_the_line = matches!(
         message,
         Message::CloseCommandLine
+            | Message::PreviousSegment
             | Message::RunCommand
             | Message::Text(_)
             | Message::NextCandidate
@@ -366,27 +384,34 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
             }
         }
         Message::CompleteCommand => {
-            let name = state.command_line.as_ref().and_then(|line| {
-                candidates(&state)
-                    .get(line.highlighted)
-                    .map(|c| c.command.name)
-            });
-            if let (Some(name), Some(line)) = (name, &mut state.command_line) {
-                line.field = TextField::with_text(name);
+            accept(&mut state);
+        }
+        Message::PreviousSegment => {
+            if let Some(line) = &mut state.command_line
+                && let Some(command) = line.chosen.take()
+            {
+                line.field = TextField::with_text(command.name);
                 line.highlighted = 0;
             }
         }
         Message::RunCommand => {
-            let chosen = state.command_line.as_ref().and_then(|line| {
-                candidates(&state)
-                    .get(line.highlighted)
-                    .map(|c| c.command.message)
-            });
-            if let Some(chosen) = chosen {
+            if let Some(chosen) = accept(&mut state) {
                 state.command_line = None;
                 return update(state, chosen);
             }
         }
+        Message::SetEncoding(encoding) => match selected_files(&state) {
+            Some(files) => {
+                state.session.set_encodings(&files, encoding);
+            }
+            None => state.alert = Some("encoding needs files".to_owned()),
+        },
+        Message::SetExcluded(excluded) => match selected_bundles(&state) {
+            Some(bundles) => {
+                state.session.exclude_bundles(&bundles, excluded);
+            }
+            None => state.alert = Some("excluded needs bundles".to_owned()),
+        },
         Message::Edit => match edit_effect(&state) {
             Some(edit) => effect = Some(edit),
             None => state.alert = Some("edit needs exactly one file".to_owned()),
@@ -424,6 +449,37 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     // whatever the message was, the rows may have changed
     settle_overview(&mut state);
     (state, effect)
+}
+
+/// Takes the highlighted candidate of the command line. A command with values becomes a segment
+/// and the field is for its value; anything else is written into the field. Returns the message
+/// that the line then stands for, if it is complete.
+fn accept(state: &mut AppState) -> Option<Message> {
+    let picked = {
+        let line = state.command_line.as_ref()?;
+        let found = candidates(state);
+        let candidate = found.get(line.highlighted)?;
+        (candidate.entry, candidate.name)
+    };
+    let line = state.command_line.as_mut()?;
+    line.highlighted = 0;
+    match picked {
+        (Entry::Command(command), name) => match command.action {
+            Action::Message(message) => {
+                line.field = TextField::with_text(name);
+                Some(message)
+            }
+            Action::Choose(_) => {
+                line.chosen = Some(command);
+                line.field = TextField::new();
+                None
+            }
+        },
+        (Entry::Value(value), name) => {
+            line.field = TextField::with_text(name);
+            Some(value.message)
+        }
+    }
 }
 
 /// The effect for editing the selection: it has to be exactly one file.

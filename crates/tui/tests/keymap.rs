@@ -445,6 +445,7 @@ fn the_standard_keymap_has_the_keys_of_the_command_line() {
         (Key::new(Code::Up), Message::NextCandidate),
         (Key::new(Code::Down), Message::PreviousCandidate),
         (Key::new(Code::Tab), Message::CompleteCommand),
+        (Key::new(Code::Tab).shift(), Message::PreviousSegment),
         (
             Key::new(Code::Backspace),
             Message::Text(TextEdit::Backspace),

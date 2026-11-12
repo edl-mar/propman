@@ -31,8 +31,9 @@ pub use screen::screen_text;
 pub use ui::{Theme, Ui};
 
 use app::{
-    AppState, Confidence, EditorOutcome, Encoding, ItemId, Message, OverviewItem, TextEdit, View,
-    applicable, candidates, commands, overview, perform, preview, update,
+    Action, AppState, Command, Confidence, EditorOutcome, Entry, ItemId, Message, OverviewItem,
+    TextEdit, Value, View, applicable, candidates, commands, encoding_name, overview, perform,
+    preview, summary, target, update,
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
@@ -149,15 +150,6 @@ fn render_alert(theme: &Theme, keymap: &Keymap, text: &str, frame: &mut Frame) {
 fn counted(number: usize, singular: &str, plural: &str) -> String {
     let word = if number == 1 { singular } else { plural };
     format!("{number} {word}")
-}
-
-fn encoding_name(encoding: Encoding) -> &'static str {
-    match encoding {
-        Encoding::Utf8 => "UTF-8",
-        Encoding::Utf8Bom => "UTF-8+BOM",
-        Encoding::Windows1252 => "Windows-1252",
-        Encoding::Latin1 => "Latin-1",
-    }
 }
 
 /// The text cut from the left to `available` characters: `...` and the end of the text.
@@ -354,7 +346,8 @@ fn view_context(state: &AppState) -> Context {
 }
 
 /// The command line over the bottom of the screen: the input in the last row, behind it the keys
-/// of the line, and above it the candidates, the best one in the row next to the input.
+/// of the line, and above it the candidates, the best one in the row next to the input, and on
+/// top a row that says what the line works on and what it would do.
 fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     let Some(line) = state.command_line() else {
         return;
@@ -363,8 +356,16 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     if screen.width == 0 || screen.height == 0 {
         return;
     }
+    let aim = target(state).map(|target| match summary(state) {
+        Some(summary) => format!("on: {target}   {summary}"),
+        None => format!("on: {target}"),
+    });
+    // the row on top needs a row of its own besides the input
+    let aim_rows = usize::from(aim.is_some() && screen.height > 1);
     let found = candidates(state);
-    let available = usize::from(screen.height - 1).min(MAX_CANDIDATES);
+    let available = usize::from(screen.height - 1)
+        .saturating_sub(aim_rows)
+        .min(MAX_CANDIDATES);
     // the highlighted candidate is always among the shown ones
     let first = (line.highlighted() + 1).saturating_sub(available);
     let shown = found.len().saturating_sub(first).min(available);
@@ -375,9 +376,10 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     };
     let input_y = screen.bottom() - 1;
     let rows_u16 = u16::try_from(rows).unwrap_or(u16::MAX);
+    let aim_u16 = u16::try_from(aim_rows).unwrap_or(1);
     let block = Rect {
-        y: input_y - rows_u16,
-        height: rows_u16 + 1,
+        y: input_y - rows_u16 - aim_u16,
+        height: rows_u16 + aim_u16 + 1,
         ..screen
     };
     frame.render_widget(Clear, block);
@@ -387,12 +389,25 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
         height: 1,
         ..screen
     };
+    if let (Some(aim), 1) = (aim, aim_rows) {
+        frame.render_widget(
+            Paragraph::new(aim).style(ui.theme.target),
+            row_at(input_y - rows_u16 - 1),
+        );
+    }
     if found.is_empty() && rows > 0 {
         frame.render_widget(Paragraph::new("  no matching command"), row_at(input_y - 1));
     }
     let name_width = commands()
         .iter()
-        .map(|command| command.name.chars().count())
+        .flat_map(|command| {
+            let values: &[Value] = match &command.action {
+                Action::Choose(values) => values,
+                Action::Message(_) => &[],
+            };
+            std::iter::once(command.name).chain(values.iter().map(|value| value.name))
+        })
+        .map(|name| name.chars().count())
         .max()
         .unwrap_or(0);
     let label_width = commands()
@@ -403,7 +418,7 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     let below = view_context(state);
     for (index, candidate) in found.iter().enumerate().skip(first).take(shown) {
         let at_cursor = index == line.highlighted();
-        let name = candidate.command.name;
+        let name = candidate.name;
         let mut spans = vec![Span::raw(if at_cursor { "> " } else { "  " })];
         for (place, letter) in name.chars().enumerate() {
             let style = if candidate.matched.contains(&place) {
@@ -413,16 +428,23 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
             };
             spans.push(Span::styled(letter.to_string(), style));
         }
-        let keys: Vec<String> = ui
-            .keymap
-            .keys_for(below, candidate.command.message)
-            .iter()
-            .map(Key::to_string)
-            .collect();
+        // the keys of a command that is done at once; a command with values has none
+        let keys: Vec<String> = match candidate.entry {
+            Entry::Command(Command {
+                action: Action::Message(message),
+                ..
+            }) => ui
+                .keymap
+                .keys_for(below, *message)
+                .iter()
+                .map(Key::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
         spans.push(Span::raw(format!(
             "{}  {:<label_width$}  {}",
             " ".repeat(name_width.saturating_sub(name.chars().count())),
-            candidate.command.label,
+            candidate.label,
             keys.join("/"),
         )));
         let style = if at_cursor {
@@ -434,10 +456,20 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(Line::from(spans).style(style)), row_at(y));
     }
 
+    // the input: the segment that was chosen, in its own style, and the field behind it
+    let chosen = line.chosen().map_or("", |command| command.name);
     let text = line.field().text();
-    frame.render_widget(Paragraph::new(format!(":{text}")), row_at(input_y));
+    let mut input = vec![Span::raw(":")];
+    let mut prefix = 1;
+    if !chosen.is_empty() {
+        input.push(Span::styled(chosen.to_owned(), ui.theme.token));
+        input.push(Span::raw(" "));
+        prefix += chosen.chars().count() + 1;
+    }
+    input.push(Span::raw(text.to_owned()));
+    frame.render_widget(Paragraph::new(Line::from(input)), row_at(input_y));
     // the keys of the line, at the right edge, if there is room behind the input
-    let used = u16::try_from(1 + text.chars().count() + 2).unwrap_or(u16::MAX);
+    let used = u16::try_from(prefix + text.chars().count() + 2).unwrap_or(u16::MAX);
     if used < screen.width {
         let hints = Rect {
             x: screen.x + used,
@@ -450,7 +482,7 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
             hints,
         );
     }
-    let caret = u16::try_from(1 + line.field().cursor()).unwrap_or(u16::MAX);
+    let caret = u16::try_from(prefix + line.field().cursor()).unwrap_or(u16::MAX);
     frame.set_cursor_position(Position::new(
         screen.x + caret.min(screen.width - 1),
         input_y,
@@ -501,12 +533,13 @@ fn preview_lines(theme: &Theme, state: &AppState, width: usize) -> Vec<Line<'sta
 /// What the keys do, as far as they are bound and can be done now: `q/ctrl+c: quit   up/k/down/j: move ...`.
 fn key_help(keymap: &Keymap, state: &AppState) -> String {
     let context = Context::of(state);
-    let groups: [(&[Message], &str); 15] = [
+    let groups: [(&[Message], &str); 16] = [
         (&[Message::Quit], "quit"),
         (&[Message::DismissAlert], "dismiss"),
         (&[Message::CloseCommandLine], "close"),
         (&[Message::RunCommand], "run"),
         (&[Message::CompleteCommand], "complete"),
+        (&[Message::PreviousSegment], "back"),
         (
             &[Message::NextCandidate, Message::PreviousCandidate],
             "choose",

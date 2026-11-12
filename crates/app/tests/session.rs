@@ -525,3 +525,103 @@ fn a_file_of_another_session_cannot_be_reloaded() {
         Err(app::ReloadError::UnknownFile)
     );
 }
+
+// ── Several files or bundles in one edit ─────────────────────────────────────
+
+/// A folder with these files (all UTF-8), opened, and their ids in this order.
+fn files_named(names: &[&str]) -> (Session, TempDir, Vec<FileId>) {
+    let dir = TempDir::new();
+    for name in names {
+        std::fs::write(dir.path().join(name), b"a=1\n").unwrap();
+    }
+    let session = open(&dir);
+    let ids = names
+        .iter()
+        .map(|name| file(&session, &dir, name))
+        .collect();
+    (session, dir, ids)
+}
+
+fn last_edit_of_the_encoding(session: &Session, file: FileId) -> impl PartialEq + std::fmt::Debug {
+    session.store().encoding_versions(file).last().unwrap().edit
+}
+
+#[test]
+fn several_files_get_an_encoding_in_one_edit() {
+    let (mut session, _dir, ids) = files_named(&["a.properties", "b.properties", "c.properties"]);
+    assert_eq!(session.set_encodings(&ids, Encoding::Latin1), 3);
+    for &id in &ids {
+        assert_eq!(session.store().file_encoding(id), Some(Encoding::Latin1));
+    }
+    let first = last_edit_of_the_encoding(&session, ids[0]);
+    assert_eq!(first, last_edit_of_the_encoding(&session, ids[1]));
+    assert_eq!(first, last_edit_of_the_encoding(&session, ids[2]));
+}
+
+#[test]
+fn files_that_have_the_encoding_already_are_left_out() {
+    let (mut session, _dir, ids) = files_named(&["a.properties", "b.properties"]);
+    assert!(session.set_encoding(ids[0], Encoding::Latin1));
+    let before = session.store().encoding_versions(ids[0]).len();
+
+    assert_eq!(session.set_encodings(&ids, Encoding::Latin1), 1);
+
+    assert_eq!(session.store().encoding_versions(ids[0]).len(), before);
+    assert_eq!(
+        session.store().file_encoding(ids[1]),
+        Some(Encoding::Latin1)
+    );
+}
+
+#[test]
+fn nothing_changes_if_every_file_has_the_encoding_already() {
+    let (mut session, _dir, ids) = files_named(&["a.properties", "b.properties"]);
+    let before: Vec<usize> = ids
+        .iter()
+        .map(|&id| session.store().encoding_versions(id).len())
+        .collect();
+    assert_eq!(session.set_encodings(&ids, Encoding::Utf8), 0);
+    let after: Vec<usize> = ids
+        .iter()
+        .map(|&id| session.store().encoding_versions(id).len())
+        .collect();
+    assert_eq!(before, after);
+    assert_eq!(session.set_encodings(&[], Encoding::Latin1), 0);
+}
+
+#[test]
+fn a_file_of_another_session_is_left_out_of_the_encodings() {
+    let (mut session, _dir, ids) = files_named(&["a.properties"]);
+    let (_other, _other_dir, foreign) = files_named(&["a.properties"]);
+    let both = [ids[0], foreign[0]];
+    assert_eq!(session.set_encodings(&both, Encoding::Latin1), 1);
+}
+
+#[test]
+fn several_bundles_are_left_out_in_one_edit() {
+    let (mut session, _dir, _ids) = files_named(&["a.properties", "b.properties"]);
+    let bundles = session.store().bundles();
+    assert_eq!(bundles.len(), 2);
+    assert_eq!(session.exclude_bundles(&bundles, true), 2);
+    for &bundle in &bundles {
+        assert_eq!(session.store().bundle_excluded(bundle), Some(true));
+    }
+    let edit_of = |bundle| {
+        session
+            .store()
+            .excluded_versions(bundle)
+            .last()
+            .unwrap()
+            .edit
+    };
+    assert_eq!(edit_of(bundles[0]), edit_of(bundles[1]));
+
+    assert_eq!(
+        session.exclude_bundles(&bundles, true),
+        0,
+        "they are left out already"
+    );
+    assert_eq!(session.exclude_bundles(&bundles[..1], false), 1);
+    assert_eq!(session.store().bundle_excluded(bundles[0]), Some(false));
+    assert_eq!(session.store().bundle_excluded(bundles[1]), Some(true));
+}

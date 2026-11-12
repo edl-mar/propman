@@ -787,6 +787,8 @@ fn loud_theme() -> Theme {
         excluded: Style::new().fg(Color::Cyan),
         cursor: Style::new().add_modifier(Modifier::UNDERLINED),
         matched: Style::new().fg(Color::LightYellow),
+        token: Style::new().fg(Color::LightCyan),
+        target: Style::new().fg(Color::LightMagenta),
         marked: Style::new().fg(Color::LightGreen),
         alert: Style::new().fg(Color::LightRed),
         line_number: Style::new().fg(Color::Yellow),
@@ -1778,6 +1780,11 @@ fn in_the_command_line_the_keys_with_a_meaning_have_it() {
         event_in(line, key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
         Some(Message::Text(TextEdit::Clear))
     );
+    // a terminal reports Shift+Tab as its own key
+    assert_eq!(
+        event_in(line, key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        Some(Message::PreviousSegment)
+    );
     assert_eq!(
         event_in(line, key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
         Some(Message::Quit),
@@ -1791,7 +1798,6 @@ fn in_the_command_line_other_keys_with_modifiers_and_other_events_are_nothing() 
     for event in [
         key(KeyCode::Char('x'), KeyModifiers::CONTROL),
         key(KeyCode::Char('x'), KeyModifiers::ALT),
-        key(KeyCode::BackTab, KeyModifiers::SHIFT),
         key(KeyCode::F(12), KeyModifiers::NONE),
         key(KeyCode::PageUp, KeyModifiers::NONE),
         Event::FocusLost,
@@ -1880,11 +1886,16 @@ fn the_best_candidate_is_the_row_above_the_input_and_the_others_follow_upwards()
         rows[18].contains("enter"),
         "the key of the command: {screen}"
     );
-    assert!(rows[17].contains("preview-down"), "{screen}");
-    assert!(rows[16].contains("preview-half-down"), "{screen}");
-    assert!(rows[15].contains("page-down"), "{screen}");
+    assert!(rows[17].contains("encoding"), "{screen}");
+    assert!(rows[16].contains("preview-down"), "{screen}");
+    assert!(rows[15].contains("preview-half-down"), "{screen}");
+    assert!(rows[14].contains("page-down"), "{screen}");
     assert!(
-        !rows[14].contains("page-down"),
+        rows[13].starts_with("on: file messages.properties"),
+        "the row on top says what the line works on: {screen}"
+    );
+    assert!(
+        !rows[12].contains("on:") && !rows[12].contains("page-down"),
         "the list of the overview goes on: {screen}"
     );
 }
@@ -1903,27 +1914,24 @@ fn the_highlighted_candidate_has_a_mark_and_the_others_have_not() {
     let second = rows(&screen);
     assert!(second[18].starts_with("  "), "{screen}");
     assert!(second[17].starts_with("> "), "{screen}");
-    assert!(second[17].contains("preview-down"), "{screen}");
+    assert!(second[17].contains("encoding"), "{screen}");
 }
 
 #[test]
 fn at_most_eight_candidates_are_shown_and_the_highlighted_one_is_always_among_them() {
-    // 14 commands can be done on a file that is not marked
+    // 15 commands can be done on a file that is not marked
     let state = with_line(on_a_file_of_the_project(), "");
     let screen = drawn(&state, 120, 20);
     let rows = rows(&screen);
     assert!(rows[18].contains("quit"), "{screen}");
-    assert!(
-        rows[11].contains("preview-half-down"),
-        "the eighth: {screen}"
-    );
-    assert!(!rows[10].contains("preview-half-down"), "{screen}");
+    assert!(rows[11].contains("preview-half-up"), "the eighth: {screen}");
+    assert!(rows[10].starts_with("on: "), "the row on top: {screen}");
     assert!(
         !screen.contains("page-up  "),
         "the eleventh is not shown yet: {screen}"
     );
 
-    // the eleventh candidate is `page-up`
+    // the eleventh candidate is `down`
     let state = press_all(state, &[Message::NextCandidate; 10]);
     let screen = drawn(&state, 120, 20);
     // only the rows of the command line, not the cursor row of the list above it
@@ -1933,7 +1941,7 @@ fn at_most_eight_candidates_are_shown_and_the_highlighted_one_is_always_among_th
         .filter(|row| row.starts_with("> "))
         .collect();
     assert_eq!(highlighted.len(), 1, "{screen}");
-    assert!(highlighted[0].contains("page-up"), "{screen}");
+    assert!(highlighted[0].starts_with("> down "), "{screen}");
 }
 
 fn rows_of(screen: &str) -> Vec<&str> {
@@ -1955,8 +1963,8 @@ fn the_command_line_covers_only_the_bottom_of_the_screen() {
     let state = on_a_file_of_the_project();
     let plain = drawn(&state, 120, 20);
     let covered = drawn(&with_line(state, "ed"), 120, 20);
-    // four candidates and the input: the rows above the fifth from the bottom are the same
-    assert_eq!(rows(&plain)[..14], rows(&covered)[..14]);
+    // five candidates, the row on top and the input: the rows above them are the same
+    assert_eq!(rows(&plain)[..13], rows(&covered)[..13]);
 }
 
 #[test]
@@ -2107,14 +2115,214 @@ fn the_arrow_keys_choose_the_candidate_in_the_loop() {
     write(&dir, "a.properties", b"a=1\n");
     let mut terminal = terminal(100, 20);
     let mut calls = 0;
-    // `ed` lists `edit` first; up chooses the next one, `preview-down`, so no editor is run
+    // `ed` lists `edit`, `encoding` and then `preview-down`: up twice chooses the third, so no
+    // editor is run
     let mut events = vec![press('j'), press('j'), press(':')];
     events.extend(typed_events("ed"));
-    events.extend([key(KeyCode::Up, KeyModifiers::NONE), enter(), press('q')]);
+    events.extend([
+        key(KeyCode::Up, KeyModifiers::NONE),
+        key(KeyCode::Up, KeyModifiers::NONE),
+        enter(),
+        press('q'),
+    ]);
     run_with_editor(&mut terminal, state_for(&dir.0), events, |_| {
         calls += 1;
         EditorOutcome::Done
     })
     .unwrap();
     assert_eq!(calls, 0);
+}
+
+// ── Fields and values ────────────────────────────────────────────────────────
+
+/// The command is chosen in the command line and this is typed for its value.
+fn in_the_value_segment(state: AppState, command: &str, value: &str) -> AppState {
+    let state = press_all(with_line(state, command), &[Message::CompleteCommand]);
+    value.chars().fold(state, |state, c| {
+        press_all(state, &[Message::Text(TextEdit::Insert(c))])
+    })
+}
+
+#[test]
+fn the_chosen_command_stands_in_front_of_the_value_in_the_input() {
+    let state = in_the_value_segment(on_a_file_of_the_project(), "enc", "w");
+    let screen = drawn(&state, 120, 20);
+    let last = last_line(&screen);
+    assert!(last.starts_with(":encoding w"), "{screen}");
+    assert!(last.contains("shift+tab: back"), "{last}");
+    assert!(last.contains("tab: complete"), "{last}");
+    let rows = rows(&screen);
+    assert!(rows[18].contains("Windows-1252"), "{screen}");
+    assert!(rows[18].contains("Windows-1252 (cp1252)"), "{screen}");
+    assert!(rows[18].starts_with("> "), "{screen}");
+}
+
+#[test]
+fn the_back_key_is_named_only_after_a_command_was_chosen() {
+    let state = with_line(on_a_file_of_the_project(), "enc");
+    let last = last_line(&drawn(&state, 120, 20));
+    assert!(!last.contains("back"), "{last}");
+}
+
+#[test]
+fn the_row_on_top_says_what_the_line_works_on_and_what_it_would_do() {
+    let state = with_line(on_a_file_of_the_project(), "enc");
+    let screen = drawn(&state, 120, 20);
+    let on_top = row_with(&screen, "on: ");
+    assert!(
+        on_top.starts_with("on: file messages.properties"),
+        "{on_top}"
+    );
+    assert!(!on_top.contains("changes"), "{on_top}");
+
+    // the file is UTF-8, so Windows-1252 changes it
+    let state = in_the_value_segment(on_a_file_of_the_project(), "enc", "w");
+    let screen = drawn(&state, 120, 20);
+    let on_top = row_with(&screen, "on: ");
+    assert!(
+        on_top.contains("encoding Windows-1252 changes 1 of 1 file"),
+        "{on_top}"
+    );
+    // it is the row above the only candidate
+    assert!(rows(&screen)[17].starts_with("on: "), "{screen}");
+}
+
+#[test]
+fn the_row_on_top_counts_the_marked_files() {
+    let state = press_all(
+        on_a_file_of_the_project(),
+        &[Message::ToggleMark, Message::Down, Message::ToggleMark],
+    );
+    let state = in_the_value_segment(state, "enc", "u");
+    let screen = drawn(&state, 120, 20);
+    let on_top = row_with(&screen, "on: ");
+    assert!(on_top.starts_with("on: 2 files (marked)"), "{on_top}");
+    assert!(on_top.contains("changes"), "{on_top}");
+}
+
+#[test]
+fn there_is_no_row_on_top_in_an_empty_folder() {
+    let dir = TempDir::new();
+    let state = with_line(state_for(&dir.0), "");
+    let screen = drawn(&state, 120, 20);
+    assert!(!screen.contains("on: "), "{screen}");
+}
+
+#[test]
+fn the_chosen_command_and_the_row_on_top_have_their_own_styles() {
+    let state = in_the_value_segment(on_a_file_of_the_project(), "enc", "w");
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    assert_eq!(style_at(&terminal, "encoding w").fg, Some(Color::LightCyan));
+    assert_eq!(
+        style_at(&terminal, "on: file").fg,
+        Some(Color::LightMagenta)
+    );
+    assert_eq!(
+        drawn_with(&themed(loud_theme()), &state, 120, 20),
+        drawn(&state, 120, 20),
+        "a theme never changes the text"
+    );
+}
+
+#[test]
+fn the_cursor_of_the_terminal_stands_behind_the_value() {
+    let state = in_the_value_segment(on_a_file_of_the_project(), "enc", "w");
+    let mut terminal = terminal(120, 20);
+    terminal
+        .draw(|frame| render_with(&Ui::default(), &state, frame))
+        .unwrap();
+    let position = terminal.get_cursor_position().unwrap();
+    // `:encoding ` is ten columns, then the `w`
+    assert_eq!((position.x, position.y), (11, 19));
+}
+
+#[test]
+fn drawing_the_value_segment_survives_a_tiny_area() {
+    let state = in_the_value_segment(on_a_file_of_the_project(), "enc", "w");
+    for (width, height) in [
+        (0, 0),
+        (1, 1),
+        (5, 1),
+        (20, 3),
+        (100, 2),
+        (110, 40),
+        (3, 30),
+    ] {
+        let mut terminal = terminal(width, height);
+        terminal
+            .draw(|frame| render_with(&Ui::default(), &state, frame))
+            .unwrap();
+    }
+}
+
+/// The encoding of the file under the cursor.
+fn encoding_under_the_cursor(state: &AppState) -> app::Encoding {
+    match app::selection(state).as_slice() {
+        [app::ItemId::File(file)] => state.session().store().file_encoding(*file).unwrap(),
+        other => panic!("not one file: {other:?}"),
+    }
+}
+
+fn the_project_with_the_cursor_on_a_file() -> Vec<Event> {
+    vec![press('j'), press('j')]
+}
+
+#[test]
+fn an_encoding_that_is_typed_and_run_in_the_loop_is_set() {
+    let mut terminal = terminal(100, 20);
+    let mut events = the_project_with_the_cursor_on_a_file();
+    events.push(press(':'));
+    events.extend(typed_events("en"));
+    events.push(key(KeyCode::Tab, KeyModifiers::NONE));
+    events.extend(typed_events("w"));
+    events.extend([enter(), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    let state = result.unwrap();
+    assert!(state.command_line().is_none());
+    assert_eq!(
+        encoding_under_the_cursor(&state),
+        app::Encoding::Windows1252
+    );
+    // and the list shows it
+    let screen = drawn(&state, 110, 30);
+    assert!(
+        row_with(&screen, "messages.properties").contains("Windows-1252"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn enter_alone_goes_from_the_command_to_the_value_and_runs_it() {
+    let mut terminal = terminal(100, 20);
+    let mut events = the_project_with_the_cursor_on_a_file();
+    events.push(press(':'));
+    events.extend(typed_events("en"));
+    events.push(enter());
+    events.extend(typed_events("l"));
+    events.extend([enter(), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    assert_eq!(
+        encoding_under_the_cursor(&result.unwrap()),
+        app::Encoding::Latin1
+    );
+}
+
+#[test]
+fn shift_tab_goes_back_to_the_command_in_the_loop() {
+    let mut terminal = terminal(100, 20);
+    let mut events = the_project_with_the_cursor_on_a_file();
+    events.push(press(':'));
+    events.extend(typed_events("en"));
+    events.extend([
+        key(KeyCode::Tab, KeyModifiers::NONE),
+        key(KeyCode::BackTab, KeyModifiers::SHIFT),
+        enter(),
+    ]);
+    events.extend(typed_events("w"));
+    events.extend([enter(), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    assert_eq!(
+        encoding_under_the_cursor(&result.unwrap()),
+        app::Encoding::Windows1252
+    );
 }

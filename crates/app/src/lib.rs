@@ -10,12 +10,12 @@ mod session;
 mod state;
 mod text;
 
-pub use commands::{Candidate, Command, candidates, commands};
+pub use commands::{Action, Candidate, Command, Entry, Value, candidates, commands, encoding_name};
 pub use effect::{EditorOutcome, Effect, perform};
 pub use list::{ListState, Movement};
 pub use overview::{ItemId, OverviewItem, overview};
 pub use preview::{Preview, PreviewLine, preview};
-pub use selection::{applicable, selection};
+pub use selection::{applicable, selection, summary, target};
 pub use session::{LoadProblem, ReloadError, SaveError, Session};
 pub use state::{AppState, CommandLine, Message, OverviewState, View, update};
 pub use text::{TextEdit, TextField};

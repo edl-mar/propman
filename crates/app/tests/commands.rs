@@ -6,7 +6,9 @@ mod common;
 
 use std::collections::HashSet;
 
-use app::{AppState, Message, Session, TextEdit, candidates, commands, update};
+use app::{
+    Action, AppState, Message, Session, TextEdit, candidates, commands, summary, target, update,
+};
 use common::TempDir;
 
 /// A folder with `a.properties`; the list is: folder, bundle `a`, the file.
@@ -56,14 +58,14 @@ fn typed(state: AppState, input: &str) -> AppState {
 fn names(state: &AppState) -> Vec<&'static str> {
     candidates(state)
         .iter()
-        .map(|candidate| candidate.command.name)
+        .map(|candidate| candidate.name)
         .collect()
 }
 
 fn matched(state: &AppState) -> Vec<(&'static str, Vec<usize>)> {
     candidates(state)
         .into_iter()
-        .map(|candidate| (candidate.command.name, candidate.matched))
+        .map(|candidate| (candidate.name, candidate.matched))
         .collect()
 }
 
@@ -79,6 +81,8 @@ fn the_commands_are_these_in_this_order() {
             "edit",
             "mark",
             "clear-marks",
+            "encoding",
+            "excluded",
             "preview",
             "preview-up",
             "preview-down",
@@ -110,21 +114,32 @@ fn every_command_has_its_own_name_label_and_message() {
             command.name
         );
     }
-    for (index, command) in commands.iter().enumerate() {
-        for other in &commands[index + 1..] {
-            assert_ne!(command.message, other.message, "{}", command.name);
-        }
+    // every message is the message of one command or one value
+    let mut messages: Vec<Message> = commands
+        .iter()
+        .flat_map(|command| match &command.action {
+            Action::Message(message) => vec![*message],
+            Action::Choose(values) => values.iter().map(|value| value.message).collect(),
+        })
+        .collect();
+    let all = messages.len();
+    messages.dedup_by(|a, b| a == b);
+    assert_eq!(messages.len(), all, "no message twice (next to each other)");
+    for (index, message) in messages.iter().enumerate() {
+        assert!(!messages[index + 1..].contains(message), "{message:?}");
     }
 }
 
 #[test]
 fn the_commands_say_what_the_message_does() {
-    let by_name = |name: &str| {
-        commands()
-            .iter()
-            .find(|command| command.name == name)
-            .unwrap()
-            .message
+    let by_name = |name: &str| match &commands()
+        .iter()
+        .find(|command| command.name == name)
+        .unwrap()
+        .action
+    {
+        Action::Message(message) => *message,
+        Action::Choose(_) => panic!("{name} needs a value"),
     };
     assert_eq!(by_name("quit"), Message::Quit);
     assert_eq!(by_name("edit"), Message::Edit);
@@ -148,7 +163,12 @@ fn there_are_no_candidates_while_the_command_line_is_closed() {
 fn without_input_every_command_that_can_be_done_is_a_candidate_in_the_order_of_the_table() {
     let (state, _dir) = everything_possible();
     let state = typed(state, "");
-    let all: Vec<&str> = commands().iter().map(|command| command.name).collect();
+    // everything but `excluded`: that is for bundles, and a file is under the cursor
+    let all: Vec<&str> = commands()
+        .iter()
+        .map(|command| command.name)
+        .filter(|&name| name != "excluded")
+        .collect();
     assert_eq!(names(&state), all);
     assert!(
         candidates(&state)
@@ -164,6 +184,8 @@ fn only_commands_that_can_be_done_are_candidates() {
     let listed = names(&state);
     assert!(!listed.contains(&"edit"), "a folder cannot be edited");
     assert!(!listed.contains(&"clear-marks"), "nothing is marked");
+    assert!(!listed.contains(&"encoding"), "that is for files");
+    assert!(!listed.contains(&"excluded"), "that is for bundles");
     assert!(listed.contains(&"mark"));
     assert!(listed.contains(&"quit"));
 
@@ -198,7 +220,13 @@ fn then_come_the_names_that_have_the_input_as_a_subsequence() {
     let (state, _dir) = everything_possible();
     assert_eq!(
         names(&typed(state, "ed")),
-        ["edit", "preview-down", "preview-half-down", "page-down"]
+        [
+            "edit",
+            "encoding",
+            "preview-down",
+            "preview-half-down",
+            "page-down"
+        ]
     );
 
     let (state, _dir) = everything_possible();
@@ -250,6 +278,7 @@ fn the_places_of_the_letters_that_were_hit_are_given() {
         matched(&typed(state, "ed")),
         [
             ("edit", vec![0, 1]),
+            ("encoding", vec![0, 4]),
             ("preview-down", vec![2, 8]),
             ("preview-half-down", vec![2, 13]),
             ("page-down", vec![3, 5]),
@@ -268,4 +297,203 @@ fn the_places_of_the_letters_that_were_hit_are_given() {
 
     let (state, _dir) = everything_possible();
     assert_eq!(matched(&typed(state, "pre"))[0], ("preview", vec![0, 1, 2]));
+}
+
+// ── Commands with values ─────────────────────────────────────────────────────
+
+/// A folder with two bundles of one file each; the list is: folder, bundle `a`, file `a`,
+/// bundle `b`, file `b`. Both files are UTF-8.
+fn two_files() -> (AppState, TempDir) {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.properties"), b"a=1\n").unwrap();
+    std::fs::write(dir.path().join("b.properties"), b"b=1\n").unwrap();
+    let (session, problems) = Session::open(dir.path());
+    let state = send(AppState::new(session, problems), &[Message::Viewport(10)]);
+    (state, dir)
+}
+
+fn down(state: AppState, times: usize) -> AppState {
+    (0..times).fold(state, |state, _| send(state, &[Message::Down]))
+}
+
+/// The command with this name is chosen in the command line and this is typed for its value.
+fn value_typed(state: AppState, command: &str, value: &str) -> AppState {
+    let state = typed(state, command);
+    let state = send(state, &[Message::CompleteCommand]);
+    value.chars().fold(state, |state, c| {
+        send(state, &[Message::Text(TextEdit::Insert(c))])
+    })
+}
+
+#[test]
+fn encoding_and_excluded_are_commands_that_need_a_value() {
+    let values_of = |name: &str| -> Vec<&'static str> {
+        match &commands().iter().find(|c| c.name == name).unwrap().action {
+            Action::Choose(values) => values.iter().map(|value| value.name).collect(),
+            Action::Message(_) => panic!("{name} needs no value"),
+        }
+    };
+    assert_eq!(
+        values_of("encoding"),
+        ["UTF-8", "UTF-8+BOM", "Windows-1252", "Latin-1"]
+    );
+    assert_eq!(values_of("excluded"), ["yes", "no"]);
+}
+
+#[test]
+fn the_names_of_the_encodings_are_the_ones_that_are_shown() {
+    use app::{Encoding, encoding_name};
+    assert_eq!(encoding_name(Encoding::Utf8), "UTF-8");
+    assert_eq!(encoding_name(Encoding::Utf8Bom), "UTF-8+BOM");
+    assert_eq!(encoding_name(Encoding::Windows1252), "Windows-1252");
+    assert_eq!(encoding_name(Encoding::Latin1), "Latin-1");
+    for command in commands() {
+        if let Action::Choose(values) = &command.action {
+            for value in *values {
+                if let Message::SetEncoding(encoding) = value.message {
+                    assert_eq!(value.name, encoding_name(encoding));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_command_with_values_is_offered_for_the_kind_of_item_it_works_on() {
+    let (state, _dir) = two_files();
+    let on_a_folder = names(&typed(state, "enc"));
+    assert_eq!(on_a_folder, Vec::<&str>::new(), "a folder has no encoding");
+
+    let (state, _dir) = two_files();
+    let on_a_bundle = typed(down(state, 1), "e");
+    assert!(names(&on_a_bundle).contains(&"excluded"));
+    assert!(!names(&on_a_bundle).contains(&"encoding"));
+
+    let (state, _dir) = two_files();
+    let on_a_file = typed(down(state, 2), "e");
+    assert!(names(&on_a_file).contains(&"encoding"));
+    assert!(!names(&on_a_file).contains(&"excluded"));
+}
+
+#[test]
+fn after_a_command_with_values_the_values_are_the_candidates() {
+    let (state, _dir) = two_files();
+    let state = value_typed(down(state, 2), "enc", "");
+    assert_eq!(
+        names(&state),
+        ["UTF-8", "UTF-8+BOM", "Windows-1252", "Latin-1"]
+    );
+}
+
+#[test]
+fn values_are_narrowed_like_commands() {
+    let narrowed = |input: &str| {
+        let (state, _dir) = two_files();
+        names(&value_typed(down(state, 2), "enc", input))
+    };
+    assert_eq!(narrowed("w"), ["Windows-1252"]);
+    assert_eq!(narrowed("u"), ["UTF-8", "UTF-8+BOM"]);
+    assert_eq!(narrowed("1252"), ["Windows-1252"]);
+    assert_eq!(narrowed("l"), ["Latin-1"]);
+    assert_eq!(narrowed("8"), ["UTF-8", "UTF-8+BOM"]);
+    assert_eq!(narrowed("BOM"), ["UTF-8+BOM"]);
+    assert_eq!(narrowed("xyz"), Vec::<&str>::new());
+
+    let (state, _dir) = two_files();
+    let state = value_typed(down(state, 2), "enc", "w");
+    assert_eq!(matched(&state), [("Windows-1252", vec![0])]);
+
+    let (state, _dir) = two_files();
+    let on_a_bundle = value_typed(down(state, 1), "excl", "y");
+    assert_eq!(names(&on_a_bundle), ["yes"]);
+}
+
+// ── What the line says it works on and what it does ──────────────────────────
+
+#[test]
+fn the_target_is_the_item_under_the_cursor_or_the_marked_ones() {
+    let (state, _dir) = two_files();
+    assert_eq!(target(&state).unwrap(), "folder .");
+    assert_eq!(target(&down(state, 1)).unwrap(), "bundle a");
+
+    let (state, _dir) = two_files();
+    assert_eq!(target(&down(state, 2)).unwrap(), "file a.properties");
+
+    let (state, _dir) = two_files();
+    let state = send(down(state, 2), &[Message::ToggleMark]);
+    assert_eq!(target(&state).unwrap(), "1 file (marked)");
+    let state = send(down(state, 2), &[Message::ToggleMark]);
+    assert_eq!(target(&state).unwrap(), "2 files (marked)");
+    // the marks win over the cursor
+    let state = send(state, &[Message::First]);
+    assert_eq!(target(&state).unwrap(), "2 files (marked)");
+
+    let (state, _dir) = two_files();
+    let state = send(down(state, 1), &[Message::ToggleMark]);
+    assert_eq!(target(&state).unwrap(), "1 bundle (marked)");
+}
+
+#[test]
+fn there_is_no_target_in_an_empty_list() {
+    let dir = TempDir::new();
+    let (session, problems) = Session::open(dir.path());
+    let state = AppState::new(session, problems);
+    assert_eq!(target(&state), None);
+}
+
+#[test]
+fn the_summary_says_how_many_of_the_selection_would_change() {
+    // both files are UTF-8
+    let (state, _dir) = two_files();
+    let state = value_typed(down(state, 2), "enc", "w");
+    assert_eq!(
+        summary(&state).unwrap(),
+        "encoding Windows-1252 changes 1 of 1 file"
+    );
+
+    let (state, _dir) = two_files();
+    let state = value_typed(down(state, 2), "enc", "u");
+    assert_eq!(
+        summary(&state).unwrap(),
+        "encoding UTF-8 changes 0 of 1 file",
+        "the highlighted value is the first, UTF-8"
+    );
+
+    // two marked files, both UTF-8
+    let (state, _dir) = two_files();
+    let state = send(
+        down(state, 2),
+        &[Message::ToggleMark, Message::Down, Message::Down],
+    );
+    let state = send(state, &[Message::ToggleMark]);
+    let state = send(state, &[Message::OpenCommandLine]);
+    let state = send(state, &[Message::Text(TextEdit::Insert('e'))]);
+    let state = send(state, &[Message::CompleteCommand]);
+    assert_eq!(
+        summary(&state).unwrap(),
+        "encoding UTF-8 changes 0 of 2 files"
+    );
+
+    let (state, _dir) = two_files();
+    let state = value_typed(down(state, 1), "excl", "y");
+    assert_eq!(
+        summary(&state).unwrap(),
+        "excluded yes changes 1 of 1 bundle"
+    );
+}
+
+#[test]
+fn there_is_no_summary_before_a_value_is_chosen_or_while_the_line_is_closed() {
+    let (state, _dir) = two_files();
+    assert_eq!(summary(&state), None, "closed");
+    let state = typed(down(state, 2), "enc");
+    assert_eq!(summary(&state), None, "the command is not chosen yet");
+    let state = send(
+        state,
+        &[
+            Message::CompleteCommand,
+            Message::Text(TextEdit::Insert('x')),
+        ],
+    );
+    assert_eq!(summary(&state), None, "no value fits");
 }

@@ -6,6 +6,37 @@ not authoritative.
 
 ## Decisions
 
+### Fields and values in the command line (2026-11-12)
+The second slice of the command line: `encoding Windows-1252` typed as a field and its value. As
+with `show` and `sel`, the grammar is what the description of the kinds will give; this slice has
+two fields, both with a list of values.
+- **A command either does its message at once or needs one value** from a list (`Action::Message`
+  and `Action::Choose`). The messages with a value are plain data and `Copy`
+  (`SetEncoding(Encoding)`, `SetExcluded(bool)`): they work on the **selection**, which `update`
+  finds when the message arrives, so a key can bind such a message as well. A completed command
+  line is nothing but a message.
+- **The fields of this slice:** `encoding` (`UTF-8`, `UTF-8+BOM`, `Windows-1252`, `Latin-1`) for a
+  selection of files, and `excluded` (`yes`, `no`) for a selection of bundles. A command is
+  offered only if the selection is of the kind it works on; if its message comes anyway, `update`
+  gives an alert (`encoding needs files`, `excluded needs bundles`). The names of the encodings
+  are one function in `app`, used for the list, the preview and the values.
+- **Several items in one edit:** `Session::set_encodings` and `Session::exclude_bundles` do it in
+  one edit of the history, leave out what has the value already, and do nothing (no empty edit)
+  if nothing changes. Both only change the memory; saving is a step of its own.
+- **Segments:** the line has the command that was chosen and the field for the value.
+  `Tab` takes the highlighted candidate: a command with values becomes the segment and its values
+  are listed, anything else is written into the field. `Shift+Tab` takes the segment back into
+  the field. `Enter` takes the highlighted candidate too and runs the line if that completes it,
+  so `en`, `Enter`, `w`, `Enter` and `en`, `Tab`, `w`, `Enter` do the same. `Esc` closes from any
+  segment.
+- **The row on top says what the line works on** (`on: 2 files (marked)`, `on: file
+  messages.properties`) and, for a highlighted value, what it would do (`encoding Latin-1
+  changes 2 of 2 files`): the summary before an action, from the concept. The chosen segment has
+  its own style (`token`), and so has the row on top (`target`).
+- **Not in this slice:** the assignment (bundle, locale) and renaming need free text, a safety
+  question and a `Session` call that does not exist; `save` needs an effect and a summary of what
+  is written; a marker for unsaved changes belongs to `save`.
+
 ### The command line, first slice (2026-11-11)
 The first part of the operating concept: `:` opens a command line with a flat list of named
 commands that narrows while typing. Arguments, `show` and `sel` come later.
