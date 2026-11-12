@@ -31,9 +31,9 @@ pub use screen::screen_text;
 pub use ui::{Theme, Ui};
 
 use app::{
-    Action, AppState, Command, Confidence, EditorOutcome, Entry, ItemId, Message, OverviewItem,
-    TextEdit, Value, View, applicable, candidates, commands, encoding_name, overview, perform,
-    preview, summary, target, update,
+    Action, AppState, Command, Confidence, EditorOutcome, Entry, Message, OverviewItem, TextEdit,
+    View, applicable, candidates, commands, encoding_name, overview, perform, preview,
+    selected_items, selection_text, summary, target, update,
 };
 use ratatui::backend::Backend;
 use ratatui::crossterm::event::Event;
@@ -63,19 +63,6 @@ const FOOTER_LINES: usize = 1;
 /// the count, the status line (only if there is one) and the line with the keys.
 pub fn list_height(screen_height: u16, has_status: bool) -> usize {
     usize::from(screen_height).saturating_sub(HEADER_LINES + usize::from(has_status) + FOOTER_LINES)
-}
-
-/// "2 files marked", or nothing if nothing is marked.
-fn marked_text(marked: &[ItemId]) -> Option<String> {
-    let (singular, plural) = match marked.first()? {
-        ItemId::Folder(_) => ("folder", "folders"),
-        ItemId::Bundle(_) => ("bundle", "bundles"),
-        ItemId::File(_) => ("file", "files"),
-    };
-    Some(format!(
-        "{} marked",
-        counted(marked.len(), singular, plural)
-    ))
 }
 
 /// The status line: the count of the problems, if there are any.
@@ -269,8 +256,8 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
         counted(session.file_count(), "file", "files"),
         counted(session.bundle_count(), "bundle", "bundles"),
     );
-    if let Some(marked) = marked_text(view.marked()) {
-        counts.push_str(&format!(" \u{b7} {marked}"));
+    if let Some(selected) = selection_text(state) {
+        counts.push_str(&format!(" \u{b7} {selected}"));
     }
     frame.render_widget(Paragraph::new(counts), count);
     if let Some(status) = status {
@@ -308,6 +295,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
             })
             .max()
             .unwrap_or(0);
+        let selected = selected_items(state);
         let lines: Vec<Line> = items
             .iter()
             .enumerate()
@@ -318,7 +306,7 @@ pub fn render(ui: &Ui, state: &AppState, frame: &mut Frame) {
                     &ui.theme,
                     item,
                     index == view.index(),
-                    view.is_marked(&item.id()),
+                    selected.contains(&item.id()),
                     usize::from(list.width),
                     name_width,
                 )
@@ -400,14 +388,8 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     }
     let name_width = commands()
         .iter()
-        .flat_map(|command| {
-            let values: &[Value] = match &command.action {
-                Action::Choose(values) => values,
-                Action::Message(_) => &[],
-            };
-            std::iter::once(command.name).chain(values.iter().map(|value| value.name))
-        })
-        .map(|name| name.chars().count())
+        .map(|command| command.name.chars().count())
+        .chain(found.iter().map(|candidate| candidate.name.chars().count()))
         .max()
         .unwrap_or(0);
     let label_width = commands()
@@ -418,7 +400,7 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
     let below = view_context(state);
     for (index, candidate) in found.iter().enumerate().skip(first).take(shown) {
         let at_cursor = index == line.highlighted();
-        let name = candidate.name;
+        let name = candidate.name.as_str();
         let mut spans = vec![Span::raw(if at_cursor { "> " } else { "  " })];
         for (place, letter) in name.chars().enumerate() {
             let style = if candidate.matched.contains(&place) {
@@ -456,15 +438,21 @@ fn render_command_line(ui: &Ui, state: &AppState, frame: &mut Frame) {
         frame.render_widget(Paragraph::new(Line::from(spans).style(style)), row_at(y));
     }
 
-    // the input: the segment that was chosen, in its own style, and the field behind it
-    let chosen = line.chosen().map_or("", |command| command.name);
+    // the input: the steps and segments that were chosen, in their own style, and the field
+    // behind them
     let text = line.field().text();
     let mut input = vec![Span::raw(":")];
     let mut prefix = 1;
-    if !chosen.is_empty() {
-        input.push(Span::styled(chosen.to_owned(), ui.theme.token));
+    for step in line.steps() {
+        let step = step.text();
+        prefix += step.chars().count() + 3;
+        input.push(Span::styled(step, ui.theme.token));
+        input.push(Span::raw(" > "));
+    }
+    for segment in line.segments() {
+        prefix += segment.chars().count() + 1;
+        input.push(Span::styled(segment.clone(), ui.theme.token));
         input.push(Span::raw(" "));
-        prefix += chosen.chars().count() + 1;
     }
     input.push(Span::raw(text.to_owned()));
     frame.render_widget(Paragraph::new(Line::from(input)), row_at(input_y));
@@ -547,7 +535,7 @@ fn key_help(keymap: &Keymap, state: &AppState) -> String {
         (&[Message::OpenCommandLine], "commands"),
         (&[Message::Edit], "edit"),
         (&[Message::ToggleMark], "mark"),
-        (&[Message::ClearMarks], "clear marks"),
+        (&[Message::ClearSelection], "clear selection"),
         (&[Message::Up, Message::Down], "move"),
         (&[Message::PageUp, Message::PageDown], "page"),
         (&[Message::First, Message::Last], "ends"),

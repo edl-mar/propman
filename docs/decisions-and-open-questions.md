@@ -6,6 +6,39 @@ not authoritative.
 
 ## Decisions
 
+### `sel`: a condition as the selection (2026-11-12)
+The third slice of the command line: the selection is built in the line by what the files have,
+not only by hand.
+- **A condition is a chain of "and"** of predicates over files: `locale` (a locale, or the default
+  file), `bundle` and `encoding`. They are small `Copy` values that hold ids of the store (a pool
+  id for the locale, a bundle id, an encoding), so that a message stays `Copy`; text appears only
+  when it is shown. The values that the line offers are what the files have (the locales that
+  there are, the bundles, the encodings in use), each with the number of files, and two bundles
+  with one name are told apart by their folders (`a (.)`, `a (sub)`).
+- **The selection of a condition** is the files that have it, in the order of the list, whatever
+  the cursor is on. A condition that nothing meets is an empty selection and does **not** fall
+  back to the cursor, so nothing that needs files can be done with it. It stays until it is
+  replaced or cleared: `Esc` (`ClearSelection`, the command `clear-selection`) takes the condition
+  and the marks away.
+- **Condition and marks are never there together.** A new `sel` narrows what is there: marks are
+  narrowed and stay a fixed set (marks that are not files give the alert `sel works on files`),
+  and without marks the predicate is added to the condition, also in a later line. `Space` while
+  a condition holds makes the files it picks the marked ones first (an action makes a condition a
+  fixed set) and then toggles the item under the cursor.
+- **Steps in the line.** A step is made of segments (`sel locale de`). `Tab` on a complete
+  selection step takes it and starts the next one, `Shift+Tab` opens the last one again, `Enter`
+  runs all steps in order; an action (`encoding Latin-1`) is the last step. After a selection step
+  the commands for files are offered even if the cursor is on a folder. The row on top and the
+  summary count with the steps that are not run yet (`on: 3 files (locale de)`, `encoding Latin-1
+  changes 3 of 3 files`, `sel locale de selects 2 files`).
+- **What is shown:** the files of a condition have the same `*` as marked ones, the count line
+  says `3 files selected: locale de`, and the input shows the steps in front of the field, joined
+  by ` > `.
+- **The commands are a tree of choices** made from the state when they are needed (a candidate
+  owns its name), so a list can be what is there.
+- **Not in this slice:** conditions on bundles and folders, `show`, other ways to compare than
+  "is" (parts of a name, numbers), "or" and "not".
+
 ### Fields and values in the command line (2026-11-12)
 The second slice of the command line: `encoding Windows-1252` typed as a field and its value. As
 with `show` and `sel`, the grammar is what the description of the kinds will give; this slice has
@@ -41,7 +74,7 @@ two fields, both with a list of values.
 The first part of the operating concept: `:` opens a command line with a flat list of named
 commands that narrows while typing. Arguments, `show` and `sel` come later.
 - **The commands** have a name, a label and the message they stand for: `quit`, `edit`, `mark`,
-  `clear-marks`, `preview`, `preview-up`, `preview-down`, `preview-half-up`, `preview-half-down`,
+  `clear-selection` (was `clear-marks`), `preview`, `preview-up`, `preview-down`, `preview-half-up`, `preview-half-down`,
   `up`, `down`, `page-up`, `page-down`, `first`, `last`. The names are what is typed and what a
   settings file will use. Messages that come from the program (`Viewport`, `EditorClosed`,
   `Reloaded`, `DismissAlert`) are no commands.

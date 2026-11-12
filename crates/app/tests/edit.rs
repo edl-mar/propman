@@ -275,7 +275,7 @@ fn an_alert_blocks_what_the_keys_of_the_view_do() {
         Message::PreviewDown,
         Message::PreviewHalfPageDown,
         Message::ToggleMark,
-        Message::ClearMarks,
+        Message::ClearSelection,
         Message::Edit,
     ];
     for message in blocked {

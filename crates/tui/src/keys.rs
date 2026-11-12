@@ -307,7 +307,7 @@ impl Default for Keymap {
             .bind(line, Key::char('u').ctrl(), Message::Text(TextEdit::Clear))
             .bind(overview, Key::char(':'), Message::OpenCommandLine)
             .bind(overview, Key::char(' '), Message::ToggleMark)
-            .bind(overview, Key::new(Code::Esc), Message::ClearMarks)
+            .bind(overview, Key::new(Code::Esc), Message::ClearSelection)
             .bind(overview, Key::char('v'), Message::TogglePreview)
             .bind(overview, Key::new(Code::Up).ctrl(), Message::PreviewUp)
             .bind(overview, Key::new(Code::Down).ctrl(), Message::PreviewDown)

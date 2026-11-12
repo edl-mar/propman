@@ -127,9 +127,9 @@ fn marks_are_of_one_kind_and_marking_another_kind_starts_a_new_set() {
 
 #[test]
 fn clearing_takes_all_marks_away_and_does_nothing_without_marks() {
-    let state = send(mark(mark(project(), 3), 4), &[Message::ClearMarks]);
+    let state = send(mark(mark(project(), 3), 4), &[Message::ClearSelection]);
     assert!(view(&state).marked().is_empty());
-    let state = send(state, &[Message::ClearMarks]);
+    let state = send(state, &[Message::ClearSelection]);
     assert!(view(&state).marked().is_empty());
 }
 
@@ -189,8 +189,8 @@ fn editing_can_be_done_with_exactly_one_file_as_the_selection() {
 #[test]
 fn marking_needs_an_item_and_clearing_needs_a_mark() {
     assert!(applicable(&project(), Message::ToggleMark));
-    assert!(!applicable(&project(), Message::ClearMarks));
-    assert!(applicable(&mark(project(), 2), Message::ClearMarks));
+    assert!(!applicable(&project(), Message::ClearSelection));
+    assert!(applicable(&mark(project(), 2), Message::ClearSelection));
 
     let (empty, _dir) = empty();
     assert!(!applicable(&empty, Message::ToggleMark));

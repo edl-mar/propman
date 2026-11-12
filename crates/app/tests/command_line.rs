@@ -282,7 +282,7 @@ fn while_the_line_is_open_the_keys_of_the_view_do_nothing() {
         Message::PreviewDown,
         Message::PreviewHalfPageDown,
         Message::ToggleMark,
-        Message::ClearMarks,
+        Message::ClearSelection,
         Message::Edit,
         Message::OpenCommandLine,
     ] {
@@ -353,10 +353,10 @@ fn a_command_with_values_becomes_a_segment_and_the_values_are_listed() {
     let (state, _dir) = on_the_file();
     let state = send(open_with(state, "enc"), &[Message::CompleteCommand]);
     let line = state.command_line().unwrap();
-    assert_eq!(line.chosen().unwrap().name, "encoding");
+    assert_eq!(line.segments(), ["encoding"]);
     assert_eq!(text(&state), "", "the field is for the value now");
     assert_eq!(highlighted(&state), 0);
-    let names: Vec<&str> = candidates(&state).iter().map(|c| c.name).collect();
+    let names: Vec<String> = candidates(&state).into_iter().map(|c| c.name).collect();
     assert_eq!(names, ["UTF-8", "UTF-8+BOM", "Windows-1252", "Latin-1"]);
 }
 
@@ -385,10 +385,7 @@ fn enter_takes_the_highlighted_candidate_and_runs_only_when_that_completes_the_l
     // the first enter takes `encoding` and asks for the value, the second takes the value and runs
     let state = send(open_with(state, "en"), &[Message::RunCommand]);
     assert!(state.command_line().is_some());
-    assert_eq!(
-        state.command_line().unwrap().chosen().unwrap().name,
-        "encoding"
-    );
+    assert_eq!(state.command_line().unwrap().segments(), ["encoding"]);
     assert_eq!(
         encoding_of(&state, 0),
         types::Encoding::Utf8,
@@ -405,7 +402,7 @@ fn the_previous_segment_takes_the_command_back_into_the_field() {
     let (state, _dir) = on_the_file();
     let state = send(open_with(state, "enc"), &[Message::CompleteCommand]);
     let state = send(type_text(state, "w"), &[Message::PreviousSegment]);
-    assert!(state.command_line().unwrap().chosen().is_none());
+    assert!(state.command_line().unwrap().segments().is_empty());
     assert_eq!(text(&state), "encoding");
     assert_eq!(state.command_line().unwrap().field().cursor(), 8);
     assert_eq!(highlighted(&state), 0);
@@ -416,7 +413,7 @@ fn the_previous_segment_does_nothing_without_a_segment() {
     let (state, _dir) = on_the_file();
     let state = send(open_with(state, "enc"), &[Message::PreviousSegment]);
     assert_eq!(text(&state), "enc");
-    assert!(state.command_line().unwrap().chosen().is_none());
+    assert!(state.command_line().unwrap().segments().is_empty());
 }
 
 #[test]
@@ -428,7 +425,7 @@ fn closing_from_the_value_segment_changes_nothing() {
     assert_eq!(encoding_of(&state, 0), types::Encoding::Utf8);
     let state = send(state, &[Message::OpenCommandLine]);
     assert!(
-        state.command_line().unwrap().chosen().is_none(),
+        state.command_line().unwrap().segments().is_empty(),
         "a new line starts again"
     );
 }
@@ -535,4 +532,291 @@ fn what_can_be_done_with_a_value_depends_on_the_selection() {
     assert!(!applicable(&state, Message::PreviousSegment));
     let state = send(open_with(state, "excl"), &[Message::CompleteCommand]);
     assert!(applicable(&state, Message::PreviousSegment));
+}
+
+// ── Steps: `sel` and then what to do with the files ──────────────────────────
+
+use app::{ItemId, Predicate, Step, applicable, selected_items, selection, summary, target};
+
+/// The folder of the tests of the condition; the list is: the folder (0), the bundle `m` (1)
+/// with `m` (2), `m_de` (3) and `m_fr` (4), the bundle `n` (5) with `n` (6) and `n_de` (7).
+fn locale_project() -> (AppState, TempDir) {
+    let dir = TempDir::new();
+    for (name, bytes) in [
+        ("m.properties", &b"a=1\n"[..]),
+        ("m_de.properties", b"a=1\n"),
+        ("m_fr.properties", b"a=\xe9\n"),
+        ("n.properties", b"a=1\n"),
+        ("n_de.properties", b"a=1\n"),
+    ] {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let (session, problems) = Session::open(dir.path());
+    let state = send(AppState::new(session, problems), &[Message::Viewport(20)]);
+    (state, dir)
+}
+
+/// This is typed and the candidates are taken with tab after every part that is a name.
+fn typed_with_tab(state: AppState, parts: &[&str]) -> AppState {
+    let mut state = state;
+    for part in parts {
+        state = type_text(state, part);
+        state = send(state, &[Message::CompleteCommand]);
+    }
+    state
+}
+
+fn file_encoding(state: &AppState, name: &str) -> types::Encoding {
+    let store = state.session().store();
+    let file = store
+        .files()
+        .into_iter()
+        .find(|&file| {
+            store
+                .file_path(file)
+                .is_some_and(|path| path.ends_with(name))
+        })
+        .unwrap();
+    store.file_encoding(file).unwrap()
+}
+
+fn file_ids(state: &AppState, names: &[&str]) -> Vec<ItemId> {
+    let store = state.session().store();
+    names
+        .iter()
+        .map(|name| {
+            let file = store
+                .files()
+                .into_iter()
+                .find(|&file| {
+                    store
+                        .file_path(file)
+                        .is_some_and(|path| path.ends_with(format!("{name}.properties")))
+                })
+                .unwrap();
+            ItemId::File(file)
+        })
+        .collect()
+}
+
+fn steps(state: &AppState) -> Vec<String> {
+    state
+        .command_line()
+        .unwrap()
+        .steps()
+        .iter()
+        .map(Step::text)
+        .collect()
+}
+
+#[test]
+fn a_selection_step_is_made_of_segments_and_taken_with_tab() {
+    let (state, _dir) = locale_project();
+    let state = send(state, &[Message::OpenCommandLine]);
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    assert_eq!(state.command_line().unwrap().segments(), ["sel", "locale"]);
+    assert!(steps(&state).is_empty());
+
+    let state = typed_with_tab(state, &["de"]);
+    assert_eq!(steps(&state), ["sel locale de"]);
+    assert!(state.command_line().unwrap().segments().is_empty());
+    assert_eq!(text(&state), "", "the next step starts");
+    assert_eq!(highlighted(&state), 0);
+    assert!(state.command_line().is_some());
+}
+
+#[test]
+fn after_a_selection_step_the_commands_for_files_are_offered() {
+    let (state, _dir) = locale_project();
+    let state = send(state, &[Message::OpenCommandLine]);
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    let names: Vec<String> = candidates(&state).into_iter().map(|c| c.name).collect();
+    for wanted in ["sel", "encoding", "edit"] {
+        assert!(
+            names.iter().any(|name| name == wanted),
+            "{wanted}: {names:?}"
+        );
+    }
+    assert!(!names.iter().any(|name| name == "excluded"));
+}
+
+#[test]
+fn enter_on_a_value_of_sel_runs_the_selection_and_closes_the_line() {
+    let (state, _dir) = locale_project();
+    let state = open_with(state, "");
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    let state = send(type_text(state, "de"), &[Message::RunCommand]);
+    assert!(state.command_line().is_none());
+    assert_eq!(selected_items(&state), file_ids(&state, &["m_de", "n_de"]));
+    assert_eq!(view_condition_len(&state), 1);
+}
+
+fn view_condition_len(state: &AppState) -> usize {
+    overview_state(state).condition().len()
+}
+
+#[test]
+fn a_whole_line_is_run_in_order() {
+    let (state, _dir) = locale_project();
+    let state = open_with(state, "");
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    let state = send(type_text(state, "l"), &[Message::RunCommand]);
+    assert!(state.command_line().is_none());
+    assert_eq!(
+        file_encoding(&state, "m_de.properties"),
+        types::Encoding::Latin1
+    );
+    assert_eq!(
+        file_encoding(&state, "n_de.properties"),
+        types::Encoding::Latin1
+    );
+    assert_eq!(file_encoding(&state, "m.properties"), types::Encoding::Utf8);
+    assert_eq!(
+        view_condition_len(&state),
+        1,
+        "the condition is still there"
+    );
+}
+
+#[test]
+fn a_second_line_with_sel_narrows_the_selection() {
+    let (state, _dir) = locale_project();
+    let state = open_with(state, "");
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    let state = send(type_text(state, "de"), &[Message::RunCommand]);
+
+    let state = open_with(state, "");
+    let state = typed_with_tab(state, &["sel", "bun"]);
+    let state = send(type_text(state, "m"), &[Message::RunCommand]);
+    assert_eq!(selected_items(&state), file_ids(&state, &["m_de"]));
+    assert_eq!(view_condition_len(&state), 2);
+}
+
+#[test]
+fn the_previous_segment_takes_the_last_segment_back_into_the_field() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    let state = send(type_text(state, "d"), &[Message::PreviousSegment]);
+    assert_eq!(state.command_line().unwrap().segments(), ["sel"]);
+    assert_eq!(text(&state), "locale");
+}
+
+#[test]
+fn the_previous_segment_opens_the_last_step_again_if_there_is_no_segment() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    assert_eq!(steps(&state), ["sel locale de"]);
+
+    let state = send(state, &[Message::PreviousSegment]);
+    assert!(steps(&state).is_empty());
+    assert_eq!(state.command_line().unwrap().segments(), ["sel", "locale"]);
+    assert_eq!(text(&state), "de");
+}
+
+#[test]
+fn an_action_is_the_last_step_and_tab_only_writes_its_name() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    let state = send(type_text(state, "l"), &[Message::CompleteCommand]);
+    assert_eq!(text(&state), "Latin-1");
+    assert_eq!(steps(&state), ["sel locale de"], "no step is added");
+    let state = send(state, &[Message::CompleteCommand]);
+    assert_eq!(text(&state), "Latin-1");
+    assert_eq!(steps(&state), ["sel locale de"]);
+}
+
+#[test]
+fn a_value_that_does_not_exist_runs_nothing() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    let state = send(type_text(state, "xx"), &[Message::RunCommand]);
+    assert!(state.command_line().is_some());
+    assert_eq!(view_condition_len(&state), 0);
+}
+
+#[test]
+fn closing_from_a_later_step_changes_nothing() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    let state = send(state, &[Message::CloseCommandLine]);
+    assert!(state.command_line().is_none());
+    assert_eq!(view_condition_len(&state), 0);
+    assert_eq!(
+        file_encoding(&state, "m_de.properties"),
+        types::Encoding::Utf8
+    );
+    let state = send(state, &[Message::OpenCommandLine]);
+    assert!(steps(&state).is_empty(), "a new line starts again");
+}
+
+#[test]
+fn the_line_says_what_the_steps_so_far_select() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    assert_eq!(target(&state).unwrap(), "2 files (locale de)");
+    assert_eq!(
+        selection(&state).len(),
+        1,
+        "the selection itself is not changed yet"
+    );
+}
+
+#[test]
+fn the_summary_counts_the_files_of_the_steps_so_far() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    let state = type_text(state, "l");
+    assert_eq!(
+        summary(&state).unwrap(),
+        "encoding Latin-1 changes 2 of 2 files"
+    );
+}
+
+#[test]
+fn the_summary_of_a_selection_says_how_many_files_it_selects() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc"]);
+    let state = type_text(state, "de");
+    assert_eq!(summary(&state).unwrap(), "sel locale de selects 2 files");
+
+    // narrowing a condition that is there already
+    let state = send(state, &[Message::RunCommand]);
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "bun"]);
+    let state = type_text(state, "m");
+    assert_eq!(summary(&state).unwrap(), "sel bundle m selects 1 file");
+}
+
+#[test]
+fn a_command_that_needs_a_selection_can_follow_a_step_when_the_cursor_is_on_a_folder() {
+    // the cursor is on the folder, where `encoding` alone is not possible
+    let (state, _dir) = locale_project();
+    assert!(!applicable(
+        &state,
+        Message::SetEncoding(types::Encoding::Latin1)
+    ));
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    let names: Vec<String> = candidates(&state).into_iter().map(|c| c.name).collect();
+    assert!(names.iter().any(|name| name == "encoding"));
+}
+
+#[test]
+fn a_condition_with_the_predicate_of_the_value_is_what_the_selection_step_makes() {
+    let (state, _dir) = locale_project();
+    let state = send(open_with(state, ""), &[]);
+    let state = typed_with_tab(state, &["sel", "enc"]);
+    let state = send(type_text(state, "utf-8"), &[Message::RunCommand]);
+    assert_eq!(
+        overview_state(&state).condition(),
+        [Predicate::Encoding(types::Encoding::Utf8)]
+    );
 }

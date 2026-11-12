@@ -10,14 +10,16 @@ mod session;
 mod state;
 mod text;
 
-pub use commands::{Action, Candidate, Command, Entry, Value, candidates, commands, encoding_name};
+pub use commands::{
+    Action, Candidate, Choice, Command, Entry, Predicate, Then, candidates, commands, encoding_name,
+};
 pub use effect::{EditorOutcome, Effect, perform};
 pub use list::{ListState, Movement};
 pub use overview::{ItemId, OverviewItem, overview};
 pub use preview::{Preview, PreviewLine, preview};
-pub use selection::{applicable, selection, summary, target};
+pub use selection::{applicable, selected_items, selection, selection_text, summary, target};
 pub use session::{LoadProblem, ReloadError, SaveError, Session};
-pub use state::{AppState, CommandLine, Message, OverviewState, View, update};
+pub use state::{AppState, CommandLine, Message, OverviewState, Step, View, update};
 pub use text::{TextEdit, TextField};
 
 // The types that the user interface may read; it does not depend on `store` or `types` itself.

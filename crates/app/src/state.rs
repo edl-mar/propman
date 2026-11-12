@@ -19,11 +19,11 @@
 use store::FileId;
 use types::Encoding;
 
-use crate::commands::{Action, Command, Entry, candidates};
+use crate::commands::{Action, Entry, Predicate, candidates};
 use crate::effect::{EditorOutcome, Effect};
 use crate::list::{ListState, Movement};
 use crate::overview::{ItemId, OverviewItem, overview};
-use crate::selection::{selected_bundles, selected_files, selection};
+use crate::selection::{matching_files, meets, selected_bundles, selected_files, selection};
 use crate::session::{LoadProblem, ReloadError, Session};
 use crate::text::{TextEdit, TextField};
 
@@ -83,15 +83,39 @@ impl AppState {
 /// The command line: the text that is typed and which of the candidates is highlighted.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CommandLine {
-    chosen: Option<&'static Command>,
+    /// The steps that are done: a selection step and then the next one (`sel locale de`).
+    steps: Vec<Step>,
+    /// The segments of the step that is being typed, as far as they were chosen.
+    segments: Vec<String>,
     field: TextField,
     highlighted: usize,
 }
 
+/// A step of a line that is complete and is followed by another one: the segments that were
+/// chosen for it and the message it stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub segments: Vec<String>,
+    pub message: Message,
+}
+
+impl Step {
+    /// The segments as the user typed them: `sel locale de`.
+    pub fn text(&self) -> String {
+        self.segments.join(" ")
+    }
+}
+
 impl CommandLine {
-    /// The command that was chosen, if it needs a value; the field is then for the value.
-    pub fn chosen(&self) -> Option<&'static Command> {
-        self.chosen
+    /// The steps that are done and wait for the next one.
+    pub fn steps(&self) -> &[Step] {
+        &self.steps
+    }
+
+    /// The segments of the step that is being typed that were chosen already (the command, then
+    /// what it asks for); the field is for the next one.
+    pub fn segments(&self) -> &[String] {
+        &self.segments
     }
 
     pub fn field(&self) -> &TextField {
@@ -116,6 +140,7 @@ pub enum View {
 pub struct OverviewState {
     list: ListState<ItemId>,
     marks: Vec<ItemId>,
+    condition: Vec<Predicate>,
     preview: bool,
     preview_scroll: usize,
 }
@@ -125,6 +150,7 @@ impl Default for OverviewState {
         Self {
             list: ListState::new(),
             marks: Vec::new(),
+            condition: Vec::new(),
             preview: true,
             preview_scroll: 0,
         }
@@ -166,7 +192,10 @@ impl OverviewState {
             }
             Message::PreviewHalfPageDown => self.preview_scroll += half,
             Message::ToggleMark => self.toggle_mark(),
-            Message::ClearMarks => self.marks.clear(),
+            Message::ClearSelection => {
+                self.marks.clear();
+                self.condition.clear();
+            }
             Message::Quit
             | Message::OpenCommandLine
             | Message::CloseCommandLine
@@ -178,6 +207,7 @@ impl OverviewState {
             | Message::PreviousSegment
             | Message::SetEncoding(_)
             | Message::SetExcluded(_)
+            | Message::Select(_)
             | Message::DismissAlert
             | Message::Edit
             | Message::EditorClosed { .. }
@@ -246,6 +276,11 @@ impl OverviewState {
         self.list.height()
     }
 
+    /// What the selected files have to have, all of it; empty if there is no condition.
+    pub fn condition(&self) -> &[Predicate] {
+        &self.condition
+    }
+
     /// The items that were marked by hand.
     pub fn marked(&self) -> &[ItemId] {
         &self.marks
@@ -289,8 +324,10 @@ pub enum Message {
     PreviewHalfPageDown,
     /// Marks the item under the cursor, or takes the mark away.
     ToggleMark,
-    /// Takes all marks away.
-    ClearMarks,
+    /// Narrows the selection to the files that have this (the first one starts a condition).
+    Select(Predicate),
+    /// Takes the marks and the condition away.
+    ClearSelection,
     /// Closes the alert.
     DismissAlert,
     /// Opens the command line.
@@ -384,21 +421,57 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
             }
         }
         Message::CompleteCommand => {
-            accept(&mut state);
+            // a complete selection step is followed by the next step; anything else is only written
+            if let Some(Message::Select(predicate)) = accept(&mut state)
+                && let Some(line) = &mut state.command_line
+            {
+                let mut segments = std::mem::take(&mut line.segments);
+                segments.push(line.field.text().to_owned());
+                line.steps.push(Step {
+                    segments,
+                    message: Message::Select(predicate),
+                });
+                line.field = TextField::new();
+            }
         }
         Message::PreviousSegment => {
-            if let Some(line) = &mut state.command_line
-                && let Some(command) = line.chosen.take()
-            {
-                line.field = TextField::with_text(command.name);
-                line.highlighted = 0;
+            if let Some(line) = &mut state.command_line {
+                if let Some(last) = line.segments.pop() {
+                    line.field = TextField::with_text(&last);
+                    line.highlighted = 0;
+                } else if let Some(mut step) = line.steps.pop() {
+                    // the last step is open again, at its last segment
+                    let last = step.segments.pop().unwrap_or_default();
+                    line.segments = step.segments;
+                    line.field = TextField::with_text(&last);
+                    line.highlighted = 0;
+                }
             }
         }
         Message::RunCommand => {
-            if let Some(chosen) = accept(&mut state) {
+            if let Some(last) = accept(&mut state) {
+                let mut messages: Vec<Message> = state
+                    .command_line
+                    .as_ref()
+                    .map(|line| line.steps.iter().map(|step| step.message).collect())
+                    .unwrap_or_default();
+                messages.push(last);
                 state.command_line = None;
-                return update(state, chosen);
+                // the steps are done in order; only the last can ask for an effect
+                let mut effect = None;
+                for message in messages {
+                    let (next, asked) = update(state, message);
+                    state = next;
+                    effect = asked;
+                }
+                return (state, effect);
             }
+        }
+        Message::Select(predicate) => select_step(&mut state, predicate),
+        Message::ToggleMark => {
+            // a condition becomes the marks first: marking is a fixed set
+            materialize_the_condition(&mut state);
+            apply_to_overview(&mut state, Message::ToggleMark);
         }
         Message::SetEncoding(encoding) => match selected_files(&state) {
             Some(files) => {
@@ -451,33 +524,77 @@ pub fn update(mut state: AppState, message: Message) -> (AppState, Option<Effect
     (state, effect)
 }
 
+/// Narrows the selection by what the files have. Marks are narrowed and stay a fixed set; with
+/// none, the predicate is added to the condition.
+fn select_step(state: &mut AppState, predicate: Predicate) {
+    let View::Overview(view) = &state.view;
+    if view.marks.is_empty() {
+        let View::Overview(view) = &mut state.view;
+        if !view.condition.contains(&predicate) {
+            view.condition.push(predicate);
+        }
+        return;
+    }
+    let marked_files: Option<Vec<ItemId>> = view
+        .marks
+        .iter()
+        .map(|id| matches!(id, ItemId::File(_)).then(|| id.clone()))
+        .collect();
+    let Some(marked_files) = marked_files else {
+        state.alert = Some("sel works on files".to_owned());
+        return;
+    };
+    let keep: Vec<ItemId> = marked_files
+        .into_iter()
+        .filter(|id| match id {
+            ItemId::File(file) => meets(&state.session, *file, predicate),
+            _ => false,
+        })
+        .collect();
+    let View::Overview(view) = &mut state.view;
+    view.marks = keep;
+}
+
+/// Makes the files that a condition picks the marked ones, and ends the condition.
+fn materialize_the_condition(state: &mut AppState) {
+    let View::Overview(view) = &state.view;
+    if view.condition.is_empty() {
+        return;
+    }
+    let matching = matching_files(state, &view.condition.clone());
+    let View::Overview(view) = &mut state.view;
+    view.marks = matching;
+    view.condition.clear();
+}
+
 /// Takes the highlighted candidate of the command line. A command with values becomes a segment
 /// and the field is for its value; anything else is written into the field. Returns the message
 /// that the line then stands for, if it is complete.
 fn accept(state: &mut AppState) -> Option<Message> {
-    let picked = {
+    let (entry, name) = {
         let line = state.command_line.as_ref()?;
         let found = candidates(state);
         let candidate = found.get(line.highlighted)?;
-        (candidate.entry, candidate.name)
+        (candidate.entry, candidate.name.clone())
     };
     let line = state.command_line.as_mut()?;
     line.highlighted = 0;
-    match picked {
-        (Entry::Command(command), name) => match command.action {
-            Action::Message(message) => {
-                line.field = TextField::with_text(name);
-                Some(message)
-            }
-            Action::Choose(_) => {
-                line.chosen = Some(command);
-                line.field = TextField::new();
-                None
-            }
+    let complete = match entry {
+        Entry::Command(command) => match command.action {
+            Action::Message(message) => Some(message),
+            Action::Choose(_) => None,
         },
-        (Entry::Value(value), name) => {
-            line.field = TextField::with_text(name);
-            Some(value.message)
+        Entry::Choice { complete } => complete,
+    };
+    match complete {
+        Some(message) => {
+            line.field = TextField::with_text(&name);
+            Some(message)
+        }
+        None => {
+            line.segments.push(name);
+            line.field = TextField::new();
+            None
         }
     }
 }

@@ -1624,11 +1624,11 @@ fn the_line_with_the_keys_names_marking_and_clearing_only_when_they_can_be_done(
     let state = state_for(&fixtures("project"));
     let footer = last_line(&drawn(&state, 170, 10));
     assert!(footer.contains("space: mark"), "{footer}");
-    assert!(!footer.contains("clear marks"), "{footer}");
+    assert!(!footer.contains("clear selection"), "{footer}");
 
     let marked = press_all(state, &[Message::ToggleMark]);
     let footer = last_line(&drawn(&marked, 170, 10));
-    assert!(footer.contains("esc: clear marks"), "{footer}");
+    assert!(footer.contains("esc: clear selection"), "{footer}");
 }
 
 #[test]
@@ -1919,19 +1919,19 @@ fn the_highlighted_candidate_has_a_mark_and_the_others_have_not() {
 
 #[test]
 fn at_most_eight_candidates_are_shown_and_the_highlighted_one_is_always_among_them() {
-    // 15 commands can be done on a file that is not marked
+    // 16 commands can be done on a file that is not marked
     let state = with_line(on_a_file_of_the_project(), "");
     let screen = drawn(&state, 120, 20);
     let rows = rows(&screen);
     assert!(rows[18].contains("quit"), "{screen}");
-    assert!(rows[11].contains("preview-half-up"), "the eighth: {screen}");
+    assert!(rows[11].contains("preview-down"), "the eighth: {screen}");
     assert!(rows[10].starts_with("on: "), "the row on top: {screen}");
     assert!(
         !screen.contains("page-up  "),
         "the eleventh is not shown yet: {screen}"
     );
 
-    // the eleventh candidate is `down`
+    // the eleventh candidate is `up`
     let state = press_all(state, &[Message::NextCandidate; 10]);
     let screen = drawn(&state, 120, 20);
     // only the rows of the command line, not the cursor row of the list above it
@@ -1941,7 +1941,7 @@ fn at_most_eight_candidates_are_shown_and_the_highlighted_one_is_always_among_th
         .filter(|row| row.starts_with("> "))
         .collect();
     assert_eq!(highlighted.len(), 1, "{screen}");
-    assert!(highlighted[0].starts_with("> down "), "{screen}");
+    assert!(highlighted[0].starts_with("> up "), "{screen}");
 }
 
 fn rows_of(screen: &str) -> Vec<&str> {
@@ -2324,5 +2324,207 @@ fn shift_tab_goes_back_to_the_command_in_the_loop() {
     assert_eq!(
         encoding_under_the_cursor(&result.unwrap()),
         app::Encoding::Windows1252
+    );
+}
+
+// ── A condition as the selection ─────────────────────────────────────────────
+
+/// The predicate for the locale of this file of the folder `project`.
+fn locale_of(state: &AppState, file_name: &str) -> app::Predicate {
+    let store = state.session().store();
+    let file = store
+        .files()
+        .into_iter()
+        .find(|&file| {
+            store
+                .file_path(file)
+                .is_some_and(|path| path.ends_with(file_name))
+        })
+        .unwrap();
+    app::Predicate::Locale(store.file_assignment(file).unwrap().locale)
+}
+
+/// The project with the condition that the locale is `de`: three files.
+fn with_the_locale_de() -> AppState {
+    let state = state_for(&fixtures("project"));
+    let de = locale_of(&state, "messages_de.properties");
+    press_all(state, &[Message::Select(de)])
+}
+
+/// Every part is typed and taken with tab.
+fn typed_with_tab(state: AppState, parts: &[&str]) -> AppState {
+    parts.iter().fold(state, |state, part| {
+        let state = part.chars().fold(state, |state, c| {
+            press_all(state, &[Message::Text(TextEdit::Insert(c))])
+        });
+        press_all(state, &[Message::CompleteCommand])
+    })
+}
+
+fn tab() -> Event {
+    key(KeyCode::Tab, KeyModifiers::NONE)
+}
+
+#[test]
+fn the_files_of_a_condition_have_a_star_like_marked_ones() {
+    let screen = drawn(&with_the_locale_de(), 110, 30);
+    let list = list_lines(&screen, false);
+    let starred: Vec<&String> = list
+        .iter()
+        .filter(|line| line.starts_with(" *") || line.starts_with(">*"))
+        .collect();
+    assert_eq!(starred.len(), 3, "{screen}");
+    assert!(
+        starred.iter().all(|line| line.contains("_de.properties")),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_line_with_the_count_says_what_the_condition_is() {
+    let screen = drawn(&with_the_locale_de(), 110, 12);
+    assert!(
+        rows(&screen)[1].contains("\u{b7} 3 files selected: locale de"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn a_condition_can_be_cleared_with_the_key_named_in_the_line() {
+    let footer = last_line(&drawn(&with_the_locale_de(), 170, 10));
+    assert!(footer.contains("esc: clear selection"), "{footer}");
+}
+
+#[test]
+fn the_steps_stand_in_front_of_the_input_separated_by_arrows() {
+    let state = with_line(with_the_locale_de(), "");
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    let state = press_all(state, &[Message::Text(TextEdit::Insert('l'))]);
+    let screen = drawn(&state, 130, 20);
+    assert!(
+        last_line(&screen).starts_with(":sel locale de > encoding l"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn the_row_on_top_counts_the_files_of_the_steps_so_far() {
+    let state = with_line(on_a_file_of_the_project(), "");
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    let state = press_all(state, &[Message::Text(TextEdit::Insert('l'))]);
+    let screen = drawn(&state, 130, 20);
+    let on_top = row_with(&screen, "on: ");
+    assert!(on_top.starts_with("on: 3 files (locale de)"), "{on_top}");
+    assert!(
+        on_top.contains("encoding Latin-1 changes 3 of 3 files"),
+        "{on_top}"
+    );
+}
+
+#[test]
+fn the_steps_have_the_style_of_the_chosen_segments() {
+    let state = with_line(on_a_file_of_the_project(), "");
+    let state = typed_with_tab(state, &["sel", "loc", "de"]);
+    let terminal = drawn_terminal(&themed(loud_theme()), &state);
+    assert_eq!(
+        style_at(&terminal, "sel locale de").fg,
+        Some(Color::LightCyan)
+    );
+}
+
+#[test]
+fn drawing_the_steps_survives_a_tiny_area() {
+    let state = with_line(on_a_file_of_the_project(), "");
+    let state = typed_with_tab(state, &["sel", "loc", "de", "enc"]);
+    for (width, height) in [
+        (0, 0),
+        (1, 1),
+        (5, 1),
+        (20, 3),
+        (100, 2),
+        (110, 40),
+        (3, 30),
+    ] {
+        let mut terminal = terminal(width, height);
+        terminal
+            .draw(|frame| render_with(&Ui::default(), &state, frame))
+            .unwrap();
+    }
+}
+
+fn selection_events(parts: &[&str]) -> Vec<Event> {
+    let mut events = vec![press(':')];
+    for part in parts {
+        events.extend(typed_events(part));
+        events.push(tab());
+    }
+    events
+}
+
+/// The encoding of the file with this name in the folder `project`.
+fn encoding_of_file(state: &AppState, file_name: &str) -> app::Encoding {
+    let store = state.session().store();
+    let file = store
+        .files()
+        .into_iter()
+        .find(|&file| {
+            store
+                .file_path(file)
+                .is_some_and(|path| path.ends_with(file_name))
+        })
+        .unwrap();
+    store.file_encoding(file).unwrap()
+}
+
+#[test]
+fn a_whole_line_with_a_selection_and_an_action_is_run_in_the_loop() {
+    let mut terminal = terminal(120, 20);
+    // sel locale de, tab, encoding, tab, then the value and enter
+    let mut events = selection_events(&["sel", "loc", "de", "enc"]);
+    events.extend(typed_events("l"));
+    events.extend([enter(), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    let state = result.unwrap();
+    for file in ["messages_de", "testbundle_de", "translations_de"] {
+        assert_eq!(
+            encoding_of_file(&state, &format!("{file}.properties")),
+            app::Encoding::Latin1,
+            "{file}"
+        );
+    }
+    assert_eq!(
+        encoding_of_file(&state, "messages.properties"),
+        app::Encoding::Utf8
+    );
+    assert_eq!(
+        encoding_of_file(&state, "messages_fr.properties"),
+        app::Encoding::Utf8
+    );
+}
+
+#[test]
+fn the_selection_that_the_loop_made_is_cleared_with_escape() {
+    let mut terminal = terminal(120, 20);
+    let mut events = selection_events(&["sel", "loc"]);
+    events.extend(typed_events("de"));
+    events.extend([enter(), key(KeyCode::Esc, KeyModifiers::NONE), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    match result.unwrap().view() {
+        View::Overview(overview) => assert!(overview.condition().is_empty()),
+    }
+}
+
+#[test]
+fn a_selection_that_the_loop_made_is_drawn() {
+    let mut terminal = terminal(120, 20);
+    let mut events = selection_events(&["sel", "loc"]);
+    events.extend(typed_events("de"));
+    events.extend([enter(), press('q')]);
+    let (result, _) = run_with(&mut terminal, state_for(&fixtures("project")), events);
+    let state = result.unwrap();
+    let screen = drawn(&state, 120, 20);
+    assert!(
+        rows(&screen)[1].contains("3 files selected: locale de"),
+        "{screen}"
     );
 }

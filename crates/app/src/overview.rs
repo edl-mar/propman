@@ -58,7 +58,7 @@ impl OverviewItem {
 }
 
 /// A folder relative to the opened one, with `/` as separator and `.` for the folder itself.
-fn relative_folder(root: &Path, folder: &Path) -> String {
+pub(crate) fn relative_folder(root: &Path, folder: &Path) -> String {
     let relative = folder.strip_prefix(root).unwrap_or(folder);
     let text = relative.display().to_string().replace('\\', "/");
     if text.is_empty() {

@@ -379,7 +379,7 @@ fn the_keys_of_the_overview_keep_their_meaning() {
     );
     assert_eq!(
         keymap.message(OVERVIEW, Key::new(Code::Esc)),
-        Some(Message::ClearMarks)
+        Some(Message::ClearSelection)
     );
 }
 

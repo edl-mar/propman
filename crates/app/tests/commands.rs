@@ -7,7 +7,8 @@ mod common;
 use std::collections::HashSet;
 
 use app::{
-    Action, AppState, Message, Session, TextEdit, candidates, commands, summary, target, update,
+    Action, AppState, Choice, Message, Session, TextEdit, Then, candidates, commands, summary,
+    target, update,
 };
 use common::TempDir;
 
@@ -55,17 +56,33 @@ fn typed(state: AppState, input: &str) -> AppState {
     state
 }
 
+/// The names live as long as the test run: it is shorter than that.
+fn leaked(name: String) -> &'static str {
+    Box::leak(name.into_boxed_str())
+}
+
 fn names(state: &AppState) -> Vec<&'static str> {
     candidates(state)
-        .iter()
-        .map(|candidate| candidate.name)
+        .into_iter()
+        .map(|candidate| leaked(candidate.name))
         .collect()
 }
 
 fn matched(state: &AppState) -> Vec<(&'static str, Vec<usize>)> {
     candidates(state)
         .into_iter()
-        .map(|candidate| (candidate.name, candidate.matched))
+        .map(|candidate| (leaked(candidate.name), candidate.matched))
+        .collect()
+}
+
+/// The messages that the choices lead to, depth first.
+fn leaf_messages(choices: &[Choice]) -> Vec<Message> {
+    choices
+        .iter()
+        .flat_map(|choice| match &choice.then {
+            Then::Run(message) => vec![*message],
+            Then::Choose(more) => leaf_messages(more),
+        })
         .collect()
 }
 
@@ -80,7 +97,8 @@ fn the_commands_are_these_in_this_order() {
             "quit",
             "edit",
             "mark",
-            "clear-marks",
+            "sel",
+            "clear-selection",
             "encoding",
             "excluded",
             "preview",
@@ -115,11 +133,12 @@ fn every_command_has_its_own_name_label_and_message() {
         );
     }
     // every message is the message of one command or one value
+    let (state, _dir) = two_files();
     let mut messages: Vec<Message> = commands
         .iter()
         .flat_map(|command| match &command.action {
             Action::Message(message) => vec![*message],
-            Action::Choose(values) => values.iter().map(|value| value.message).collect(),
+            Action::Choose(make) => leaf_messages(&make(&state)),
         })
         .collect();
     let all = messages.len();
@@ -144,7 +163,7 @@ fn the_commands_say_what_the_message_does() {
     assert_eq!(by_name("quit"), Message::Quit);
     assert_eq!(by_name("edit"), Message::Edit);
     assert_eq!(by_name("mark"), Message::ToggleMark);
-    assert_eq!(by_name("clear-marks"), Message::ClearMarks);
+    assert_eq!(by_name("clear-selection"), Message::ClearSelection);
     assert_eq!(by_name("preview"), Message::TogglePreview);
     assert_eq!(by_name("preview-half-down"), Message::PreviewHalfPageDown);
     assert_eq!(by_name("page-up"), Message::PageUp);
@@ -183,7 +202,7 @@ fn only_commands_that_can_be_done_are_candidates() {
     let state = typed(state, "");
     let listed = names(&state);
     assert!(!listed.contains(&"edit"), "a folder cannot be edited");
-    assert!(!listed.contains(&"clear-marks"), "nothing is marked");
+    assert!(!listed.contains(&"clear-selection"), "nothing is marked");
     assert!(!listed.contains(&"encoding"), "that is for files");
     assert!(!listed.contains(&"excluded"), "that is for bundles");
     assert!(listed.contains(&"mark"));
@@ -252,7 +271,7 @@ fn the_beginnings_of_the_words_come_before_other_subsequences() {
     );
 
     let (state, _dir) = everything_possible();
-    assert_eq!(names(&typed(state, "cm")), ["clear-marks"]);
+    assert_eq!(names(&typed(state, "cs")), ["clear-selection"]);
 }
 
 #[test]
@@ -327,9 +346,13 @@ fn value_typed(state: AppState, command: &str, value: &str) -> AppState {
 
 #[test]
 fn encoding_and_excluded_are_commands_that_need_a_value() {
+    let (state, _dir) = two_files();
     let values_of = |name: &str| -> Vec<&'static str> {
         match &commands().iter().find(|c| c.name == name).unwrap().action {
-            Action::Choose(values) => values.iter().map(|value| value.name).collect(),
+            Action::Choose(make) => make(&state)
+                .into_iter()
+                .map(|choice| leaked(choice.name))
+                .collect(),
             Action::Message(_) => panic!("{name} needs no value"),
         }
     };
@@ -347,11 +370,12 @@ fn the_names_of_the_encodings_are_the_ones_that_are_shown() {
     assert_eq!(encoding_name(Encoding::Utf8Bom), "UTF-8+BOM");
     assert_eq!(encoding_name(Encoding::Windows1252), "Windows-1252");
     assert_eq!(encoding_name(Encoding::Latin1), "Latin-1");
+    let (state, _dir) = two_files();
     for command in commands() {
-        if let Action::Choose(values) = &command.action {
-            for value in *values {
-                if let Message::SetEncoding(encoding) = value.message {
-                    assert_eq!(value.name, encoding_name(encoding));
+        if let Action::Choose(make) = &command.action {
+            for choice in make(&state) {
+                if let Then::Run(Message::SetEncoding(encoding)) = choice.then {
+                    assert_eq!(choice.name, encoding_name(encoding));
                 }
             }
         }
@@ -496,4 +520,123 @@ fn there_is_no_summary_before_a_value_is_chosen_or_while_the_line_is_closed() {
         ],
     );
     assert_eq!(summary(&state), None, "no value fits");
+}
+
+// ── `sel`: the fields and what the files have ────────────────────────────────
+
+/// The folder of the tests of the condition: the bundle `m` with `m`, `m_de` and `m_fr` (not
+/// UTF-8) and the bundle `n` with `n` and `n_de`.
+fn locale_project() -> (AppState, TempDir) {
+    let dir = TempDir::new();
+    for (name, bytes) in [
+        ("m.properties", &b"a=1\n"[..]),
+        ("m_de.properties", b"a=1\n"),
+        ("m_fr.properties", b"a=\xe9\n"),
+        ("n.properties", b"a=1\n"),
+        ("n_de.properties", b"a=1\n"),
+    ] {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let (session, problems) = Session::open(dir.path());
+    let state = send(AppState::new(session, problems), &[Message::Viewport(20)]);
+    (state, dir)
+}
+
+/// The line is open and these were chosen, each typed in full and taken with tab.
+fn chosen(state: AppState, segments: &[&str]) -> AppState {
+    let mut state = send(state, &[Message::OpenCommandLine]);
+    for segment in segments {
+        for c in segment.chars() {
+            state = send(state, &[Message::Text(TextEdit::Insert(c))]);
+        }
+        state = send(state, &[Message::CompleteCommand]);
+    }
+    state
+}
+
+fn labels(state: &AppState) -> Vec<String> {
+    candidates(state)
+        .into_iter()
+        .map(|candidate| candidate.label)
+        .collect()
+}
+
+#[test]
+fn sel_is_a_command_that_leads_to_the_fields_of_a_file() {
+    let (state, _dir) = locale_project();
+    assert!(names(&typed(state, "se")).contains(&"sel"));
+
+    let (state, _dir) = locale_project();
+    assert_eq!(
+        names(&chosen(state, &["sel"])),
+        ["locale", "bundle", "encoding"]
+    );
+}
+
+#[test]
+fn the_values_of_a_field_are_what_the_files_have() {
+    let (state, _dir) = locale_project();
+    let state = chosen(state, &["sel", "locale"]);
+    assert_eq!(names(&state), ["(default)", "de", "fr"]);
+    assert_eq!(labels(&state), ["2 files", "2 files", "1 file"]);
+
+    let (state, _dir) = locale_project();
+    let state = chosen(state, &["sel", "bundle"]);
+    assert_eq!(names(&state), ["m", "n"]);
+    assert_eq!(labels(&state), ["3 files", "2 files"]);
+
+    // the encodings that there are: UTF-8 and the one of `m_fr`
+    let (state, _dir) = locale_project();
+    let other = {
+        let store = state.session().store();
+        let fr = store
+            .files()
+            .into_iter()
+            .find(|&file| {
+                store
+                    .file_path(file)
+                    .is_some_and(|path| path.ends_with("m_fr.properties"))
+            })
+            .unwrap();
+        app::encoding_name(store.file_encoding(fr).unwrap())
+    };
+    let state = chosen(state, &["sel", "encoding"]);
+    assert_eq!(names(&state), ["UTF-8", other]);
+    assert_eq!(labels(&state), ["4 files", "1 file"]);
+}
+
+#[test]
+fn the_values_of_a_field_are_narrowed_like_the_commands() {
+    let narrowed = |input: &str| {
+        let (state, _dir) = locale_project();
+        let state = chosen(state, &["sel", "locale"]);
+        let state = input.chars().fold(state, |state, c| {
+            send(state, &[Message::Text(TextEdit::Insert(c))])
+        });
+        names(&state)
+    };
+    assert_eq!(narrowed("d"), ["de", "(default)"]);
+    assert_eq!(narrowed("fr"), ["fr"]);
+    assert_eq!(narrowed("def"), ["(default)"]);
+    assert_eq!(narrowed("xyz"), Vec::<&str>::new());
+}
+
+#[test]
+fn two_bundles_with_one_name_are_told_apart_by_their_folders() {
+    let dir = TempDir::new();
+    std::fs::write(dir.path().join("a.properties"), b"a=1\n").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub").join("a.properties"), b"a=1\n").unwrap();
+    let (session, problems) = Session::open(dir.path());
+    let state = send(AppState::new(session, problems), &[Message::Viewport(20)]);
+    let state = chosen(state, &["sel", "bundle"]);
+    assert_eq!(names(&state), ["a (.)", "a (sub)"]);
+}
+
+#[test]
+fn sel_is_not_offered_when_the_marks_are_not_files() {
+    let (state, _dir) = locale_project();
+    // mark the bundle `m`
+    let state = send(state, &[Message::Down, Message::ToggleMark]);
+    assert!(!names(&typed(state, "se")).contains(&"sel"));
 }
